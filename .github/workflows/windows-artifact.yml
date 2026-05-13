@@ -1,0 +1,95 @@
+name: Windows Artifact
+
+on:
+  push:
+    branches:
+      - windows-artifacts
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows-artifact:
+    name: Build Windows artifacts
+    runs-on: windows-2022
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v5.0.1
+
+      - name: Install protobuf
+        shell: pwsh
+        run: choco install protoc --yes --no-progress
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Cache Rust build data
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+          key: windows-artifacts
+          shared-key: windows-artifacts
+
+      - name: Build release binaries
+        run: cargo build --release --locked -p omnigraph-cli -p omnigraph-server
+
+      - name: Package release files
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force release | Out-Null
+          Copy-Item -LiteralPath target\release\omnigraph.exe -Destination release\omnigraph.exe
+          Copy-Item -LiteralPath target\release\omnigraph-server.exe -Destination release\omnigraph-server.exe
+
+          $files = @(
+            'release\omnigraph.exe',
+            'release\omnigraph-server.exe'
+          )
+
+          foreach ($file in $files) {
+            if (-not (Test-Path -LiteralPath $file)) {
+              throw "missing artifact: $file"
+            }
+            $hash = Get-FileHash -Algorithm SHA256 -LiteralPath $file
+            "$($hash.Hash.ToLowerInvariant())  $(Split-Path -Leaf $file)" |
+              Set-Content -NoNewline -Path "$file.sha256"
+          }
+
+          Compress-Archive -Path release\omnigraph.exe,release\omnigraph-server.exe -DestinationPath omnigraph-windows-x64.zip -Force
+          $zipHash = Get-FileHash -Algorithm SHA256 -LiteralPath omnigraph-windows-x64.zip
+          "$($zipHash.Hash.ToLowerInvariant())  omnigraph-windows-x64.zip" |
+            Set-Content -NoNewline -Path omnigraph-windows-x64.zip.sha256
+
+      - name: Smoke test binaries
+        shell: pwsh
+        run: |
+          & .\release\omnigraph.exe --help
+          if ($LASTEXITCODE -ne 0) {
+            throw "omnigraph --help failed: $LASTEXITCODE"
+          }
+          & .\release\omnigraph-server.exe --help
+          if ($LASTEXITCODE -ne 0) {
+            throw "omnigraph-server --help failed: $LASTEXITCODE"
+          }
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: omnigraph-windows-x64
+          path: |
+            omnigraph-windows-x64.zip
+            omnigraph-windows-x64.zip.sha256
+            release/omnigraph.exe
+            release/omnigraph.exe.sha256
+            release/omnigraph-server.exe
+            release/omnigraph-server.exe.sha256
+          if-no-files-found: error
+          retention-days: 14
