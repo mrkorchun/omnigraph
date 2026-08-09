@@ -1,3 +1,10 @@
+// Both the read namespace (BranchManifestNamespace) and the write namespace
+// (StagedTableNamespace) are now test-only contract validation. Reads open
+// sub-tables directly by location+version (SubTableEntry::open, Fix 2), and
+// writes open the table head directly by URI (TableStore::open_dataset_head,
+// RFC-013 step 3a), so nothing in production routes through the Lance namespace
+// anymore. These impls are retained only to validate the LanceNamespace
+// contract in unit tests.
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -10,7 +17,9 @@ use lance_namespace::models::{
 };
 use lance_namespace::{Error as LanceNamespaceError, LanceNamespace, NamespaceError};
 use lance_table::io::commit::ManifestNamingScheme;
-use object_store::{Error as ObjectStoreError, ObjectStore as _, PutMode, PutOptions, path::Path};
+use object_store::{
+    Error as ObjectStoreError, ObjectStore as _, ObjectStoreExt, PutMode, PutOptions, path::Path,
+};
 
 use crate::error::{OmniError, Result};
 
@@ -98,9 +107,16 @@ impl StagedTableNamespace {
     }
 
     async fn open_head(&self) -> Result<Dataset> {
-        Dataset::open(&self.table_uri())
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))
+        // A staged-table namespace opens a DATA table (its `table_uri` is the
+        // per-table physical path), so its opens count in the data-table
+        // bucket, not the internal/manifest one.
+        crate::instrumentation::open_dataset(
+            &self.table_uri(),
+            crate::instrumentation::VersionResolution::Latest,
+            None,
+            crate::instrumentation::table_wrapper(),
+        )
+        .await
     }
 
     async fn open_version(&self, version: u64) -> Result<Dataset> {
@@ -153,41 +169,6 @@ pub(crate) fn staged_table_namespace(
     ))
 }
 
-async fn load_table_from_namespace(
-    namespace: Arc<dyn LanceNamespace>,
-    table_key: &str,
-    branch: Option<&str>,
-    version: Option<u64>,
-) -> Result<Dataset> {
-    let builder = DatasetBuilder::from_namespace(namespace, vec![table_key.to_string()])
-        .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
-    let builder = match (branch, version) {
-        (Some(branch), version) => builder.with_branch(branch, version),
-        (None, Some(version)) => builder.with_version(version),
-        (None, None) => builder,
-    };
-    builder
-        .load()
-        .await
-        .map_err(|e| OmniError::Lance(e.to_string()))
-}
-
-pub(crate) async fn open_table_at_version_from_manifest(
-    root_uri: &str,
-    table_key: &str,
-    branch: Option<&str>,
-    version: u64,
-) -> Result<Dataset> {
-    load_table_from_namespace(
-        branch_manifest_namespace(root_uri, branch),
-        table_key,
-        branch,
-        Some(version),
-    )
-    .await
-}
-
 #[async_trait]
 impl LanceNamespace for BranchManifestNamespace {
     fn namespace_id(&self) -> String {
@@ -230,6 +211,11 @@ impl LanceNamespace for BranchManifestNamespace {
             metadata: None,
             properties: None,
             managed_versioning: Some(true),
+            // Every table we return from describe_table is physically
+            // materialized (open_manifest_dataset succeeds), never just
+            // "declared." See lance-namespace 6.0.1 DescribeTableResponse
+            // field docs.
+            is_only_declared: Some(false),
         })
     }
 
@@ -373,6 +359,11 @@ impl LanceNamespace for StagedTableNamespace {
             metadata: None,
             properties: None,
             managed_versioning: Some(true),
+            // Every table we return from describe_table is physically
+            // materialized (open_manifest_dataset succeeds), never just
+            // "declared." See lance-namespace 6.0.1 DescribeTableResponse
+            // field docs.
+            is_only_declared: Some(false),
         })
     }
 
@@ -531,19 +522,4 @@ impl LanceNamespace for StagedTableNamespace {
         }));
         Ok(response)
     }
-}
-
-pub(crate) async fn open_table_head_for_write(
-    root_uri: &str,
-    table_key: &str,
-    table_path: &str,
-    branch: Option<&str>,
-) -> Result<Dataset> {
-    load_table_from_namespace(
-        staged_table_namespace(root_uri, table_key, table_path, branch),
-        table_key,
-        branch,
-        None,
-    )
-    .await
 }

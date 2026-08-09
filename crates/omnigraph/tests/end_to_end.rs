@@ -233,8 +233,15 @@ async fn overwrite_replaces_data() {
         .await
         .unwrap();
 
-    // Overwrite with just one person
-    let small = r#"{"type": "Person", "data": {"name": "Zara", "age": 40}}"#;
+    // Overwrite to a small SELF-CONSISTENT image. Overwrite is per-table, so a
+    // Person-only overwrite would drop Alice/Bob while the retained Knows/WorksAt
+    // edges still reference them — a now-rejected orphan (see
+    // `validators::overwrite_node_removal_rejects_retained_orphan_edge`). To
+    // replace the graph, overwrite the edge tables too; Company stays retained
+    // and Zara->Acme references it.
+    let small = r#"{"type": "Person", "data": {"name": "Zara", "age": 40}}
+{"edge": "Knows", "from": "Zara", "to": "Zara"}
+{"edge": "WorksAt", "from": "Zara", "to": "Acme"}"#;
     load_jsonl(&mut db, small, LoadMode::Overwrite)
         .await
         .unwrap();
@@ -1865,4 +1872,155 @@ async fn ensure_indices_does_not_error_on_repeated_call() {
     let snap = snapshot_main(&db).await.unwrap();
     let ds = snap.open("node:Person").await.unwrap();
     assert_eq!(ds.count_rows(None).await.unwrap(), 4);
+}
+
+// ─── DataFusion-Expr filter pushdown (Tier-1 follow-up to the Lance v6 bump) ──
+
+/// Regression for `CompOp::Contains` pushdown via `array_has` in
+/// `ir_filter_to_expr`. Before the Expr-pushdown refactor, the
+/// `ir_filter_to_sql` family returned `None` for list-contains (the
+/// comment said *"Can't pushdown list contains"*) and the predicate was
+/// applied post-scan in memory. With `Scanner::filter_expr(Expr)` and
+/// DF's `array_has` builtin, the contains predicate now pushes down to
+/// Lance — the test confirms results are correct AND the pushdown path
+/// is exercised (a regression on the pushdown would land all rows in
+/// the scan, then be filtered post-hoc; that still produces the right
+/// count so this test pins correctness, while `lance_surface_guards.rs`
+/// is the structural pin for the surface itself).
+#[tokio::test]
+async fn ir_filter_with_list_contains_pushes_down() {
+    let schema = r#"
+node Doc {
+    slug: String @key
+    tags: [String]
+}
+"#;
+    let data = r#"{"type":"Doc","data":{"slug":"alpha","tags":["red","blue"]}}
+{"type":"Doc","data":{"slug":"bravo","tags":["green"]}}
+{"type":"Doc","data":{"slug":"charlie","tags":["red","green"]}}
+{"type":"Doc","data":{"slug":"delta","tags":[]}}"#;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Omnigraph::init(dir.path().to_str().unwrap(), schema)
+        .await
+        .unwrap();
+    load_jsonl(&mut db, data, LoadMode::Overwrite)
+        .await
+        .unwrap();
+
+    let queries = r#"
+query docs_with_tag($tag: String) {
+    match {
+        $d: Doc
+        $d.tags contains $tag
+    }
+    return { $d.slug }
+}
+"#;
+    let result = query_main(
+        &mut db,
+        queries,
+        "docs_with_tag",
+        &params(&[("$tag", "red")]),
+    )
+    .await
+    .unwrap();
+
+    let batch = result.concat_batches().unwrap();
+    let slugs = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let mut got: Vec<&str> = (0..slugs.len()).map(|i| slugs.value(i)).collect();
+    got.sort();
+    assert_eq!(
+        got,
+        vec!["alpha", "charlie"],
+        "contains-pushdown should return exactly the rows whose tags list contains 'red'"
+    );
+}
+
+// ─── Maintenance in the full lifecycle: optimize (compaction) ────────────────
+
+/// `optimize` (Lance compaction) is part of a realistic graph lifecycle: it
+/// advances the Lance HEAD and publishes the compacted version to the manifest.
+/// The rest of the flow must keep working across that boundary — reads observe
+/// the compacted data, strict updates (which check Lance HEAD == manifest
+/// version) still commit, inserts still commit, and the state survives a reopen
+/// (the open-time recovery sweep finds no leftover drift). Before optimize
+/// published its compaction, the manifest lagged the Lance HEAD here and the
+/// post-optimize update below failed with "stale view ... refresh and retry".
+#[tokio::test]
+async fn full_flow_optimize_then_query_update_and_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let mut db = init_and_load(&dir).await;
+
+    // Build several Person fragments so compaction has something to merge.
+    for (name, age) in [("Eve", 40), ("Frank", 41), ("Grace", 42)] {
+        mutate_main(
+            &mut db,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", name)], &[("$age", age)]),
+        )
+        .await
+        .unwrap();
+    }
+
+    let stats = db.optimize().await.unwrap();
+    assert!(
+        stats.iter().any(|s| s.committed),
+        "a multi-fragment table should have compacted in this flow"
+    );
+
+    // Reads observe the compacted data.
+    let qr = query_main(
+        &mut db,
+        TEST_QUERIES,
+        "get_person",
+        &params(&[("$name", "Alice")]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(qr.num_rows(), 1);
+
+    // Strict update after optimize commits (previously failed with "stale view"
+    // because the manifest lagged the compacted Lance HEAD).
+    let upd = mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "set_age",
+        &mixed_params(&[("$name", "Alice")], &[("$age", 31)]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(upd.affected_nodes, 1);
+
+    // Insert after optimize also commits.
+    mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Ivan")], &[("$age", 50)]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(count_rows(&db, "node:Person").await, 8); // 4 seed + Eve/Frank/Grace + Ivan
+
+    // State survives a reopen — the recovery sweep runs and finds no drift.
+    drop(db);
+    let reopened = Omnigraph::open(&uri).await.unwrap();
+    assert_eq!(count_rows(&reopened, "node:Person").await, 8);
+    let alice = reopened
+        .entity_at_target(ReadTarget::branch("main"), "node:Person", "Alice")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        alice["age"],
+        serde_json::json!(31),
+        "Alice's post-optimize age update must persist across reopen"
+    );
 }

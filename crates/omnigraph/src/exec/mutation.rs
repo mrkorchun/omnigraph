@@ -338,113 +338,6 @@ fn build_insert_batch(
     RecordBatch::try_new(schema.clone(), columns).map_err(|e| OmniError::Lance(e.to_string()))
 }
 
-async fn validate_edge_insert_endpoints(
-    db: &Omnigraph,
-    staging: &MutationStaging,
-    branch: Option<&str>,
-    edge_name: &str,
-    assignments: &HashMap<String, Literal>,
-) -> Result<()> {
-    let edge_type = db
-        .catalog()
-        .edge_types
-        .get(edge_name)
-        .ok_or_else(|| OmniError::manifest(format!("unknown edge type '{}'", edge_name)))?;
-    let from = match assignments.get("from") {
-        Some(Literal::String(value)) => value.as_str(),
-        Some(other) => {
-            return Err(OmniError::manifest(format!(
-                "edge {} from endpoint must be a string id, got {}",
-                edge_name,
-                literal_to_sql(other)
-            )));
-        }
-        None => {
-            return Err(OmniError::manifest(format!(
-                "edge {} missing 'from' endpoint",
-                edge_name
-            )));
-        }
-    };
-    let to = match assignments.get("to") {
-        Some(Literal::String(value)) => value.as_str(),
-        Some(other) => {
-            return Err(OmniError::manifest(format!(
-                "edge {} to endpoint must be a string id, got {}",
-                edge_name,
-                literal_to_sql(other)
-            )));
-        }
-        None => {
-            return Err(OmniError::manifest(format!(
-                "edge {} missing 'to' endpoint",
-                edge_name
-            )));
-        }
-    };
-
-    ensure_node_id_exists(db, staging, branch, &edge_type.from_type, from, "src").await?;
-    ensure_node_id_exists(db, staging, branch, &edge_type.to_type, to, "dst").await?;
-    Ok(())
-}
-
-/// Quick scan of pending batches for an `id` value match. Used by the
-/// mutation path's edge endpoint validation to satisfy read-your-writes
-/// for same-query inserts before they're committed to Lance.
-fn pending_batches_contain_id(batches: &[RecordBatch], id: &str) -> bool {
-    for batch in batches {
-        let Some(col) = batch.column_by_name("id") else {
-            continue;
-        };
-        let Some(arr) = col.as_any().downcast_ref::<StringArray>() else {
-            continue;
-        };
-        for i in 0..arr.len() {
-            if arr.is_valid(i) && arr.value(i) == id {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-async fn ensure_node_id_exists(
-    db: &Omnigraph,
-    staging: &MutationStaging,
-    branch: Option<&str>,
-    node_type: &str,
-    id: &str,
-    label: &str,
-) -> Result<()> {
-    let table_key = format!("node:{}", node_type);
-
-    // Prefer the in-query pending accumulator so a same-query insert of
-    // the referenced node is visible to this validation. Fall back to
-    // the pre-mutation manifest snapshot when nothing pending matches.
-    let pending = staging.pending_batches(&table_key);
-    if pending_batches_contain_id(pending, id) {
-        return Ok(());
-    }
-
-    let filter = format!("id = '{}'", id.replace('\'', "''"));
-    let snapshot = db.snapshot_for_branch(branch).await?;
-    let ds = snapshot.open(&table_key).await?;
-    let exists = ds
-        .count_rows(Some(filter))
-        .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?
-        > 0;
-
-    if exists {
-        Ok(())
-    } else {
-        Err(OmniError::manifest(format!(
-            "{} '{}' not found in {}",
-            label, id, node_type
-        )))
-    }
-}
-
 /// Convert an IRMutationPredicate to a Lance SQL filter string.
 fn predicate_to_sql(
     predicate: &IRMutationPredicate,
@@ -478,6 +371,12 @@ fn predicate_to_sql(
         }
     };
 
+    // #283: emit the column UNQUOTED. Lance's `Scanner::filter(&str)` (the
+    // committed-scan consumer) preserves an unquoted identifier's case but
+    // treats a double-quoted `"col"` as a string literal, so quoting here
+    // would silently match zero committed rows. The pending-batch MemTable
+    // query is instead made case-preserving by disabling DataFusion identifier
+    // normalization on its `SessionContext` (see `scan_pending_batches`).
     Ok(format!("{} {} {}", column, op, value_sql))
 }
 
@@ -560,87 +459,121 @@ fn apply_assignments(
 
 use super::staging::{MutationStaging, PendingMode};
 
-/// Open a sub-table dataset for read or inline-commit-write within the
-/// current mutation query, capturing pre-write metadata in `staging` on
-/// first touch. The captured version is the publisher's CAS fence at
-/// end-of-query (per-table OCC).
+/// Open a sub-table dataset for read or staged write within the current
+/// mutation query, capturing pre-write metadata in `staging` on first touch.
+/// The captured version is the publisher's CAS fence at end-of-query
+/// (per-table OCC).
 ///
 /// On first touch, opens the dataset at HEAD on the requested branch
 /// via `open_for_mutation_on_branch`, which compares Lance HEAD against
 /// the manifest's pinned version — that fence is the engine's
 /// publisher-style OCC catching cross-writer drift before we make any
-/// changes.
+/// changes. For delete-only queries, this strict open is also the uncovered
+/// drift guard.
 ///
-/// On subsequent touches *within the same query*, behavior depends on
-/// whether the table has already been inline-committed by a delete op:
-///
-/// - **Insert / update path (no inline commit between touches).** Lance
-///   HEAD has not moved since first touch, so a fresh
-///   `open_for_mutation_on_branch` would still match the manifest
-///   pinned version. We just go through it again; `ensure_path` is a
-///   no-op (idempotent on the captured `expected_version`).
-/// - **Delete cascade or multi-delete on the same table.** A prior
-///   `delete_where` on this table has already advanced Lance HEAD past
-///   the manifest's pinned version (the manifest doesn't move until
-///   end-of-query). Going through `open_for_mutation_on_branch` again
-///   would trip its `ensure_expected_version` equality check
-///   (`actual = pinned + 1` vs `expected = pinned`). Instead we route
-///   through `reopen_for_mutation` at the post-inline-commit Lance
-///   version captured in `staging.inline_committed[table_key]`, which
-///   is the source of truth for "where is Lance HEAD right now on
-///   this table within this query."
-///
-/// The `inline_committed` reopen branch closes the multi-delete-on-same-table
-/// failure path that pre-staged-write engines inherited. The branch goes
-/// away once Lance exposes a two-phase delete API
-/// ([lance-format/lance#6658](https://github.com/lance-format/lance/issues/6658))
-/// and we can stage deletes on the same path as inserts/updates.
+/// On subsequent touches *within the same query*, Lance HEAD has not moved
+/// since first touch — inserts, updates AND deletes all stage their work and
+/// defer every HEAD advance to the end-of-query commit, so no op inline-commits
+/// between touches. A fresh `open_for_mutation_on_branch` therefore still
+/// matches the manifest pinned version; we go through it again and `ensure_path`
+/// is a no-op (idempotent on the captured `expected_version`). This holds for a
+/// delete cascade or multiple delete statements hitting the same table: each
+/// touch records another predicate (`record_delete`), and `stage_all` combines
+/// them into one staged delete — there is no post-inline-commit reopen to
+/// special-case anymore.
+impl Omnigraph {
+}
+
 async fn open_table_for_mutation(
     db: &Omnigraph,
     staging: &mut MutationStaging,
     branch: Option<&str>,
     table_key: &str,
-) -> Result<(Dataset, String, Option<String>)> {
-    if let Some(prior) = staging.inline_committed.get(table_key) {
-        let path = staging.paths.get(table_key).ok_or_else(|| {
-            OmniError::manifest_internal(format!(
-                "open_table_for_mutation: inline_committed[{}] without paths entry",
-                table_key
-            ))
-        })?;
-        let ds = db
-            .reopen_for_mutation(
-                table_key,
-                &path.full_path,
-                path.table_branch.as_deref(),
-                prior.table_version,
-            )
-            .await?;
-        return Ok((ds, path.full_path.clone(), path.table_branch.clone()));
-    }
-    let (ds, full_path, table_branch) =
-        db.open_for_mutation_on_branch(branch, table_key).await?;
-    let expected_version = ds.version().version;
+    op_kind: crate::db::MutationOpKind,
+    txn: Option<&crate::db::WriteTxn>,
+) -> Result<(Option<SnapshotHandle>, String, Option<String>)> {
+    // `open_for_mutation_on_branch` returns the expected version even when it
+    // skips the open (collapse #1, the non-strict insert/merge path): the version
+    // is the pinned base's, identical to the opened handle's `.version()`. Use it
+    // directly for `ensure_path` so the no-open path still captures the publisher
+    // CAS fence.
+    let opened = db
+        .open_for_mutation_on_branch(branch, table_key, op_kind, txn)
+        .await?;
+    // Pin the open-skip contract (collapse #1): a missing handle is legal ONLY on
+    // the non-strict `txn` path. A future change that returns `None` elsewhere
+    // (e.g. a new strict arm) trips this in debug builds rather than silently
+    // handing a `None` to a `require_handle` consumer.
+    debug_assert!(
+        opened.handle.is_some() || (txn.is_some() && !op_kind.strict_pre_stage_version_check()),
+        "open_for_mutation_on_branch returned no handle outside the non-strict txn open-skip path",
+    );
     staging.ensure_path(
         table_key,
-        full_path.clone(),
-        table_branch.clone(),
-        expected_version,
+        opened.full_path.clone(),
+        opened.table_branch.clone(),
+        opened.expected_version,
+        op_kind,
     );
-    Ok((ds, full_path, table_branch))
+    Ok((opened.handle, opened.full_path, opened.table_branch))
+}
+
+/// Build the committed-snapshot filter used to COUNT a delete statement's
+/// `affected_*`, excluding rows a prior delete statement on the same table
+/// already scheduled for removal in this query.
+///
+/// Deletes stage — they no longer inline-commit — so every statement in a
+/// delete-only query scans the same unchanged committed snapshot. Counting each
+/// predicate independently would double-count overlapping statements (the old
+/// inline path did not, because each delete committed before the next ran). The
+/// combined staged delete actually removes the UNION `p₁ ∪ p₂ ∪ …`; excluding
+/// the prior predicates here makes each statement contribute `|pₙ \ (p₁ ∪ …)|`,
+/// whose sum is exactly that distinct count. `base` (the original predicate) is
+/// still what gets recorded — only the count uses this exclusion.
+///
+/// LOAD-BEARING on D₂: this exclusion assumes the committed snapshot is
+/// invariant across the query's statements, which holds only because D₂
+/// (`enforce_no_mixed_destructive_constructive`) forbids mixing inserts/updates
+/// with deletes — so a delete-touched table never has pending writes that would
+/// shift what a later statement sees. If D₂ is ever relaxed, this dedup must be
+/// revisited (a later delete would then need to see prior in-query writes).
+///
+/// The exclusion uses `IS NOT TRUE`, not `NOT`, because of SQL three-valued
+/// logic: a prior predicate referencing a column that is NULL for some row
+/// (e.g. `age > 30` on a row with NULL `age`) evaluates to UNKNOWN, and
+/// `NOT UNKNOWN` is still UNKNOWN — which a `WHERE` treats as not-matched, so
+/// the row would be wrongly dropped from this statement's scan even though the
+/// prior delete never matched it (dropping it from `deleted_ids` skips its
+/// cascade, or — if it is the only match — leaves the node undeleted). Only
+/// rows a prior predicate matched as definitely TRUE should be excluded:
+/// `(prior) IS NOT TRUE` keeps both FALSE and UNKNOWN rows.
+fn dedup_delete_filter(base: &str, prior: &[String]) -> String {
+    if prior.is_empty() {
+        base.to_string()
+    } else {
+        let excluded = prior
+            .iter()
+            .map(|p| format!("({p})"))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        format!("({base}) AND (({excluded}) IS NOT TRUE)")
+    }
 }
 
 /// D₂ parse-time check: a single mutation query is either insert/update-only
 /// or delete-only. Mixed → reject before any I/O.
 ///
-/// Reason: under the staged-write writer, inserts and updates
-/// accumulate in memory and commit at end-of-query, while deletes still
-/// inline-commit (Lance lacks a public two-phase delete in 4.0.0).
-/// Mixing creates ordering hazards (same-row insert→delete becomes a no-op
-/// because the staged insert isn't visible to delete; cascading deletes
-/// of just-inserted edges break referential integrity by silent design).
-/// Until Lance exposes `DeleteJob::execute_uncommitted`, the parse-time
-/// rejection keeps both paths atomic and correct.
+/// This is a deliberate semantic boundary, not temporary scaffolding. Inserts
+/// and updates accumulate as pending in-memory batches and deletes accumulate
+/// as predicates; both stage and commit at end-of-query. Keeping a single query
+/// to one kind means read-your-writes stays unambiguous (a read never has to
+/// reconcile pending inserts against same-query delete predicates) and each
+/// touched table commits at most one version per query. Compose mixed
+/// operations by issuing separate atomic mutations (writes, then deletes), or a
+/// branch + merge when one atomic commit is required. Allowing mixing would
+/// instead demand an in-query delete view, pending pruning, and per-table
+/// two-commit ordering in the hot mutation path — complexity this boundary
+/// deliberately avoids.
 fn enforce_no_mixed_destructive_constructive(
     ir: &omnigraph_compiler::ir::MutationIR,
 ) -> Result<()> {
@@ -660,8 +593,9 @@ fn enforce_no_mixed_destructive_constructive(
         return Err(OmniError::manifest(format!(
             "mutation '{}' on the same query mixes inserts/updates and deletes; \
              split into separate mutations: (1) inserts and updates, then (2) deletes. \
-             This restriction lifts when Lance exposes a two-phase delete API \
-             (tracked: lance-format/lance#6658).",
+             A query is deliberately constructive or destructive, not both, so its \
+             read-your-writes stays unambiguous; run the two on a branch and merge \
+             if you need them in one atomic commit.",
             ir.name
         )));
     }
@@ -670,7 +604,7 @@ fn enforce_no_mixed_destructive_constructive(
 
 impl Omnigraph {
     pub async fn mutate(
-        &mut self,
+        &self,
         branch: &str,
         query_source: &str,
         query_name: &str,
@@ -681,30 +615,70 @@ impl Omnigraph {
     }
 
     pub async fn mutate_as(
-        &mut self,
+        &self,
         branch: &str,
         query_source: &str,
         query_name: &str,
         params: &ParamMap,
         actor_id: Option<&str>,
     ) -> Result<MutationResult> {
-        let previous_actor = self.audit_actor_id.clone();
-        self.audit_actor_id = actor_id.map(str::to_string);
-        let result = self
-            .mutate_with_current_actor(branch, query_source, query_name, params)
-            .await;
-        self.audit_actor_id = previous_actor;
-        result
+        // Engine-layer policy gate (MR-722 fan-out / PR #3). Scope is
+        // `Branch(branch)` to match the HTTP-layer convention at
+        // `server_change` (branch=Some(branch), target_branch=None). When no
+        // PolicyChecker is installed this is a no-op; with policy installed
+        // and actor=None this fails hard (forget-the-actor footgun guard).
+        self.enforce(
+            omnigraph_policy::PolicyAction::Change,
+            &omnigraph_policy::ResourceScope::Branch(branch.to_string()),
+            actor_id,
+        )?;
+        self.mutate_with_current_actor(branch, query_source, query_name, params, actor_id)
+            .await
+    }
+
+    /// End-of-query validation for a constructive mutation: build the change-set
+    /// from the accumulated staging and run the unified evaluator (value/enum,
+    /// uniqueness incl. cross-version, edge-RI, cardinality) against committed
+    /// state. Read-your-writes is inherent — every same-query insert is already
+    /// in the change-set. Destructive queries (D2) stage no constructive batches,
+    /// so the change-set is empty and this is a no-op (deletes cascade).
+    async fn validate_staged_mutation(
+        &self,
+        staging: &MutationStaging,
+        txn: &crate::db::WriteTxn,
+    ) -> Result<()> {
+        // RI/uniqueness read the write's already-validated pinned base (`txn.base`),
+        // NOT a fresh `snapshot_for_branch` — which would re-run the schema-contract
+        // validation the WriteTxn already did once (RFC-013 step 3b capture-once).
+        // Cardinality reads LIVE HEAD per edge table (the #298 stale-handle fix) via
+        // the live opener in `CommittedState::write`.
+        let committed =
+            crate::validate::CommittedState::write(&txn.base, self, txn.branch.as_deref());
+        // `to_changeset` carries both constructive batches and the ids the delete
+        // ops captured from their own scans (`deleted_ids`), so the evaluator
+        // recounts the srcs a delete empties (`@card`) and sees removed rows for
+        // RI — the faithful change-set the merge path also builds.
+        crate::validate::validate_changeset(&staging.to_changeset(), &committed, &self.catalog())
+            .await
     }
 
     async fn mutate_with_current_actor(
-        &mut self,
+        &self,
         branch: &str,
         query_source: &str,
         query_name: &str,
         params: &ParamMap,
+        actor_id: Option<&str>,
     ) -> Result<MutationResult> {
-        self.ensure_schema_state_valid().await?;
+        // Converge any pending recovery sidecar (a previously failed
+        // writer's Phase B → Phase C residual) before executing: the
+        // inline delete path advances Lance HEAD during execution and
+        // the staged path's commit-time drift guard refuses
+        // sidecar-covered drift, so a long-lived handle must heal here
+        // — not at restart. One `list_dir` when no sidecars exist (the
+        // steady state). MUST run before `open_write_txn` below — the heal
+        // may advance the manifest, so the pinned base must be captured after.
+        self.heal_pending_recovery_sidecars().await?;
         let requested = Self::normalize_branch_name(branch)?;
         // Reject internal `__run__*` / system-prefixed branches at the
         // public write boundary. Direct-publish paths assert this
@@ -713,23 +687,70 @@ impl Omnigraph {
         if let Some(name) = requested.as_deref() {
             crate::db::ensure_public_branch_ref(name, "mutate")?;
         }
+        // Capture-once write transaction (RFC-013 step 3b). `open_write_txn`
+        // validates the schema contract ONCE (it resolves the branch target,
+        // whose first line is `ensure_schema_state_valid`) and pins the base
+        // snapshot for this write. Threaded as `Some(&txn)` through execution,
+        // staging commit, and the manifest publish so the per-table opens and
+        // the commit-time OCC re-read reuse the pinned base instead of
+        // re-validating the contract at every resolve point. Captured AFTER the
+        // recovery heal (which may advance the manifest) and AFTER `requested`
+        // is known so it pins the post-heal snapshot for the correct branch.
+        let txn = self.open_write_txn(requested.as_deref()).await?;
         let resolved_params = enrich_mutation_params(params)?;
 
         // Per-query staging accumulator. Inserts and updates push batches
-        // into `pending`; deletes still inline-commit and record into
-        // `inline_committed`. At end-of-query, `finalize` issues one
-        // `stage_*` + `commit_staged` per pending table, then the
-        // publisher commits the manifest atomically across all touched
-        // tables. Branch is threaded explicitly — no coordinator swap.
+        // into `pending`; deletes push predicates into `delete_predicates`. At
+        // end-of-query, `finalize` issues one `stage_*` + `commit_staged` per
+        // touched table (inserts/updates/deletes alike), then the publisher
+        // commits the manifest atomically across all touched tables. Branch is
+        // threaded explicitly — no coordinator swap.
         let mut staging = MutationStaging::default();
+
+        // Lower + validate up front so the touched-table set is known before
+        // execution. A lowering/validation error returns exactly as it did
+        // when this happened inside execute_named_mutation.
+        let ir = self.lower_named_mutation(query_source, query_name)?;
+
+        // Up-front fork-queue acquisition (see the loader for the full
+        // rationale): if this mutation will fork any touched table onto a
+        // non-main branch, acquire the per-(table, branch) write queues for
+        // every touched table before the first fork and hold them through the
+        // publish, so the orphan-fork reclaim can't race a concurrent
+        // in-process fork. The touched set is derived from the lowered IR.
+        let fork_queue_guards: Option<(
+            Vec<(String, Option<String>)>,
+            Vec<tokio::sync::OwnedMutexGuard<()>>,
+        )> = if let Some(active) = requested.as_deref() {
+            let snapshot = self.snapshot_for_branch(Some(active)).await?;
+            let touched: Vec<(String, Option<String>)> = self
+                .touched_table_keys(&ir)
+                .into_iter()
+                .map(|k| (k, Some(active.to_string())))
+                .collect();
+            let needs_fork = touched.iter().any(|(table_key, _)| {
+                snapshot
+                    .entry(table_key)
+                    .map(|e| e.table_branch.as_deref() != Some(active))
+                    .unwrap_or(false)
+            });
+            if needs_fork {
+                let guards = self.write_queue().acquire_many(&touched).await;
+                Some((touched, guards))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         let exec_result = self
             .execute_named_mutation(
-                query_source,
-                query_name,
+                &ir,
                 &resolved_params,
                 requested.as_deref(),
                 &mut staging,
+                Some(&txn),
             )
             .await;
 
@@ -737,11 +758,28 @@ impl Omnigraph {
             Err(e) => Err(e),
             Ok(total) if staging.is_empty() => Ok(total),
             Ok(total) => {
-                let (updates, expected_versions, sidecar_handle) = staging
-                    .finalize(
+                self.validate_staged_mutation(&staging, &txn).await?;
+                let staged = staging.stage_all(self, requested.as_deref()).await?;
+                // `_queue_guards` holds per-(table_key, branch) write
+                // queues acquired inside `commit_all`. Held across the
+                // manifest publish below so no concurrent writer can
+                // interleave between our commit_staged and our publish
+                // (which would correctly fail our CAS but leave Lance
+                // HEAD advanced — the residual class MR-870 recovers).
+                let super::staging::CommittedMutation {
+                    updates,
+                    expected_versions,
+                    sidecar_handle,
+                    guards: _queue_guards,
+                    committed_handles,
+                } = staged
+                    .commit_all(
                         self,
                         requested.as_deref(),
                         crate::db::manifest::SidecarKind::Mutation,
+                        actor_id,
+                        fork_queue_guards,
+                        Some(&txn),
                     )
                     .await?;
                 // Failpoint that wedges the documented finalize→publisher
@@ -754,11 +792,14 @@ impl Omnigraph {
                 // across this failure so the next `Omnigraph::open`'s
                 // recovery sweep can roll forward — see
                 // `tests/failpoints.rs::recovery_rolls_forward_after_finalize_publisher_failure`.
-                crate::failpoints::maybe_fail("mutation.post_finalize_pre_publisher")?;
+                crate::failpoints::maybe_fail(crate::failpoints::names::MUTATION_POST_FINALIZE_PRE_PUBLISHER)?;
                 self.commit_updates_on_branch_with_expected(
                     requested.as_deref(),
                     &updates,
                     &expected_versions,
+                    actor_id,
+                    Some(&txn),
+                    committed_handles,
                 )
                 .await?;
                 // Phase C succeeded — sidecar can be deleted. If this
@@ -775,11 +816,8 @@ impl Omnigraph {
                     // post_commit_pin) and tidies up. Failing the user
                     // here would return an error for a write that
                     // already landed.
-                    if let Err(err) = crate::db::manifest::delete_sidecar(
-                        &handle,
-                        self.storage_adapter(),
-                    )
-                    .await
+                    if let Err(err) =
+                        crate::db::manifest::delete_sidecar(&handle, self.storage_adapter()).await
                     {
                         tracing::warn!(
                             error = %err,
@@ -793,18 +831,23 @@ impl Omnigraph {
         }
     }
 
-    async fn execute_named_mutation(
-        &mut self,
+    /// Lower + validate a named mutation query into its IR.
+    ///
+    /// Hoisted out of [`Self::execute_named_mutation`] so the caller can
+    /// inspect the IR before execution — specifically to compute the
+    /// touched-table set (see [`Self::touched_table_keys`]) for up-front
+    /// write-queue acquisition. Performs the same find → typecheck → lower
+    /// → D₂ checks that execution previously did inline, so error behavior
+    /// is unchanged.
+    fn lower_named_mutation(
+        &self,
         query_source: &str,
         query_name: &str,
-        params: &ParamMap,
-        branch: Option<&str>,
-        staging: &mut MutationStaging,
-    ) -> Result<MutationResult> {
+    ) -> Result<omnigraph_compiler::ir::MutationIR> {
         let query_decl = omnigraph_compiler::find_named_query(query_source, query_name)
             .map_err(|e| OmniError::manifest(e.to_string()))?;
 
-        let checked = typecheck_query_decl(self.catalog(), &query_decl)?;
+        let checked = typecheck_query_decl(&self.catalog(), &query_decl)?;
         match checked {
             CheckedQuery::Mutation(_) => {}
             CheckedQuery::Read(_) => {
@@ -817,7 +860,62 @@ impl Omnigraph {
         let ir = lower_mutation_query(&query_decl)?;
         // D₂: reject mixed insert/update + delete before any I/O.
         enforce_no_mixed_destructive_constructive(&ir)?;
+        Ok(ir)
+    }
 
+    /// The COMPLETE set of `(node|edge):{type}` table keys a mutation IR can
+    /// touch at execution time, keyed as `MutationStaging`/`commit_all` key
+    /// them. Must be a superset of everything execution forks/commits, since
+    /// it drives the up-front fork-queue acquisition and `commit_all`'s
+    /// held-guard coverage check — a miss means an unserialized fork/commit.
+    ///
+    /// The set is a pure function of (IR ops + catalog). For each op it mirrors
+    /// the execute path's node-vs-edge dispatch (`node_types` first, then
+    /// `edge_types`). A `delete <Node>` additionally **cascades** to every edge
+    /// type whose endpoint is that node (see `execute_delete_node`), forking
+    /// those edge tables during execution — so they are included here, derived
+    /// the same way the executor derives them (`from_type`/`to_type` match).
+    /// Unknown types are skipped (the execute path surfaces the error).
+    /// Sorted + deduped for one-shot `acquire_many`.
+    fn touched_table_keys(&self, ir: &omnigraph_compiler::ir::MutationIR) -> Vec<String> {
+        use omnigraph_compiler::ir::MutationOpIR;
+        let catalog = self.catalog();
+        let mut keys: Vec<String> = Vec::new();
+        for op in &ir.ops {
+            let type_name = match op {
+                MutationOpIR::Insert { type_name, .. }
+                | MutationOpIR::Update { type_name, .. }
+                | MutationOpIR::Delete { type_name, .. } => type_name,
+            };
+            if catalog.node_types.contains_key(type_name) {
+                keys.push(format!("node:{type_name}"));
+                // A node delete cascades to every edge touching this node type,
+                // forking those edge tables. Include them so the up-front
+                // acquisition covers the cascade (mirrors execute_delete_node).
+                if matches!(op, MutationOpIR::Delete { .. }) {
+                    for (edge_name, edge_type) in &catalog.edge_types {
+                        if edge_type.from_type == *type_name || edge_type.to_type == *type_name {
+                            keys.push(format!("edge:{edge_name}"));
+                        }
+                    }
+                }
+            } else if catalog.edge_types.contains_key(type_name) {
+                keys.push(format!("edge:{type_name}"));
+            }
+        }
+        keys.sort();
+        keys.dedup();
+        keys
+    }
+
+    async fn execute_named_mutation(
+        &self,
+        ir: &omnigraph_compiler::ir::MutationIR,
+        params: &ParamMap,
+        branch: Option<&str>,
+        staging: &mut MutationStaging,
+        txn: Option<&crate::db::WriteTxn>,
+    ) -> Result<MutationResult> {
         let mut total = MutationResult::default();
         for op in &ir.ops {
             let result = match op {
@@ -825,7 +923,7 @@ impl Omnigraph {
                     type_name,
                     assignments,
                 } => {
-                    self.execute_insert(type_name, assignments, params, branch, staging)
+                    self.execute_insert(type_name, assignments, params, branch, staging, txn)
                         .await?
                 }
                 MutationOpIR::Update {
@@ -834,12 +932,7 @@ impl Omnigraph {
                     predicate,
                 } => {
                     self.execute_update(
-                        type_name,
-                        assignments,
-                        predicate,
-                        params,
-                        branch,
-                        staging,
+                        type_name, assignments, predicate, params, branch, staging, txn,
                     )
                     .await?
                 }
@@ -847,7 +940,7 @@ impl Omnigraph {
                     type_name,
                     predicate,
                 } => {
-                    self.execute_delete(type_name, predicate, params, branch, staging)
+                    self.execute_delete(type_name, predicate, params, branch, staging, txn)
                         .await?
                 }
             };
@@ -858,12 +951,13 @@ impl Omnigraph {
     }
 
     async fn execute_insert(
-        &mut self,
+        &self,
         type_name: &str,
         assignments: &[IRAssignment],
         params: &ParamMap,
         branch: Option<&str>,
         staging: &mut MutationStaging,
+        txn: Option<&crate::db::WriteTxn>,
     ) -> Result<MutationResult> {
         let mut resolved: HashMap<String, Literal> = HashMap::new();
         for a in assignments {
@@ -893,21 +987,21 @@ impl Omnigraph {
             };
 
             let batch = build_insert_batch(&schema, &id, &resolved, &blob_props)?;
-            crate::loader::validate_value_constraints(&batch, node_type)?;
-            crate::loader::validate_enum_constraints(&batch, &node_type.properties, type_name)?;
-            let unique_props = crate::loader::unique_property_names_for_node(node_type);
-            if !unique_props.is_empty() {
-                crate::loader::enforce_unique_constraints_intra_batch(
-                    &batch,
-                    type_name,
-                    &unique_props,
-                )?;
-            }
+            // Validation (value/enum/unique) runs end-of-query via the evaluator.
             let has_key = node_type.key_property().is_some();
             let table_key = format!("node:{}", type_name);
             // Capture pre-write metadata on first touch (no Lance write).
+            let insert_kind = if has_key {
+                crate::db::MutationOpKind::Merge
+            } else {
+                crate::db::MutationOpKind::Insert
+            };
+            // Node inserts are non-strict (Insert/Merge), so with a `WriteTxn`
+            // this opens NOTHING (collapse #1) — the handle is discarded anyway;
+            // only `ensure_path`'s captured version (read inside
+            // `open_table_for_mutation`) is used downstream.
             let (_ds, _full_path, _table_branch) =
-                open_table_for_mutation(self, staging, branch, &table_key).await?;
+                open_table_for_mutation(self, staging, branch, &table_key, insert_kind, txn).await?;
             // Accumulate. @key inserts go into the Merge stream (so a
             // later update on the same id coalesces correctly); no-key
             // inserts go into the Append stream.
@@ -929,36 +1023,25 @@ impl Omnigraph {
             let id = ulid::Ulid::new().to_string();
 
             let batch = build_insert_batch(&schema, &id, &resolved, &blob_props)?;
-            validate_edge_insert_endpoints(self, staging, branch, type_name, &resolved).await?;
-            crate::loader::validate_enum_constraints(&batch, &edge_type.properties, type_name)?;
-            let unique_props = crate::loader::unique_property_names_for_edge(edge_type);
-            if !unique_props.is_empty() {
-                crate::loader::enforce_unique_constraints_intra_batch(
-                    &batch,
-                    type_name,
-                    &unique_props,
-                )?;
-            }
+            // Validation (edge-RI, enum, unique, @card against LIVE HEAD) runs
+            // end-of-query via the evaluator.
             let table_key = format!("edge:{}", type_name);
-            // Capture pre-write metadata on first touch (no Lance write).
-            let (ds, _full_path, _table_branch) =
-                open_table_for_mutation(self, staging, branch, &table_key).await?;
-            // Accumulate the new edge row. Edge IDs are ULID-generated so
-            // Append mode is correct (no key-based dedup needed).
-            staging.append_batch(&table_key, schema, PendingMode::Append, batch.clone())?;
-
-            // Edge cardinality validation: scan committed edges via Lance
-            // + iterate pending edges in-memory for the `src` column,
-            // group-by-src. The pending side already includes the row
-            // we just appended (above).
-            validate_edge_cardinality_with_pending(
+            // Capture pre-write metadata on first touch (ensure_path). Edge
+            // inserts are non-strict, so with a `WriteTxn` this opens NOTHING
+            // (collapse #1) and the handle is discarded — validation, including
+            // `@card` against LIVE HEAD, runs end-of-query via the evaluator.
+            let (_handle, _full_path, _table_branch) = open_table_for_mutation(
                 self,
-                &ds,
                 staging,
+                branch,
                 &table_key,
-                edge_type,
+                crate::db::MutationOpKind::Insert,
+                txn,
             )
             .await?;
+            // Accumulate the new edge row. Edge IDs are ULID-generated so
+            // Append mode is correct (no key-based dedup needed).
+            staging.append_batch(&table_key, schema, PendingMode::Append, batch)?;
 
             self.invalidate_graph_index().await;
 
@@ -972,13 +1055,14 @@ impl Omnigraph {
     }
 
     async fn execute_update(
-        &mut self,
+        &self,
         type_name: &str,
         assignments: &[IRAssignment],
         predicate: &IRMutationPredicate,
         params: &ParamMap,
         branch: Option<&str>,
         staging: &mut MutationStaging,
+        txn: Option<&crate::db::WriteTxn>,
     ) -> Result<MutationResult> {
         // Defense in depth: ensure this is a node type
         if !self.catalog().node_types.contains_key(type_name) {
@@ -1003,8 +1087,18 @@ impl Omnigraph {
         let blob_props = self.catalog().node_types[type_name].blob_properties.clone();
 
         let table_key = format!("node:{}", type_name);
-        let (ds, _full_path, _table_branch) =
-            open_table_for_mutation(self, staging, branch, &table_key).await?;
+        let (handle, _full_path, _table_branch) = open_table_for_mutation(
+            self,
+            staging,
+            branch,
+            &table_key,
+            crate::db::MutationOpKind::Update,
+            txn,
+        )
+        .await?;
+        // Update is a STRICT op, so collapse #1 never skips its open — the
+        // handle is always `Some` (and it's needed for the committed scan below).
+        let ds = handle.expect("strict Update op always opens its dataset");
 
         // Scan committed via Lance + apply the same predicate to pending
         // batches via DataFusion `MemTable` (read-your-writes for prior
@@ -1035,7 +1129,7 @@ impl Omnigraph {
         // and a chained `update where <pred>` can match a row whose
         // pending value no longer satisfies <pred>.
         let batches = self
-            .table_store()
+            .storage()
             .scan_with_pending(
                 &ds,
                 pending_batches,
@@ -1070,17 +1164,7 @@ impl Omnigraph {
             resolved.insert(a.property.clone(), resolve_expr_value(&a.value, params)?);
         }
         let updated = apply_assignments(&schema, &matched, &resolved, &blob_props)?;
-        let node_type = &self.catalog().node_types[type_name];
-        crate::loader::validate_value_constraints(&updated, node_type)?;
-        crate::loader::validate_enum_constraints(&updated, &node_type.properties, type_name)?;
-        let unique_props = crate::loader::unique_property_names_for_node(node_type);
-        if !unique_props.is_empty() {
-            crate::loader::enforce_unique_constraints_intra_batch(
-                &updated,
-                type_name,
-                &unique_props,
-            )?;
-        }
+        // Validation (value/enum/unique) runs end-of-query via the evaluator.
 
         // Accumulate the updated batch into the Merge-mode pending stream.
         // The accumulator may now contain entries with the same id as a
@@ -1097,59 +1181,64 @@ impl Omnigraph {
     }
 
     async fn execute_delete(
-        &mut self,
+        &self,
         type_name: &str,
         predicate: &IRMutationPredicate,
         params: &ParamMap,
         branch: Option<&str>,
         staging: &mut MutationStaging,
+        txn: Option<&crate::db::WriteTxn>,
     ) -> Result<MutationResult> {
         let is_node = self.catalog().node_types.contains_key(type_name);
         if is_node {
-            self.execute_delete_node(type_name, predicate, params, branch, staging)
+            self.execute_delete_node(type_name, predicate, params, branch, staging, txn)
                 .await
         } else {
-            self.execute_delete_edge(type_name, predicate, params, branch, staging)
+            self.execute_delete_edge(type_name, predicate, params, branch, staging, txn)
                 .await
         }
     }
 
     async fn execute_delete_node(
-        &mut self,
+        &self,
         type_name: &str,
         predicate: &IRMutationPredicate,
         params: &ParamMap,
         branch: Option<&str>,
         staging: &mut MutationStaging,
+        txn: Option<&crate::db::WriteTxn>,
     ) -> Result<MutationResult> {
         let pred_sql = predicate_to_sql(predicate, params, false)?;
 
         let table_key = format!("node:{}", type_name);
-        let (ds, full_path, table_branch) =
-            open_table_for_mutation(self, staging, branch, &table_key).await?;
-        let initial_version = ds.version().version;
+        let (handle, _full_path, _table_branch) = open_table_for_mutation(
+            self,
+            staging,
+            branch,
+            &table_key,
+            crate::db::MutationOpKind::Delete,
+            txn,
+        )
+        .await?;
+        // Delete is a STRICT op, so collapse #1 never skips its open.
+        let ds = handle.expect("strict Delete op always opens its dataset");
 
         // Scan matching IDs for cascade. Per D₂ this never overlaps with
         // staged inserts (mixed insert/delete in one query is rejected at
-        // parse time), so we scan committed only.
+        // parse time), so we scan committed only. Exclude IDs a prior delete
+        // statement on this table already scheduled (deletes stage, so the
+        // committed snapshot is unchanged across statements): without this,
+        // overlapping predicates would double-count `affected_nodes` AND
+        // re-cascade already-deleted nodes' edges. The combined staged delete
+        // still removes the union, so we record the original `pred_sql` below.
+        let scan_filter =
+            dedup_delete_filter(&pred_sql, staging.recorded_delete_predicates(&table_key));
         let batches = self
-            .table_store()
-            .scan(&ds, Some(&["id"]), Some(&pred_sql), None)
+            .storage()
+            .scan(&ds, Some(&["id"]), Some(&scan_filter), None)
             .await?;
 
-        let deleted_ids: Vec<String> = batches
-            .iter()
-            .flat_map(|batch| {
-                let ids = batch
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .unwrap();
-                (0..ids.len())
-                    .map(|i| ids.value(i).to_string())
-                    .collect::<Vec<_>>()
-            })
-            .collect();
+        let deleted_ids: Vec<String> = ids_from_batches(&batches);
 
         if deleted_ids.is_empty() {
             return Ok(MutationResult {
@@ -1160,31 +1249,16 @@ impl Omnigraph {
 
         let affected_nodes = deleted_ids.len();
 
-        // Delete nodes — still inline-commit (Lance's `Dataset::delete` is
-        // not exposed as a two-phase op in 4.0.0). D₂ keeps inserts and
-        // deletes from coexisting in one query, so this advance of Lance
-        // HEAD is the only HEAD movement during the query and the
-        // publisher's CAS captures it intact.
-        let mut ds = self
-            .reopen_for_mutation(
-                &table_key,
-                &full_path,
-                table_branch.as_deref(),
-                initial_version,
-            )
-            .await?;
-        let delete_state = self
-            .table_store()
-            .delete_where(&full_path, &mut ds, &pred_sql)
-            .await?;
-
-        staging.record_inline(crate::db::SubTableUpdate {
-            table_key: table_key.clone(),
-            table_version: delete_state.version,
-            table_branch: table_branch.clone(),
-            row_count: delete_state.row_count,
-            version_metadata: delete_state.version_metadata,
-        });
+        // Record the node delete as a staged predicate. D₂ keeps inserts and
+        // deletes from coexisting in one query, so this table carries no
+        // pending write batches; `stage_all` turns the predicate into one
+        // `stage_delete` (a deletion-vector transaction) that advances Lance
+        // HEAD only at the unified end-of-query commit — no inline residual.
+        // `open_table_for_mutation` above already captured the table's
+        // path/version/op-kind via `ensure_path`.
+        crate::failpoints::maybe_fail(crate::failpoints::names::MUTATION_DELETE_NODE_PRE_PRIMARY_DELETE)?;
+        staging.record_deleted_ids(&table_key, &deleted_ids);
+        staging.record_delete(&table_key, pred_sql.clone());
 
         let mut affected_edges = 0usize;
         let escaped: Vec<String> = deleted_ids
@@ -1214,24 +1288,45 @@ impl Omnigraph {
 
             let edge_table_key = format!("edge:{}", edge_name);
             let cascade_filter = cascade_filters.join(" OR ");
-            let (mut edge_ds, edge_full_path, edge_table_branch) =
-                open_table_for_mutation(self, staging, branch, &edge_table_key).await?;
+            let (edge_handle, _edge_full_path, _edge_table_branch) = open_table_for_mutation(
+                self,
+                staging,
+                branch,
+                &edge_table_key,
+                crate::db::MutationOpKind::Delete,
+                txn,
+            )
+            .await?;
+            // Delete is a STRICT op, so collapse #1 never skips its open.
+            let edge_ds = edge_handle.expect("strict Delete op always opens its dataset");
 
-            let edge_delete = self
-                .table_store()
-                .delete_where(&edge_full_path, &mut edge_ds, &cascade_filter)
-                .await?;
+            // `affected_edges` was the post-inline-commit `deleted_rows`; with
+            // staged deletes the rows aren't removed until end-of-query, so
+            // count the matching committed edges now. Exact under D₂ (no staged
+            // inserts can add matches mid-query), and bounded by the cascade
+            // working set. Exclude edges a prior delete statement (a prior
+            // cascade, or an explicit edge delete) on this table already
+            // scheduled, so an edge incident to two deleted nodes — or matched
+            // by both a cascade and an explicit `delete <Edge>` — is counted
+            // once. Record the ORIGINAL cascade filter (the combined staged
+            // delete removes the union); skip only when nothing NEW matches.
+            let count_filter =
+                dedup_delete_filter(&cascade_filter, staging.recorded_delete_predicates(&edge_table_key));
+            // Scan (not count) the cascade-removed edge ids so validation
+            // recounts the OTHER endpoint's @card after the cascade; `len()` is
+            // the affected count.
+            let matched_ids = ids_from_batches(
+                &self
+                    .storage()
+                    .scan(&edge_ds, Some(&["id"]), Some(&count_filter), None)
+                    .await?,
+            );
+            let matched = matched_ids.len();
+            affected_edges += matched;
 
-            affected_edges += edge_delete.deleted_rows;
-
-            if edge_delete.deleted_rows > 0 {
-                staging.record_inline(crate::db::SubTableUpdate {
-                    table_key: edge_table_key,
-                    table_version: edge_delete.version,
-                    table_branch: edge_table_branch,
-                    row_count: edge_delete.row_count,
-                    version_metadata: edge_delete.version_metadata,
-                });
+            if matched > 0 {
+                staging.record_deleted_ids(&edge_table_key, &matched_ids);
+                staging.record_delete(&edge_table_key, cascade_filter);
             }
         }
 
@@ -1246,33 +1341,52 @@ impl Omnigraph {
     }
 
     async fn execute_delete_edge(
-        &mut self,
+        &self,
         type_name: &str,
         predicate: &IRMutationPredicate,
         params: &ParamMap,
         branch: Option<&str>,
         staging: &mut MutationStaging,
+        txn: Option<&crate::db::WriteTxn>,
     ) -> Result<MutationResult> {
         let pred_sql = predicate_to_sql(predicate, params, true)?;
 
         let table_key = format!("edge:{}", type_name);
-        let (mut ds, full_path, table_branch) =
-            open_table_for_mutation(self, staging, branch, &table_key).await?;
+        let (handle, _full_path, _table_branch) = open_table_for_mutation(
+            self,
+            staging,
+            branch,
+            &table_key,
+            crate::db::MutationOpKind::Delete,
+            txn,
+        )
+        .await?;
+        // Delete is a STRICT op, so collapse #1 never skips its open.
+        let ds = handle.expect("strict Delete op always opens its dataset");
 
-        let delete_state = self
-            .table_store()
-            .delete_where(&full_path, &mut ds, &pred_sql)
-            .await?;
-        let affected = delete_state.deleted_rows;
+        // Count matching committed edges now (the staged delete won't remove
+        // them until end-of-query). Exact under D₂; exclude edges a prior delete
+        // statement on this table (an earlier cascade or edge delete) already
+        // scheduled, so overlapping statements don't double-count. Record the
+        // ORIGINAL predicate below (the combined staged delete removes the
+        // union); only record when something NEW matches.
+        let count_filter =
+            dedup_delete_filter(&pred_sql, staging.recorded_delete_predicates(&table_key));
+        // Scan the matched edge ids (not just count): the ids feed validation so
+        // a delete emptying a src below @card min is rejected; `len()` is the
+        // affected count. One scan replaces the former count-here + resolve-at-
+        // validation re-scan.
+        let deleted_ids = ids_from_batches(
+            &self
+                .storage()
+                .scan(&ds, Some(&["id"]), Some(&count_filter), None)
+                .await?,
+        );
+        let affected = deleted_ids.len();
 
         if affected > 0 {
-            staging.record_inline(crate::db::SubTableUpdate {
-                table_key,
-                table_version: delete_state.version,
-                table_branch,
-                row_count: delete_state.row_count,
-                version_metadata: delete_state.version_metadata,
-            });
+            staging.record_deleted_ids(&table_key, &deleted_ids);
+            staging.record_delete(&table_key, pred_sql.clone());
             self.invalidate_graph_index().await;
         }
 
@@ -1281,6 +1395,25 @@ impl Omnigraph {
             affected_edges: affected,
         })
     }
+}
+
+/// Extract the `id` column (projection index 0) from scanned batches. Used by
+/// the delete paths to capture the rows they remove, so validation recounts a
+/// src a delete empties without re-resolving the predicate.
+fn ids_from_batches(batches: &[RecordBatch]) -> Vec<String> {
+    batches
+        .iter()
+        .flat_map(|batch| {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            (0..ids.len())
+                .map(|i| ids.value(i).to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 /// Concat the matched batches from `scan_with_pending` into a single batch.
@@ -1309,31 +1442,6 @@ fn concat_match_batches_to_schema(
     })
 }
 
-/// Validate `@card` bounds against committed (Lance) + pending (in-memory)
-/// edges for one edge table. Engine path: each insert produces a fresh
-/// ULID id, so committed and pending cannot share a primary key — no
-/// dedup needed (`dedupe_key_column = None`).
-async fn validate_edge_cardinality_with_pending(
-    db: &Omnigraph,
-    committed_ds: &Dataset,
-    staging: &MutationStaging,
-    table_key: &str,
-    edge_type: &omnigraph_compiler::catalog::EdgeType,
-) -> Result<()> {
-    if edge_type.cardinality.is_default() {
-        return Ok(());
-    }
-    let counts = super::staging::count_src_per_edge(
-        db,
-        committed_ds,
-        table_key,
-        staging,
-        None,
-    )
-    .await?;
-    super::staging::enforce_cardinality_bounds(edge_type, &counts)
-}
-
 fn enrich_mutation_params(params: &ParamMap) -> Result<ParamMap> {
     let mut resolved = params.clone();
     if !resolved.contains_key(NOW_PARAM_NAME) {
@@ -1343,4 +1451,30 @@ fn enrich_mutation_params(params: &ParamMap) -> Result<ParamMap> {
         resolved.insert(NOW_PARAM_NAME.to_string(), Literal::DateTime(now));
     }
     Ok(resolved)
+}
+
+#[cfg(test)]
+mod predicate_sql_tests {
+    use super::*;
+
+    // #283: a camelCase column in a mutation predicate must be emitted
+    // UNQUOTED and case-preserved. The committed-scan consumer, Lance's
+    // `Scanner::filter(&str)`, preserves an unquoted identifier's case but
+    // treats a double-quoted `"col"` as a string literal (which silently
+    // matches zero rows), so the predicate string must not quote the column.
+    // The pending MemTable path stays case-preserving by disabling DataFusion
+    // identifier normalization on its context, not by quoting here.
+    #[test]
+    fn predicate_to_sql_preserves_camelcase_column_unquoted() {
+        let predicate = IRMutationPredicate {
+            property: "repoName".to_string(),
+            op: CompOp::Eq,
+            value: IRExpr::Literal(Literal::String("acme".into())),
+        };
+        let sql = predicate_to_sql(&predicate, &ParamMap::new(), false).unwrap();
+        assert_eq!(
+            sql, "repoName = 'acme'",
+            "column must be unquoted and case-preserved, got {sql}"
+        );
+    }
 }

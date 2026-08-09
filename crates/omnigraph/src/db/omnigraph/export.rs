@@ -16,7 +16,12 @@ pub(super) async fn entity_at(
     id: &str,
     version: u64,
 ) -> Result<Option<serde_json::Value>> {
-    let snap = db.coordinator.snapshot_at_version(version).await?;
+    let snap = db
+        .coordinator
+        .read()
+        .await
+        .snapshot_at_version(version)
+        .await?;
     entity_from_snapshot(db, &snap, table_key, id).await
 }
 
@@ -55,12 +60,12 @@ async fn entity_from_snapshot(
     }
 
     let ds = db
-        .table_store
-        .open_snapshot_table(snapshot, table_key)
+        .storage()
+        .open_snapshot_at_table(snapshot, table_key)
         .await?;
     let filter_sql = format!("id = '{}'", id.replace('\'', "''"));
     let batches = db
-        .table_store
+        .storage()
         .scan(&ds, None, Some(&filter_sql), None)
         .await?;
     let Some(batch) = batches.iter().find(|batch| batch.num_rows() > 0) else {
@@ -138,22 +143,23 @@ async fn export_table_to_writer<W: Write>(
     writer: &mut W,
 ) -> Result<()> {
     let ds = db
-        .table_store
-        .open_snapshot_table(snapshot, table_key)
+        .storage()
+        .open_snapshot_at_table(snapshot, table_key)
         .await?;
     let ordering = Some(vec![ColumnOrdering::asc_nulls_last("id".to_string())]);
-    let blob_properties = blob_properties_for_table_key(db.catalog(), table_key)?;
+    let catalog = db.catalog();
+    let blob_properties = blob_properties_for_table_key(&catalog, table_key)?;
 
     if blob_properties.is_empty() {
-        for batch in db.table_store.scan(&ds, None, None, ordering).await? {
+        for batch in db.storage().scan(&ds, None, None, ordering).await? {
             write_export_rows_from_batch(db, table_key, &batch, None, writer)?;
         }
         return Ok(());
     }
 
     let batches = db
-        .table_store
-        .scan_with(&ds, None, None, ordering, true, |_| Ok(()))
+        .storage()
+        .scan_with_row_id(&ds, None, None, ordering, true)
         .await?;
     for batch in batches {
         let row_ids = batch
@@ -169,7 +175,13 @@ async fn export_table_to_writer<W: Write>(
             .iter()
             .copied()
             .collect::<Vec<_>>();
-        let blob_values = export_blob_values(&ds, &batch, &row_ids, blob_properties).await?;
+        // Blob materialization reaches through to the inner Lance
+        // `Dataset` because `take_blobs` is a Lance-only API not lifted
+        // onto the `TableStorage` trait surface (the trait covers
+        // staged-write and snapshot-scan primitives; blob descriptor
+        // materialization sits outside that surface).
+        let blob_values =
+            export_blob_values(ds.dataset(), &batch, &row_ids, blob_properties).await?;
         write_export_rows_from_batch(db, table_key, &batch, Some(&blob_values), writer)?;
     }
     Ok(())
@@ -207,9 +219,9 @@ fn write_export_rows_from_batch<W: Write>(
     blob_values: Option<&HashMap<String, Vec<Option<String>>>>,
     writer: &mut W,
 ) -> Result<()> {
+    let catalog = db.catalog();
     if let Some(type_name) = table_key.strip_prefix("node:") {
-        let node_type = db
-            .catalog
+        let node_type = catalog
             .node_types
             .get(type_name)
             .ok_or_else(|| OmniError::manifest(format!("unknown node type '{}'", type_name)))?;
@@ -243,8 +255,7 @@ fn write_export_rows_from_batch<W: Write>(
     }
 
     if let Some(edge_name) = table_key.strip_prefix("edge:") {
-        let edge_type = db
-            .catalog
+        let edge_type = catalog
             .edge_types
             .get(edge_name)
             .ok_or_else(|| OmniError::manifest(format!("unknown edge type '{}'", edge_name)))?;

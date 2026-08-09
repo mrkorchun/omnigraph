@@ -3,6 +3,7 @@ mod helpers;
 use std::fs;
 
 use omnigraph::db::{Omnigraph, ReadTarget};
+use omnigraph::loader::{LoadMode, load_jsonl};
 use omnigraph_compiler::{SchemaMigrationStep, SchemaTypeKind};
 
 use helpers::*;
@@ -73,7 +74,7 @@ async fn apply_schema_rejects_when_non_main_branch_exists() {
     let err = db.apply_schema(&desired).await.unwrap_err();
     assert!(
         err.to_string()
-            .contains("schema apply requires a repo with only main")
+            .contains("schema apply requires a graph with only main")
     );
 }
 
@@ -98,4 +99,842 @@ async fn apply_schema_unsupported_plan_does_not_advance_manifest() {
             .version(),
         before_version
     );
+}
+
+// ─── Destructive / safety-tier behavior ──────────────────────────────────────
+//
+// Schema migration v1 accepts:
+// - Additive change: add type, add nullable property, add index, rename.
+// - DropProperty { Soft } via the schema-lint v1 chassis (commit #3 of MR-694)
+//   — the dropped column is removed from the current manifest version but
+//   remains reachable via Lance time travel at the prior version, until
+//   `omnigraph cleanup` runs. Hard mode (immediate data cleanup) lands in
+//   commit #5 gated by `--allow-data-loss`.
+//
+// Every other destructive shape (drop type, narrow type, add required without
+// backfill, remove constraint) still returns an `UnsupportedChange` step that
+// surfaces as an error from `apply_schema`. These tests pin the current
+// contract so a regression in the planner can't silently change behavior.
+
+#[tokio::test]
+async fn apply_schema_drops_a_nullable_property_softly_preserves_prior_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    let people_before = count_rows(&db, "node:Person").await;
+    let before_version = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .version();
+
+    // Drop `age` from Person. v1 + chassis commit #3 emit
+    // `DropProperty { Soft }`; the rewrite path projects to the
+    // target schema (no `age`), commits via stage_overwrite. Row
+    // counts are unchanged — only the column is dropped from the
+    // current schema view.
+    let desired = TEST_SCHEMA.replace("    age: I32?\n", "");
+
+    // Confirm the plan emits DropProperty { Soft } (not UnsupportedChange).
+    let plan = db.plan_schema(&desired).await.unwrap();
+    assert!(plan.supported, "drop-property plan must be supported");
+    assert!(
+        plan.steps.iter().any(|step| matches!(
+            step,
+            SchemaMigrationStep::DropProperty {
+                type_kind: SchemaTypeKind::Node,
+                type_name,
+                property_name,
+                mode: omnigraph_compiler::DropMode::Soft,
+                ..
+            } if type_name == "Person" && property_name == "age"
+        )),
+        "expected DropProperty {{ type=Person, property=age, mode=Soft }} in plan; got {plan:?}",
+    );
+
+    let result = db.apply_schema(&desired).await.unwrap();
+    assert!(result.supported);
+    assert!(result.applied);
+
+    // Manifest advanced; row count unchanged.
+    let after_version = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .version();
+    assert!(
+        after_version > before_version,
+        "manifest version should advance after soft drop; before={before_version}, after={after_version}",
+    );
+    assert_eq!(count_rows(&db, "node:Person").await, people_before);
+
+    // (a) Current snapshot: `age` is gone from the dataset schema.
+    let current_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let current_ds = current_snapshot.open("node:Person").await.unwrap();
+    let current_fields = current_ds
+        .schema()
+        .fields
+        .iter()
+        .map(|f| f.name.clone())
+        .collect::<Vec<_>>();
+    assert!(
+        !current_fields.iter().any(|f| f == "age"),
+        "current Person dataset schema must not include 'age' after soft drop; got fields {current_fields:?}",
+    );
+
+    // (b) Time travel: at the pre-drop manifest version, the prior
+    // Person dataset version still has `age`. Soft drop is reversible
+    // via Lance's version graph until `omnigraph cleanup` runs.
+    let pre_drop_snapshot = db.snapshot_at_version(before_version).await.unwrap();
+    let pre_drop_ds = pre_drop_snapshot.open("node:Person").await.unwrap();
+    let pre_drop_fields = pre_drop_ds
+        .schema()
+        .fields
+        .iter()
+        .map(|f| f.name.clone())
+        .collect::<Vec<_>>();
+    assert!(
+        pre_drop_fields.iter().any(|f| f == "age"),
+        "pre-drop Person dataset schema must still include 'age' (time-travel reversibility); got fields {pre_drop_fields:?}",
+    );
+
+    // (c) Reopen consistency: close the engine, reopen, verify the
+    // drop is preserved (column still absent from current schema).
+    let uri = dir.path().to_str().unwrap().to_string();
+    drop(db);
+    let reopened = Omnigraph::open(&uri).await.unwrap();
+    let reopened_snapshot = reopened
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap();
+    let reopened_ds = reopened_snapshot.open("node:Person").await.unwrap();
+    let reopened_fields = reopened_ds
+        .schema()
+        .fields
+        .iter()
+        .map(|f| f.name.clone())
+        .collect::<Vec<_>>();
+    assert!(
+        !reopened_fields.iter().any(|f| f == "age"),
+        "after reopen, Person dataset schema must still lack 'age'; got fields {reopened_fields:?}",
+    );
+}
+
+#[tokio::test]
+async fn apply_schema_drops_node_and_referencing_edge_softly() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+    let before_version = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .version();
+
+    // Drop the `Company` node type and the `WorksAt` edge that references it.
+    // Per schema-lint v1 chassis commit #4 (MR-694), this emits two
+    // `DropType { Soft }` steps; apply tombstones both manifest entries.
+    // Lance dataset files are retained, so time-travel back to the
+    // pre-drop manifest version still resolves both tables.
+    let desired = r#"
+node Person {
+    name: String @key
+    age: I32?
+}
+
+edge Knows: Person -> Person {
+    since: Date?
+}
+"#;
+
+    // Confirm the plan emits both DropType { Soft } steps.
+    let plan = db.plan_schema(desired).await.unwrap();
+    assert!(plan.supported, "drop-type plan must be supported");
+    assert!(
+        plan.steps.iter().any(|step| matches!(
+            step,
+            SchemaMigrationStep::DropType {
+                type_kind: SchemaTypeKind::Node,
+                name,
+                mode: omnigraph_compiler::DropMode::Soft,
+            } if name == "Company"
+        )),
+        "expected DropType {{ Node, Company, Soft }} in plan: {plan:?}",
+    );
+    assert!(
+        plan.steps.iter().any(|step| matches!(
+            step,
+            SchemaMigrationStep::DropType {
+                type_kind: SchemaTypeKind::Edge,
+                name,
+                mode: omnigraph_compiler::DropMode::Soft,
+            } if name == "WorksAt"
+        )),
+        "expected DropType {{ Edge, WorksAt, Soft }} in plan: {plan:?}",
+    );
+
+    let result = db.apply_schema(desired).await.unwrap();
+    assert!(result.supported);
+    assert!(result.applied);
+
+    let after_version = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .version();
+    assert!(
+        after_version > before_version,
+        "manifest version should advance after soft type drop; before={before_version}, after={after_version}",
+    );
+
+    // (a) Current snapshot: both manifest entries are gone.
+    let current_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    assert!(
+        current_snapshot.entry("node:Company").is_none(),
+        "current manifest must not list node:Company after soft drop",
+    );
+    assert!(
+        current_snapshot.entry("edge:WorksAt").is_none(),
+        "current manifest must not list edge:WorksAt after soft drop",
+    );
+    // Person + Knows still present (Person wasn't dropped; Knows is in desired).
+    assert!(
+        current_snapshot.entry("node:Person").is_some(),
+        "node:Person must remain in the manifest",
+    );
+
+    // (b) Time travel: at the pre-drop manifest version, both dropped
+    // tables are still listed. Soft drop is reversible via Lance's
+    // version graph until `omnigraph cleanup` runs.
+    let pre_drop_snapshot = db.snapshot_at_version(before_version).await.unwrap();
+    assert!(
+        pre_drop_snapshot.entry("node:Company").is_some(),
+        "pre-drop manifest must still list node:Company (time-travel reversibility)",
+    );
+    assert!(
+        pre_drop_snapshot.entry("edge:WorksAt").is_some(),
+        "pre-drop manifest must still list edge:WorksAt (time-travel reversibility)",
+    );
+
+    // (c) Reopen consistency: drop is preserved across engine restart.
+    let uri = dir.path().to_str().unwrap().to_string();
+    drop(db);
+    let reopened = Omnigraph::open(&uri).await.unwrap();
+    let reopened_snapshot = reopened
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap();
+    assert!(
+        reopened_snapshot.entry("node:Company").is_none(),
+        "after reopen, node:Company must still be absent from the current manifest",
+    );
+    assert!(
+        reopened_snapshot.entry("edge:WorksAt").is_none(),
+        "after reopen, edge:WorksAt must still be absent from the current manifest",
+    );
+}
+
+#[tokio::test]
+async fn apply_schema_drops_an_edge_type_softly() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+    let before_version = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .version();
+
+    // Drop only the `WorksAt` edge. Per chassis v1 commit #4, this
+    // emits `DropType { Edge, WorksAt, Soft }`; apply tombstones the
+    // edge:WorksAt manifest entry. The Company node and Person node
+    // remain intact.
+    let desired = TEST_SCHEMA.replace("\nedge WorksAt: Person -> Company", "");
+
+    let plan = db.plan_schema(&desired).await.unwrap();
+    assert!(plan.supported);
+    assert!(
+        plan.steps.iter().any(|step| matches!(
+            step,
+            SchemaMigrationStep::DropType {
+                type_kind: SchemaTypeKind::Edge,
+                name,
+                mode: omnigraph_compiler::DropMode::Soft,
+            } if name == "WorksAt"
+        )),
+        "expected DropType {{ Edge, WorksAt, Soft }} in plan: {plan:?}",
+    );
+
+    let result = db.apply_schema(&desired).await.unwrap();
+    assert!(result.applied);
+
+    let after_version = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .version();
+    assert!(after_version > before_version);
+
+    let current_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    assert!(
+        current_snapshot.entry("edge:WorksAt").is_none(),
+        "current manifest must not list edge:WorksAt",
+    );
+    // Other tables untouched.
+    assert!(current_snapshot.entry("node:Person").is_some());
+    assert!(current_snapshot.entry("node:Company").is_some());
+    assert!(current_snapshot.entry("edge:Knows").is_some());
+
+    let pre_drop_snapshot = db.snapshot_at_version(before_version).await.unwrap();
+    assert!(
+        pre_drop_snapshot.entry("edge:WorksAt").is_some(),
+        "pre-drop manifest must still list edge:WorksAt",
+    );
+}
+
+#[tokio::test]
+async fn apply_schema_rejects_adding_a_required_property_without_backfill() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+    let before_version = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .version();
+
+    // Add `email: String` (required, non-nullable, no @rename_from). Existing
+    // rows have no value to fill in, so this is unsupported in v1.
+    let desired = TEST_SCHEMA.replace("    age: I32?\n}", "    age: I32?\n    email: String\n}");
+    let err = db.apply_schema(&desired).await.unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("OG-MF-103"),
+        "expected schema-lint code OG-MF-103 in error, got: {msg}"
+    );
+    assert_eq!(
+        db.snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .version(),
+        before_version
+    );
+}
+
+#[tokio::test]
+async fn plan_schema_for_property_type_narrowing_is_not_supported() {
+    // Symmetric companion to `apply_schema_unsupported_plan_does_not_advance_manifest`,
+    // which exercises widening (I32 -> I64). Narrowing (I64 -> I32) is also
+    // unsupported in v1, and should be flagged at plan time so callers can
+    // route to a manual-migration path before invoking apply.
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+
+    let initial = TEST_SCHEMA.replace("age: I32?", "age: I64?");
+    let mut db = Omnigraph::init(uri, &initial).await.unwrap();
+    load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite)
+        .await
+        .unwrap();
+
+    let plan = db.plan_schema(TEST_SCHEMA).await.unwrap();
+    assert!(
+        !plan.supported,
+        "narrowing I64 -> I32 must not be supported"
+    );
+    assert!(plan.steps.iter().any(|step| matches!(
+        step,
+        SchemaMigrationStep::UnsupportedChange { code, .. }
+            if code.as_deref() == Some("OG-MF-106")
+    )));
+}
+
+#[tokio::test]
+async fn apply_schema_renames_node_type_via_rename_from_and_preserves_rows() {
+    // Covers the stable-type-id contract: renaming a type preserves the
+    // underlying Lance dataset (by stable id), so existing rows survive the
+    // rename and become queryable under the new table key. This is the
+    // "supported" half of the destructive-vs-supported boundary that the
+    // rejections above cover.
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+    let people_before = count_rows(&db, "node:Person").await;
+    assert!(
+        people_before > 0,
+        "fixture should seed Person rows for this test to be meaningful"
+    );
+
+    // Rename Person -> Human (and the keying property name -> full_name).
+    // Edges that referenced Person must update to Human in the same migration.
+    let desired = r#"
+node Human @rename_from("Person") {
+    full_name: String @key @rename_from("name")
+    age: I32?
+}
+
+node Company {
+    name: String @key
+}
+
+edge Knows: Human -> Human {
+    since: Date?
+}
+
+edge WorksAt: Human -> Company
+"#;
+
+    let result = db.apply_schema(desired).await.unwrap();
+    assert!(result.supported && result.applied);
+
+    // Type rename is emitted as a RenameType step.
+    assert!(
+        result.steps.iter().any(|step| matches!(
+            step,
+            SchemaMigrationStep::RenameType {
+                type_kind: SchemaTypeKind::Node,
+                from,
+                to,
+            } if from == "Person" && to == "Human"
+        )),
+        "expected RenameType Person -> Human in {:?}",
+        result.steps
+    );
+    // Property rename rides along under the new type name.
+    assert!(
+        result.steps.iter().any(|step| matches!(
+            step,
+            SchemaMigrationStep::RenameProperty {
+                type_kind: SchemaTypeKind::Node,
+                type_name,
+                from,
+                to,
+            } if type_name == "Human" && from == "name" && to == "full_name"
+        )),
+        "expected RenameProperty name -> full_name on Human in {:?}",
+        result.steps
+    );
+
+    // Rows survive: table key now resolves under the new type name and the
+    // old key is gone.
+    assert_eq!(count_rows(&db, "node:Human").await, people_before);
+    assert!(
+        db.snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .entry("node:Person")
+            .is_none(),
+        "old node:Person table key should be unmapped after rename"
+    );
+}
+
+// ─── Hard-mode drops (chassis v1 commit #5 — --allow-data-loss) ──────────────
+//
+// Hard mode promotes every `DropMode::Soft` step to `DropMode::Hard` and runs
+// `cleanup_old_versions` on affected datasets immediately after the manifest
+// publish. For DropProperty Hard, this removes the prior dataset version
+// (where the column lived), making `snapshot_at_version(pre_drop)` unable to
+// open the dataset at that version. For DropType Hard, the dataset is
+// untouched by the schema apply itself (no per-table write), so
+// cleanup_old_versions is currently a no-op for it — the dataset directory
+// persists. Full orphan-dataset deletion is a separate follow-up.
+
+#[tokio::test]
+async fn apply_schema_with_allow_data_loss_promotes_drops_to_hard() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    let desired = TEST_SCHEMA.replace("    age: I32?\n", "");
+
+    // Default plan (no flag) → Soft.
+    let plan_soft = db.plan_schema(&desired).await.unwrap();
+    assert!(plan_soft.steps.iter().any(|step| matches!(
+        step,
+        SchemaMigrationStep::DropProperty {
+            mode: omnigraph_compiler::DropMode::Soft,
+            ..
+        }
+    )));
+
+    // With --allow-data-loss → Hard.
+    let plan_hard = db
+        .plan_schema_with_options(
+            &desired,
+            omnigraph::db::SchemaApplyOptions {
+                allow_data_loss: true,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(plan_hard.supported);
+    assert!(
+        plan_hard.steps.iter().any(|step| matches!(
+            step,
+            SchemaMigrationStep::DropProperty {
+                mode: omnigraph_compiler::DropMode::Hard,
+                ..
+            }
+        )),
+        "with --allow-data-loss, DropProperty should be promoted to Hard: {plan_hard:?}",
+    );
+    // Negative: no remaining Soft drops in the promoted plan.
+    assert!(
+        !plan_hard.steps.iter().any(|step| matches!(
+            step,
+            SchemaMigrationStep::DropProperty {
+                mode: omnigraph_compiler::DropMode::Soft,
+                ..
+            } | SchemaMigrationStep::DropType {
+                mode: omnigraph_compiler::DropMode::Soft,
+                ..
+            }
+        )),
+        "promoted plan should have no Soft drops left: {plan_hard:?}",
+    );
+
+    // Apply with flag succeeds.
+    let result = db
+        .apply_schema_with_options(
+            &desired,
+            omnigraph::db::SchemaApplyOptions {
+                allow_data_loss: true,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(result.applied);
+}
+
+#[tokio::test]
+async fn apply_schema_hard_drops_property_makes_prior_version_unreachable() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+    let before_version = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .version();
+
+    // Hard drop the `age` column. Soft drop would leave the prior
+    // dataset version intact; Hard drop runs cleanup_old_versions on
+    // the dataset post-apply, removing the prior version.
+    let desired = TEST_SCHEMA.replace("    age: I32?\n", "");
+    let result = db
+        .apply_schema_with_options(
+            &desired,
+            omnigraph::db::SchemaApplyOptions {
+                allow_data_loss: true,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(result.applied);
+
+    // Current snapshot: column gone from the dataset schema.
+    let current_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let current_ds = current_snapshot.open("node:Person").await.unwrap();
+    let current_fields = current_ds
+        .schema()
+        .fields
+        .iter()
+        .map(|f| f.name.clone())
+        .collect::<Vec<_>>();
+    assert!(
+        !current_fields.iter().any(|f| f == "age"),
+        "current Person schema must not include 'age' after hard drop; got {current_fields:?}",
+    );
+
+    // Time travel: at the pre-drop manifest version, the entry points
+    // at the OLD dataset version which has been cleaned up. Opening
+    // the dataset at that snapshot should fail (Lance can't load the
+    // dropped version). This is the Hard-mode contract — the prior
+    // data is unreachable.
+    let pre_drop = db.snapshot_at_version(before_version).await.unwrap();
+    let open_result = pre_drop.open("node:Person").await;
+    assert!(
+        open_result.is_err(),
+        "after hard drop + cleanup, pre-drop snapshot.open() must fail (prior version was reclaimed); got {open_result:?}",
+    );
+}
+
+#[tokio::test]
+async fn apply_schema_hard_drops_node_and_edge_with_flag_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+    let before_version = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .version();
+
+    let desired = r#"
+node Person {
+    name: String @key
+    age: I32?
+}
+
+edge Knows: Person -> Person {
+    since: Date?
+}
+"#;
+
+    let plan = db
+        .plan_schema_with_options(
+            desired,
+            omnigraph::db::SchemaApplyOptions {
+                allow_data_loss: true,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(plan.supported);
+    assert!(
+        plan.steps.iter().any(|step| matches!(
+            step,
+            SchemaMigrationStep::DropType {
+                type_kind: SchemaTypeKind::Node,
+                mode: omnigraph_compiler::DropMode::Hard,
+                ..
+            }
+        )),
+        "with --allow-data-loss, DropType {{ Node }} should be Hard: {plan:?}",
+    );
+    assert!(
+        plan.steps.iter().any(|step| matches!(
+            step,
+            SchemaMigrationStep::DropType {
+                type_kind: SchemaTypeKind::Edge,
+                mode: omnigraph_compiler::DropMode::Hard,
+                ..
+            }
+        )),
+        "with --allow-data-loss, DropType {{ Edge }} should be Hard: {plan:?}",
+    );
+
+    let result = db
+        .apply_schema_with_options(
+            desired,
+            omnigraph::db::SchemaApplyOptions {
+                allow_data_loss: true,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(result.applied);
+
+    let after_version = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .version();
+    assert!(after_version > before_version);
+
+    // Current manifest: both dropped entries gone.
+    let current = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    assert!(current.entry("node:Company").is_none());
+    assert!(current.entry("edge:WorksAt").is_none());
+
+    // NOTE: DropType Hard's cleanup of the orphan dataset directory
+    // is a known follow-up (the manifest entry is tombstoned and the
+    // dataset's prior versions are cleaned, but the directory itself
+    // persists until an orphan-cleanup pass is implemented). For the
+    // current contract, the data is *unreachable* via omnigraph
+    // (no manifest entry), which is the user-facing guarantee.
+}
+
+// Regression (bug 3 / dev-graph iss-848): a `Vector @index` on a 0-row table
+// must not abort an otherwise-valid schema apply. A vector (IVF) index trains
+// k-means centroids over the column's vectors, so Lance cannot build it on 0
+// vectors — it errors with "Creating empty vector indices with train=False is
+// not yet implemented". When a *later* migration touches that table (here, an
+// unrelated scalar `@index` on `body`), schema apply reconciles the table's
+// whole index set, which previously tried to materialize the dormant vector
+// index and aborted the entire migration (all-or-nothing). The build is now
+// deferred (pending) when the column is untrainable, instead of failing the
+// migration. The dormant index is materialized by a later `ensure_indices` /
+// `optimize` once the table has rows. Full decoupling — intent recorded at
+// apply, an async reconciler converges physical coverage — is iss-848.
+#[tokio::test]
+async fn apply_schema_defers_vector_index_on_empty_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+
+    // init does not build indices, so the declared-but-unbuilt vector index
+    // sits harmless on the empty table (this is how it survived earlier
+    // applies that never touched the table).
+    // `slug` is the user @key; omnigraph injects its own internal `id` column,
+    // so the key field must not be named `id`.
+    let v1 = "node Doc {\n    \
+        slug: String @key\n    \
+        body: String?\n    \
+        embedding: Vector(8) @index\n\
+        }\n";
+    let mut db = Omnigraph::init(uri, v1).await.unwrap();
+
+    // Add an *unrelated* scalar @index on `body`. This routes Doc through
+    // schema apply's index reconcile, which must NOT abort on the untrainable
+    // empty vector index.
+    let v2 = "node Doc {\n    \
+        slug: String @key\n    \
+        body: String? @index\n    \
+        embedding: Vector(8) @index\n\
+        }\n";
+    let result = db.apply_schema(v2).await.expect(
+        "schema apply must succeed: an empty-table vector @index is deferred, not fatal",
+    );
+    assert!(result.applied, "the scalar @index change must apply");
+
+    // The deferred vector index is not dropped — once the table has a
+    // trainable vector, `ensure_indices` materializes it without error. (If
+    // the guard wrongly skipped a non-empty column, this would still be
+    // unindexed; if it wrongly tried to build on empty, the apply above would
+    // have failed.)
+    load_jsonl(
+        &mut db,
+        r#"{"type":"Doc","data":{"slug":"d1","body":"hello","embedding":[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .expect("loading a Doc with an embedding must succeed");
+    db.ensure_indices()
+        .await
+        .expect("the deferred vector index must build once the table has a trainable vector");
+}
+
+// iss-848: adding an `@index` to an existing column is a pure metadata change.
+// Schema apply records the intent (the catalog/IR now declares the index) but
+// must NOT build the index inline, so the table's data and manifest version are
+// untouched. The physical index is materialized later by ensure_indices /
+// optimize. Pre-iss-848 the indexed_tables block built the index inline and
+// bumped the table version.
+#[tokio::test]
+async fn index_only_constraint_apply_touches_no_table_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let v1 = "node Doc {\n    slug: String @key\n    n: I64\n}\n";
+    let mut db = Omnigraph::init(uri, v1).await.unwrap();
+    load_jsonl(
+        &mut db,
+        r#"{"type":"Doc","data":{"slug":"d1","n":1}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .expect("load a Doc");
+
+    let before = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .entry("node:Doc")
+        .unwrap()
+        .table_version;
+
+    // Add an @index on the existing `n` column.
+    let v2 = "node Doc {\n    slug: String @key\n    n: I64 @index\n}\n";
+    let result = db.apply_schema(v2).await.expect("index-only apply must succeed");
+    assert!(result.applied, "the @index addition must apply");
+
+    let after = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .entry("node:Doc")
+        .unwrap()
+        .table_version;
+    assert_eq!(
+        before, after,
+        "adding an @index must not bump the table version (no inline index build)"
+    );
+}
+
+// Enum widening (iss-enum-widening-migration): adding variants to an enum is
+// a PURE metadata change — the accepted catalog updates, no table data is
+// touched, and the widened set is enforced immediately on writes. Narrowing
+// stays OG-MF-106-refused.
+#[tokio::test]
+async fn enum_widening_apply_is_metadata_only_and_accepts_new_variant() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let v1 = "node Ticket {\n    slug: String @key\n    status: enum(todo, doing, done)\n}\n";
+    let mut db = Omnigraph::init(uri, v1).await.unwrap();
+    load_jsonl(
+        &mut db,
+        r#"{"type":"Ticket","data":{"slug":"t1","status":"todo"}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .expect("load a Ticket with an original variant");
+
+    let before = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .entry("node:Ticket")
+        .unwrap()
+        .table_version;
+
+    let v2 =
+        "node Ticket {\n    slug: String @key\n    status: enum(todo, doing, done, blocked)\n}\n";
+    let result = db.apply_schema(v2).await.expect("enum widening must apply");
+    assert!(result.supported, "widening must be a supported plan");
+    assert!(result.applied, "widening must apply");
+
+    let after = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .entry("node:Ticket")
+        .unwrap()
+        .table_version;
+    assert_eq!(
+        before, after,
+        "enum widening must not bump the table version (metadata-only)"
+    );
+
+    // The NEW variant is accepted on the write path...
+    load_jsonl(
+        &mut db,
+        r#"{"type":"Ticket","data":{"slug":"t2","status":"blocked"}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .expect("new variant must be accepted after widening");
+    // ...an original variant still is...
+    load_jsonl(
+        &mut db,
+        r#"{"type":"Ticket","data":{"slug":"t3","status":"done"}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .expect("original variant must remain accepted");
+    // ...and an out-of-set value is still rejected (the fence didn't widen to
+    // free text).
+    let err = load_jsonl(
+        &mut db,
+        r#"{"type":"Ticket","data":{"slug":"t4","status":"bogus"}}"#,
+        LoadMode::Merge,
+    )
+    .await;
+    assert!(err.is_err(), "out-of-set enum value must still be rejected");
+}
+
+#[tokio::test]
+async fn enum_narrowing_apply_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let v1 = "node Ticket {\n    slug: String @key\n    status: enum(todo, doing, done)\n}\n";
+    let mut db = Omnigraph::init(uri, v1).await.unwrap();
+
+    let narrowed = "node Ticket {\n    slug: String @key\n    status: enum(todo, done)\n}\n";
+    let err = db.apply_schema(narrowed).await;
+    assert!(err.is_err(), "narrowing must refuse at apply");
+    let msg = format!("{}", err.unwrap_err());
+    assert!(
+        msg.contains("OG-MF-106"),
+        "refusal must carry the stable lint code, got: {msg}"
+    );
+
+    // The graph stays healthy and writable on the original schema.
+    load_jsonl(
+        &mut db,
+        r#"{"type":"Ticket","data":{"slug":"t1","status":"doing"}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .expect("graph must remain writable after a refused narrowing");
 }

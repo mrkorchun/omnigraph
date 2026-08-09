@@ -1,0 +1,35 @@
+[package]
+name = "omnigraph-cluster"
+version = "0.8.1"
+edition = "2024"
+description = "Cluster configuration validation, planning, and config-only apply for Omnigraph."
+license = "MIT"
+repository = "https://github.com/ModernRelay/omnigraph"
+homepage = "https://github.com/ModernRelay/omnigraph"
+documentation = "https://docs.rs/omnigraph-cluster"
+
+[features]
+# Fault-injection hooks for the apply protocol (crash-mid-apply, CAS-race
+# tests), including cluster/engine boundary failures.
+failpoints = ["dep:fail", "fail/failpoints", "omnigraph/failpoints"]
+
+[dependencies]
+omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.8.1" }
+omnigraph = { package = "omnigraph-engine", path = "../omnigraph", version = "0.8.1" }
+fail = { workspace = true, optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+# Runtime handle only — best-effort async lock release in
+# StateLockGuard::drop on object-store backends (cluster commands always
+# run inside the caller's tokio runtime).
+tokio = { workspace = true }
+ulid = { workspace = true }
+
+[dev-dependencies]
+serial_test = "3"
+tempfile = { workspace = true }
+tokio = { workspace = true }

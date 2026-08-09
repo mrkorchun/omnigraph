@@ -4,7 +4,8 @@ use std::fs;
 
 use arrow_array::{Array, Int32Array, UInt64Array};
 use futures::TryStreamExt;
-use lance_index::{DatasetIndexExt, is_system_index};
+use lance::index::DatasetIndexExt;
+use lance_index::is_system_index;
 
 use omnigraph::db::commit_graph::CommitGraph;
 use omnigraph::db::{MergeOutcome, Omnigraph, ReadTarget};
@@ -38,6 +39,26 @@ query insert_user($name: String, $email: String) {
 }
 "#;
 
+const EDGE_UNIQUE_SCHEMA: &str = r#"
+node Person {
+    name: String @key
+}
+
+edge Knows: Person -> Person {
+    @unique(src, dst)
+}
+"#;
+
+const EDGE_UNIQUE_DATA: &str = r#"{"type":"Person","data":{"name":"Alice"}}
+{"type":"Person","data":{"name":"Bob"}}
+{"type":"Person","data":{"name":"Carol"}}"#;
+
+const EDGE_UNIQUE_MUTATIONS: &str = r#"
+query add_knows($from: String, $to: String) {
+    insert Knows { from: $from, to: $to }
+}
+"#;
+
 const CARDINALITY_SCHEMA: &str = r#"
 node Person {
     name: String @key
@@ -57,6 +78,24 @@ const CARDINALITY_DATA: &str = r#"{"type":"Person","data":{"name":"Alice"}}
 const CARDINALITY_MUTATIONS: &str = r#"
 query add_employment($person: String, $company: String) {
     insert WorksAt { from: $person, to: $company }
+}
+"#;
+
+const BLOB_SCHEMA: &str = r#"
+node Document {
+    title: String @key
+    content: Blob?
+    note: String?
+}
+"#;
+
+const BLOB_MUTATIONS: &str = r#"
+query insert_doc($title: String, $content: Blob, $note: String) {
+    insert Document { title: $title, content: $content, note: $note }
+}
+
+query update_doc_note($title: String, $note: String) {
+    update Document set { note: $note } where title = $title
 }
 "#;
 
@@ -298,6 +337,128 @@ async fn branch_merge_updates_main_traversal() {
 }
 
 #[tokio::test]
+async fn branch_merge_with_blob_columns_preserves_blob_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut main = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
+    load_jsonl(
+        &mut main,
+        concat!(
+            "{\"type\":\"Document\",\"data\":{\"title\":\"seed\",\"content\":\"base64:U2VlZA==\",\"note\":\"original\"}}\n",
+            "{\"type\":\"Document\",\"data\":{\"title\":\"main-doc\",\"content\":\"base64:TWFpbg==\",\"note\":\"main\"}}",
+        ),
+        LoadMode::Overwrite,
+    )
+    .await
+    .unwrap();
+    main.branch_create("feature").await.unwrap();
+
+    let mut feature = Omnigraph::open(uri).await.unwrap();
+    mutate_main(
+        &mut main,
+        BLOB_MUTATIONS,
+        "update_doc_note",
+        &params(&[("$title", "main-doc"), ("$note", "updated on main")]),
+    )
+    .await
+    .unwrap();
+
+    mutate_branch(
+        &mut feature,
+        "feature",
+        BLOB_MUTATIONS,
+        "insert_doc",
+        &params(&[
+            ("$title", "readme"),
+            ("$content", "base64:SGVsbG8="),
+            ("$note", "branch insert"),
+        ]),
+    )
+    .await
+    .unwrap();
+
+    mutate_branch(
+        &mut feature,
+        "feature",
+        BLOB_MUTATIONS,
+        "update_doc_note",
+        &params(&[("$title", "seed"), ("$note", "updated on branch")]),
+    )
+    .await
+    .unwrap();
+
+    let outcome = main.branch_merge("feature", "main").await.unwrap();
+    assert_eq!(outcome, MergeOutcome::Merged);
+
+    let readme = main
+        .read_blob("Document", "readme", "content")
+        .await
+        .unwrap();
+    let readme_bytes = readme.read().await.unwrap();
+    assert_eq!(&readme_bytes[..], b"Hello");
+
+    let seed = main.read_blob("Document", "seed", "content").await.unwrap();
+    let seed_bytes = seed.read().await.unwrap();
+    assert_eq!(&seed_bytes[..], b"Seed");
+
+    let main_doc = main
+        .read_blob("Document", "main-doc", "content")
+        .await
+        .unwrap();
+    let main_doc_bytes = main_doc.read().await.unwrap();
+    assert_eq!(&main_doc_bytes[..], b"Main");
+}
+
+#[tokio::test]
+async fn branch_merge_with_external_blob_uri_materializes_payload() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let external_dir = tempfile::tempdir().unwrap();
+    let external_path = external_dir.path().join("external.txt");
+    fs::write(&external_path, b"External").unwrap();
+    let external_uri = format!("file://{}", external_path.display());
+
+    let mut main = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
+    load_jsonl(&mut main, "", LoadMode::Overwrite)
+        .await
+        .unwrap();
+    main.branch_create("feature").await.unwrap();
+
+    let mut feature = Omnigraph::open(uri).await.unwrap();
+    load_jsonl(
+        &mut main,
+        "{\"type\":\"Document\",\"data\":{\"title\":\"main-doc\",\"content\":\"base64:TWFpbg==\",\"note\":\"main\"}}",
+        LoadMode::Append,
+    )
+    .await
+    .unwrap();
+
+    let external_data = serde_json::json!({
+        "type": "Document",
+        "data": {
+            "title": "external",
+            "content": external_uri,
+            "note": "branch insert",
+        }
+    })
+    .to_string();
+    feature
+        .load("feature", &external_data, LoadMode::Append)
+        .await
+        .unwrap();
+
+    let outcome = main.branch_merge("feature", "main").await.unwrap();
+    assert_eq!(outcome, MergeOutcome::Merged);
+
+    let external = main
+        .read_blob("Document", "external", "content")
+        .await
+        .unwrap();
+    let external_bytes = external.read().await.unwrap();
+    assert_eq!(&external_bytes[..], b"External");
+}
+
+#[tokio::test]
 async fn branch_merge_applies_node_insert_to_main() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
@@ -385,6 +546,174 @@ async fn branch_merge_records_single_latest_commit_with_two_parents() {
         head.merged_parent_commit_id.as_deref(),
         Some(source_head_before.graph_commit_id.as_str())
     );
+}
+
+// ── P1: commit-DAG coherence on same-branch writes after an external commit ──
+//
+// `append_commit` takes a new commit's parent from the coordinator's in-memory
+// head (commit_graph head_commit, zero storage read), but `commit_all` rebases
+// the MANIFEST from a fresh coordinator. So after an external writer advances
+// the branch, a same-branch write on a non-refreshed handle commits a fresh
+// manifest version yet appends off the stale head — forking the commit DAG (the
+// new commit and the external commit share a parent). Data is unaffected (the
+// manifest is the visibility authority); only commit history is malformed.
+// P1 refreshes the commit-graph head before the append, so the parent is the
+// true current head. These two tests are RED before that fix, GREEN after.
+
+/// Non-strict insert: the fork is pre-existing (commit_all rebases the manifest
+/// regardless of the stale head), independent of Fix 1.
+#[tokio::test]
+async fn same_branch_insert_after_external_commit_is_linear() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+
+    // Handle A: a long-lived writer whose coordinator head stays pinned at the
+    // load commit (C0) — it never refreshes before its own write below.
+    let mut a = init_and_load(&dir).await;
+    let c0 = CommitGraph::open(uri)
+        .await
+        .unwrap()
+        .head_commit()
+        .await
+        .unwrap()
+        .unwrap();
+
+    // External writer B advances main: commit C1, parent C0.
+    let mut b = Omnigraph::open(uri).await.unwrap();
+    mutate_main(
+        &mut b,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "ext_b")], &[("$age", 30)]),
+    )
+    .await
+    .unwrap();
+    let c1 = CommitGraph::open(uri)
+        .await
+        .unwrap()
+        .head_commit()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        c1.parent_commit_id.as_deref(),
+        Some(c0.graph_commit_id.as_str()),
+        "sanity: B's commit C1 should descend from C0"
+    );
+
+    // A writes to main WITHOUT refreshing. A's coordinator still thinks the head
+    // is C0, so a pre-fix append parents the new commit on C0 instead of C1.
+    mutate_main(
+        &mut a,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "local_a")], &[("$age", 40)]),
+    )
+    .await
+    .unwrap();
+
+    let commits = CommitGraph::open(uri)
+        .await
+        .unwrap()
+        .load_commits()
+        .await
+        .unwrap();
+    let latest = commits.iter().max_by_key(|c| c.manifest_version).unwrap();
+    assert_eq!(
+        latest.parent_commit_id.as_deref(),
+        Some(c1.graph_commit_id.as_str()),
+        "A's same-branch write after an external commit must append off the true \
+         head C1, not the stale head C0 (commit-DAG fork)"
+    );
+    let c0_children = commits
+        .iter()
+        .filter(|c| c.parent_commit_id.as_deref() == Some(c0.graph_commit_id.as_str()))
+        .count();
+    assert_eq!(c0_children, 1, "C0 must have exactly one child; two is the fork");
+}
+
+/// Strict update after a read: Fix 1's `refresh_manifest_only` makes the read
+/// freshen the read-time pin, defeating the strict 409 that used to force a
+/// coherent refresh — so the same stale-head append forks strict ops too.
+#[tokio::test]
+async fn same_branch_update_after_external_commit_and_read_is_linear() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+
+    // A inserts the row it will later update; this is A's own commit (Ca), so
+    // A's coordinator head is Ca.
+    let mut a = init_and_load(&dir).await;
+    mutate_main(
+        &mut a,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "target")], &[("$age", 40)]),
+    )
+    .await
+    .unwrap();
+    let ca = CommitGraph::open(uri)
+        .await
+        .unwrap()
+        .head_commit()
+        .await
+        .unwrap()
+        .unwrap();
+
+    // External writer B advances main: commit Cb, parent Ca.
+    let mut b = Omnigraph::open(uri).await.unwrap();
+    mutate_main(
+        &mut b,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "ext_b")], &[("$age", 30)]),
+    )
+    .await
+    .unwrap();
+    let cb = CommitGraph::open(uri)
+        .await
+        .unwrap()
+        .head_commit()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cb.parent_commit_id.as_deref(), Some(ca.graph_commit_id.as_str()));
+
+    // A reads main: the stale-probe path refreshes A's MANIFEST (via
+    // refresh_manifest_only) but not its commit-graph head, freshening the
+    // read-time pin so the strict update below skips its 409.
+    query_main(&mut a, TEST_QUERIES, "total_people", &params(&[]))
+        .await
+        .unwrap();
+
+    // Strict update, no explicit refresh: pre-fix it appends off the stale head
+    // Ca instead of Cb.
+    mutate_main(
+        &mut a,
+        MUTATION_QUERIES,
+        "set_age",
+        &mixed_params(&[("$name", "target")], &[("$age", 99)]),
+    )
+    .await
+    .unwrap();
+
+    let commits = CommitGraph::open(uri)
+        .await
+        .unwrap()
+        .load_commits()
+        .await
+        .unwrap();
+    let latest = commits.iter().max_by_key(|c| c.manifest_version).unwrap();
+    assert_eq!(
+        latest.parent_commit_id.as_deref(),
+        Some(cb.graph_commit_id.as_str()),
+        "a strict update after an external commit and a local read must append \
+         off the true head Cb, not the stale head Ca"
+    );
+    let ca_children = commits
+        .iter()
+        .filter(|c| c.parent_commit_id.as_deref() == Some(ca.graph_commit_id.as_str()))
+        .count();
+    assert_eq!(ca_children, 1, "Ca must have exactly one child; two is the fork");
 }
 
 #[tokio::test]
@@ -624,64 +953,6 @@ async fn merged_rewritten_indexed_table_is_searchable_immediately() {
         4,
         "expected rebuilt id BTree plus key-property and title/body indices after rewritten merge"
     );
-}
-
-#[tokio::test]
-async fn branch_merge_reports_divergent_update_conflict() {
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let mut main = init_and_load(&dir).await;
-    main.branch_create("feature").await.unwrap();
-
-    let mut feature = Omnigraph::open(uri).await.unwrap();
-
-    mutate_main(
-        &mut main,
-        MUTATION_QUERIES,
-        "set_age",
-        &mixed_params(&[("$name", "Alice")], &[("$age", 31)]),
-    )
-    .await
-    .unwrap();
-
-    mutate_branch(
-        &mut feature,
-        "feature",
-        MUTATION_QUERIES,
-        "set_age",
-        &mixed_params(&[("$name", "Alice")], &[("$age", 32)]),
-    )
-    .await
-    .unwrap();
-
-    let err = feature.branch_merge("feature", "main").await.unwrap_err();
-    match err {
-        OmniError::MergeConflicts(conflicts) => {
-            assert!(conflicts.iter().any(|conflict| {
-                conflict.table_key == "node:Person"
-                    && conflict.row_id.as_deref() == Some("Alice")
-                    && conflict.kind == MergeConflictKind::DivergentUpdate
-            }));
-        }
-        other => panic!("expected merge conflicts, got {other:?}"),
-    }
-
-    let mut reopened = Omnigraph::open(uri).await.unwrap();
-    let qr = query_main(
-        &mut reopened,
-        TEST_QUERIES,
-        "get_person",
-        &params(&[("$name", "Alice")]),
-    )
-    .await
-    .unwrap();
-    let batch = qr.concat_batches().unwrap();
-    let ages = batch
-        .column(1)
-        .as_any()
-        .downcast_ref::<Int32Array>()
-        .unwrap();
-    assert_eq!(ages.value(0), 31);
 }
 
 #[tokio::test]
@@ -997,127 +1268,6 @@ async fn branch_merge_into_non_main_target_works() {
 }
 
 #[tokio::test]
-async fn branch_merge_reports_divergent_insert_conflict() {
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let mut main = init_and_load(&dir).await;
-    main.branch_create("feature").await.unwrap();
-
-    let mut feature = Omnigraph::open(uri).await.unwrap();
-
-    mutate_main(
-        &mut main,
-        MUTATION_QUERIES,
-        "insert_person",
-        &mixed_params(&[("$name", "Eve")], &[("$age", 21)]),
-    )
-    .await
-    .unwrap();
-
-    mutate_branch(
-        &mut feature,
-        "feature",
-        MUTATION_QUERIES,
-        "insert_person",
-        &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
-    )
-    .await
-    .unwrap();
-
-    let err = feature.branch_merge("feature", "main").await.unwrap_err();
-    match err {
-        OmniError::MergeConflicts(conflicts) => {
-            assert!(conflicts.iter().any(|conflict| {
-                conflict.table_key == "node:Person"
-                    && conflict.row_id.as_deref() == Some("Eve")
-                    && conflict.kind == MergeConflictKind::DivergentInsert
-            }));
-        }
-        other => panic!("expected merge conflicts, got {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn branch_merge_reports_delete_vs_update_conflict() {
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let mut main = init_and_load(&dir).await;
-    main.branch_create("feature").await.unwrap();
-
-    let mut feature = Omnigraph::open(uri).await.unwrap();
-
-    mutate_main(
-        &mut main,
-        MUTATION_QUERIES,
-        "remove_person",
-        &params(&[("$name", "Alice")]),
-    )
-    .await
-    .unwrap();
-
-    mutate_branch(
-        &mut feature,
-        "feature",
-        MUTATION_QUERIES,
-        "set_age",
-        &mixed_params(&[("$name", "Alice")], &[("$age", 32)]),
-    )
-    .await
-    .unwrap();
-
-    let err = feature.branch_merge("feature", "main").await.unwrap_err();
-    match err {
-        OmniError::MergeConflicts(conflicts) => {
-            assert!(conflicts.iter().any(|conflict| {
-                conflict.table_key == "node:Person"
-                    && conflict.row_id.as_deref() == Some("Alice")
-                    && conflict.kind == MergeConflictKind::DeleteVsUpdate
-            }));
-        }
-        other => panic!("expected merge conflicts, got {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn branch_merge_reports_orphan_edge_conflict() {
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let mut main = init_and_load(&dir).await;
-    main.branch_create("feature").await.unwrap();
-
-    let mut feature = Omnigraph::open(uri).await.unwrap();
-
-    mutate_branch(
-        &mut feature,
-        "feature",
-        MUTATION_QUERIES,
-        "remove_person",
-        &params(&[("$name", "Alice")]),
-    )
-    .await
-    .unwrap();
-
-    mutate_main(
-        &mut main,
-        MUTATION_QUERIES,
-        "add_friend",
-        &params(&[("$from", "Alice"), ("$to", "Diana")]),
-    )
-    .await
-    .unwrap();
-
-    let err = feature.branch_merge("feature", "main").await.unwrap_err();
-    match err {
-        OmniError::MergeConflicts(conflicts) => {
-            assert!(conflicts.iter().any(|conflict| {
-                conflict.table_key == "edge:Knows" && conflict.kind == MergeConflictKind::OrphanEdge
-            }));
-        }
-        other => panic!("expected merge conflicts, got {other:?}"),
-    }
-}
-
-#[tokio::test]
 async fn branch_merge_reports_unique_violation_conflict() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
@@ -1155,6 +1305,87 @@ async fn branch_merge_reports_unique_violation_conflict() {
         }
         other => panic!("expected merge conflicts, got {other:?}"),
     }
+}
+
+/// Regression for the MR-983 follow-up: the branch-merge path must enforce an
+/// edge composite `@unique(src, dst)` as a true composite key, consistent with
+/// the intake path. Two branches inserting the *same* (src, dst) pair must
+/// conflict on merge.
+#[tokio::test]
+async fn branch_merge_reports_composite_unique_violation_conflict() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut main = init_db_from_schema_and_data(&dir, EDGE_UNIQUE_SCHEMA, EDGE_UNIQUE_DATA).await;
+    main.branch_create("feature").await.unwrap();
+
+    let mut feature = Omnigraph::open(uri).await.unwrap();
+
+    mutate_main(
+        &mut main,
+        EDGE_UNIQUE_MUTATIONS,
+        "add_knows",
+        &params(&[("$from", "Alice"), ("$to", "Bob")]),
+    )
+    .await
+    .unwrap();
+
+    mutate_branch(
+        &mut feature,
+        "feature",
+        EDGE_UNIQUE_MUTATIONS,
+        "add_knows",
+        &params(&[("$from", "Alice"), ("$to", "Bob")]),
+    )
+    .await
+    .unwrap();
+
+    let err = main.branch_merge("feature", "main").await.unwrap_err();
+    match err {
+        OmniError::MergeConflicts(conflicts) => {
+            assert!(conflicts.iter().any(|conflict| {
+                conflict.table_key == "edge:Knows"
+                    && conflict.kind == MergeConflictKind::UniqueViolation
+            }));
+        }
+        other => panic!("expected merge conflicts, got {other:?}"),
+    }
+}
+
+/// Sibling to the above: pairs sharing `src` but differing on `dst` are unique
+/// on the (src, dst) tuple and must merge cleanly. Guards against the composite
+/// degrading back into a single-field `@unique(src)` on the merge path.
+#[tokio::test]
+async fn branch_merge_allows_distinct_composite_unique_pairs() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut main = init_db_from_schema_and_data(&dir, EDGE_UNIQUE_SCHEMA, EDGE_UNIQUE_DATA).await;
+    main.branch_create("feature").await.unwrap();
+
+    let mut feature = Omnigraph::open(uri).await.unwrap();
+
+    mutate_main(
+        &mut main,
+        EDGE_UNIQUE_MUTATIONS,
+        "add_knows",
+        &params(&[("$from", "Alice"), ("$to", "Bob")]),
+    )
+    .await
+    .unwrap();
+
+    mutate_branch(
+        &mut feature,
+        "feature",
+        EDGE_UNIQUE_MUTATIONS,
+        "add_knows",
+        &params(&[("$from", "Alice"), ("$to", "Carol")]),
+    )
+    .await
+    .unwrap();
+
+    main.branch_merge("feature", "main")
+        .await
+        .expect("distinct (src, dst) pairs are unique on the composite and must merge cleanly");
+    assert_eq!(count_rows(&main, "edge:Knows").await, 2);
 }
 
 #[tokio::test]
@@ -1197,25 +1428,70 @@ async fn branch_merge_reports_cardinality_violation_conflict() {
     }
 }
 
+/// Fix C regression: a table adopted by pointer switch (`AdoptSourceState`)
+/// must still be validated. Merging `main` -> `feature` where `feature` deleted
+/// a node and `main` added an edge referencing it classifies the edge table as
+/// `AdoptSourceState` (source on main, target on a branch). The unified
+/// evaluator must see the adopted edge and reject the orphan; before the fix it
+/// skipped the table entirely and silently published the dangling edge.
 #[tokio::test]
-async fn branch_create_bootstraps_missing_commit_graph() {
+async fn merge_main_into_branch_validates_adopted_edge_against_branch_node_delete() {
+    const MUTATIONS: &str = r#"
+query add_knows($from: String, $to: String) {
+    insert Knows { from: $from, to: $to }
+}
+
+query delete_person($name: String) {
+    delete Person where name = $name
+}
+"#;
+
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let db = init_and_load(&dir).await;
-    drop(db);
+    let mut main = init_db_from_schema_and_data(&dir, EDGE_UNIQUE_SCHEMA, EDGE_UNIQUE_DATA).await;
+    main.branch_create("feature").await.unwrap();
+    let mut feature = Omnigraph::open(uri).await.unwrap();
 
-    fs::remove_dir_all(dir.path().join("_graph_commits.lance")).unwrap();
+    // main (merge source): add an edge referencing Bob.
+    mutate_main(
+        &mut main,
+        MUTATIONS,
+        "add_knows",
+        &params(&[("$from", "Alice"), ("$to", "Bob")]),
+    )
+    .await
+    .unwrap();
 
-    let mut reopened = Omnigraph::open(uri).await.unwrap();
-    reopened.branch_create("feature").await.unwrap();
+    // feature (merge target): delete Bob.
+    mutate_branch(
+        &mut feature,
+        "feature",
+        MUTATIONS,
+        "delete_person",
+        &params(&[("$name", "Bob")]),
+    )
+    .await
+    .unwrap();
 
-    assert!(dir.path().join("_graph_commits.lance").exists());
-
-    let feature = Omnigraph::open(uri).await.unwrap();
-    assert_eq!(
-        count_rows_branch(&feature, "feature", "node:Person").await,
-        4
-    );
+    // Merge main -> feature: edge:Knows is adopted by pointer switch
+    // (AdoptSourceState). The adopted edge Alice->Bob references Bob, which the
+    // target branch deleted, so the merge must reject with OrphanEdge.
+    let err = feature
+        .branch_merge("main", "feature")
+        .await
+        .expect_err("adopting main's edge into a branch that deleted its endpoint must conflict");
+    match err {
+        OmniError::MergeConflicts(conflicts) => {
+            assert!(
+                conflicts
+                    .iter()
+                    .any(|c| c.table_key == "edge:Knows"
+                        && c.kind == MergeConflictKind::OrphanEdge),
+                "expected OrphanEdge on edge:Knows, got {conflicts:?}"
+            );
+        }
+        other => panic!("expected merge conflicts, got {other:?}"),
+    }
 }
 
 #[tokio::test]

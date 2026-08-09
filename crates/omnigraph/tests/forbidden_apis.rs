@@ -29,15 +29,22 @@
 //!   the cross-table manifest commit. Documented exception.
 //! - `crates/omnigraph/src/storage_layer.rs` — IS the trait module.
 //!
-//! ## Transitional allow-list
+//! ## Allow-list shape
 //!
-//! The migration of writers onto staged primitives is incremental.
-//! Several writers (ensure_indices, branch_merge, schema_apply rewrites)
-//! already route through the staged primitives; others (bulk loader,
-//! exec/mutation, exec/query) still use the legacy inherent
-//! `TableStore` methods — they're not visible at the trait boundary, but
-//! they DO call lance types. The file-level allow-list below reflects
-//! this transitional state and tightens as call sites migrate.
+//! After MR-854, `db.storage()` (`&dyn TableStorage`) exposes only staged
+//! primitives + reads. The inline-commit writes live on a separate
+//! `InlineCommitResidual` trait reached via
+//! `Omnigraph::storage_inline_residual()`, so the default storage surface
+//! cannot couple "write bytes" with "advance HEAD" — engine code that
+//! wants an inline residual must name the residual accessor explicitly.
+//! The sole residual is `create_vector_index` (Lance #6666); `delete`
+//! migrated to the staged `stage_delete` path in MR-A (Lance 7.0 #6658).
+//! The dead legacy methods
+//! (trait `append_batch` / `merge_insert_batches`, inherent
+//! `merge_insert_batch{,es}`, `create_{btree,inverted}_index`) were
+//! removed entirely. This guard's scope is unchanged: it catches direct
+//! `lance::*` inline-commit misuse outside the storage layer. The
+//! file-level allow-list below matches that boundary.
 
 use std::path::{Path, PathBuf};
 
@@ -65,6 +72,14 @@ const FORBIDDEN_PATTERNS: &[&str] = &[
     "Dataset::drop_columns",
     "Dataset::truncate_table",
     "Dataset::restore",
+    // Raw dataset OPENS — all reads must route through `Snapshot::open` (the
+    // held-handle cache + shared Session, Fix 3). Only the instrumented opener
+    // (`instrumentation.rs`) and the storage/manifest layers (allow-listed below)
+    // open datasets directly; forbidding these in the read/exec layer keeps a
+    // future read from silently bypassing the cache.
+    "Dataset::open",
+    "DatasetBuilder::from_uri",
+    "DatasetBuilder::from_namespace",
     // Lance-specific method names that don't clash with our `TableStore`
     // wrappers (we use `merge_insert_batch{,es}`, `add_columns_to_*`,
     // etc. — never the bare Lance names). Engine code that writes
@@ -93,13 +108,13 @@ const FORBIDDEN_PATTERNS: &[&str] = &[
 /// Files exempt from the guard. These are the legitimate storage-layer
 /// or manifest-layer implementations that USE the forbidden APIs to
 /// provide the staged primitives or to maintain the system tables
-/// (commit graph, manifest).
+/// (manifest, recovery audit).
 const ALLOW_LIST_FILES: &[&str] = &[
-    "table_store.rs",        // The storage layer itself.
-    "storage_layer.rs",      // The trait module.
-    "commit_graph.rs",       // Maintains `_graph_commits.lance` system table.
-    "graph_coordinator.rs",  // Drives the manifest publisher / branch coordinator.
-    "recovery_audit.rs",     // Maintains `_graph_commit_recoveries.lance` (recovery audit trail).
+    "table_store.rs",       // The storage layer itself.
+    "storage_layer.rs",     // The trait module.
+    "graph_coordinator.rs", // Drives the manifest publisher / branch coordinator.
+    "recovery_audit.rs",    // Maintains `_graph_commit_recoveries.lance` (recovery audit trail).
+    "instrumentation.rs",   // The instrumented dataset opener (open_dataset_tracked / open_table_dataset).
 ];
 
 /// Directories exempt from the guard. Files under these paths may use
@@ -168,10 +183,7 @@ fn engine_code_does_not_call_forbidden_lance_apis() {
             // comments are documentation, not code use. The trait
             // surface (sealed + trait-only) is the actual enforcement;
             // this test only catches code use.
-            if trimmed.starts_with("//")
-                || trimmed.starts_with("/*")
-                || trimmed.starts_with("*")
-            {
+            if trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with("*") {
                 continue;
             }
             // Allow lines marked with the sentinel on the SAME line or

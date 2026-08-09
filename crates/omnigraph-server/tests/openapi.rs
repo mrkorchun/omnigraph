@@ -8,10 +8,9 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode};
 use omnigraph::db::Omnigraph;
 use omnigraph::loader::{LoadMode, load_jsonl};
-use omnigraph_server::{ApiDoc, AppState, build_app};
+use omnigraph_server::{AppState, build_app, served_openapi};
 use serde_json::Value;
 use tower::ServiceExt;
-use utoipa::OpenApi;
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -19,42 +18,42 @@ fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
-fn repo_path(root: &Path) -> PathBuf {
+fn graph_path(root: &Path) -> PathBuf {
     root.join("openapi_test.omni")
 }
 
-async fn init_loaded_repo() -> tempfile::TempDir {
+async fn init_loaded_graph() -> tempfile::TempDir {
     let temp = tempfile::tempdir().unwrap();
-    let repo = repo_path(temp.path());
-    fs::create_dir_all(&repo).unwrap();
+    let graph = graph_path(temp.path());
+    fs::create_dir_all(&graph).unwrap();
     let schema = fs::read_to_string(fixture("test.pg")).unwrap();
     let data = fs::read_to_string(fixture("test.jsonl")).unwrap();
-    Omnigraph::init(repo.to_str().unwrap(), &schema)
+    Omnigraph::init(graph.to_str().unwrap(), &schema)
         .await
         .unwrap();
-    let mut db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+    let mut db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
     load_jsonl(&mut db, &data, LoadMode::Overwrite)
         .await
         .unwrap();
     temp
 }
 
-async fn app_for_loaded_repo() -> (tempfile::TempDir, Router) {
-    let temp = init_loaded_repo().await;
-    let repo = repo_path(temp.path());
-    let state = AppState::open(repo.to_string_lossy().to_string())
+async fn app_for_loaded_graph() -> (tempfile::TempDir, Router) {
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let state = AppState::open(graph.to_string_lossy().to_string())
         .await
         .unwrap();
     let app = build_app(state);
     (temp, app)
 }
 
-async fn app_for_loaded_repo_with_auth(token: &str) -> (tempfile::TempDir, Router) {
-    let temp = init_loaded_repo().await;
-    let repo = repo_path(temp.path());
-    let db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+async fn app_for_loaded_graph_with_auth(token: &str) -> (tempfile::TempDir, Router) {
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
     let state = AppState::new_with_bearer_token(
-        repo.to_string_lossy().to_string(),
+        graph.to_string_lossy().to_string(),
         db,
         Some(token.to_string()),
     );
@@ -71,7 +70,10 @@ async fn json_response(app: &Router, request: Request<Body>) -> (StatusCode, Val
 }
 
 fn openapi_doc() -> utoipa::openapi::OpenApi {
-    ApiDoc::openapi()
+    // RFC-011 cluster-only: the canonical committed spec is the SERVED
+    // shape — protected routes nested under `/graphs/{graph_id}/…`,
+    // `/healthz` and `/graphs` flat. This matches what the server serves.
+    served_openapi()
 }
 
 fn openapi_json() -> Value {
@@ -84,7 +86,7 @@ fn openapi_json() -> Value {
 
 #[tokio::test]
 async fn openapi_endpoint_returns_200_with_valid_json() {
-    let (_temp, app) = app_for_loaded_repo().await;
+    let (_temp, app) = app_for_loaded_graph().await;
     let request = Request::builder()
         .method(Method::GET)
         .uri("/openapi.json")
@@ -97,7 +99,7 @@ async fn openapi_endpoint_returns_200_with_valid_json() {
 
 #[tokio::test]
 async fn openapi_endpoint_returns_openapi_31_version() {
-    let (_temp, app) = app_for_loaded_repo().await;
+    let (_temp, app) = app_for_loaded_graph().await;
     let request = Request::builder()
         .method(Method::GET)
         .uri("/openapi.json")
@@ -113,11 +115,11 @@ async fn openapi_endpoint_returns_openapi_31_version() {
 
 #[tokio::test]
 async fn openapi_endpoint_does_not_require_auth() {
-    let temp = init_loaded_repo().await;
-    let repo = repo_path(temp.path());
-    let db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
     let state = AppState::new_with_bearer_token(
-        repo.to_string_lossy().to_string(),
+        graph.to_string_lossy().to_string(),
         db,
         Some("secret-token".to_string()),
     );
@@ -129,7 +131,11 @@ async fn openapi_endpoint_does_not_require_auth() {
         .body(Body::empty())
         .unwrap();
     let (status, _) = json_response(&app, request).await;
-    assert_eq!(status, StatusCode::OK, "/openapi.json should not require auth");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "/openapi.json should not require auth"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -155,20 +161,28 @@ fn openapi_info_contains_version() {
 // Path coverage tests
 // ---------------------------------------------------------------------------
 
+// The canonical served spec keeps `/healthz` and `/graphs` flat; every
+// protected route nests under `/graphs/{graph_id}/…`.
 const EXPECTED_PATHS: &[&str] = &[
     "/healthz",
-    "/snapshot",
-    "/read",
-    "/export",
-    "/change",
-    "/schema",
-    "/schema/apply",
-    "/ingest",
-    "/branches",
-    "/branches/{branch}",
-    "/branches/merge",
-    "/commits",
-    "/commits/{commit_id}",
+    "/graphs",
+    "/graphs/{graph_id}/snapshot",
+    "/graphs/{graph_id}/read",
+    "/graphs/{graph_id}/query",
+    "/graphs/{graph_id}/export",
+    "/graphs/{graph_id}/change",
+    "/graphs/{graph_id}/mutate",
+    "/graphs/{graph_id}/queries",
+    "/graphs/{graph_id}/queries/{name}",
+    "/graphs/{graph_id}/schema",
+    "/graphs/{graph_id}/schema/apply",
+    "/graphs/{graph_id}/load",
+    "/graphs/{graph_id}/ingest",
+    "/graphs/{graph_id}/branches",
+    "/graphs/{graph_id}/branches/{branch}",
+    "/graphs/{graph_id}/branches/merge",
+    "/graphs/{graph_id}/commits",
+    "/graphs/{graph_id}/commits/{commit_id}",
 ];
 
 #[test]
@@ -212,56 +226,140 @@ fn openapi_healthz_is_get() {
 #[test]
 fn openapi_read_is_post() {
     let doc = openapi_json();
-    assert!(doc["paths"]["/read"]["post"].is_object());
+    assert!(doc["paths"]["/graphs/{graph_id}/read"]["post"].is_object());
 }
 
 #[test]
 fn openapi_export_is_post() {
     let doc = openapi_json();
-    assert!(doc["paths"]["/export"]["post"].is_object());
+    assert!(doc["paths"]["/graphs/{graph_id}/export"]["post"].is_object());
 }
 
 #[test]
 fn openapi_change_is_post() {
     let doc = openapi_json();
-    assert!(doc["paths"]["/change"]["post"].is_object());
+    assert!(doc["paths"]["/graphs/{graph_id}/change"]["post"].is_object());
+}
+
+#[test]
+fn openapi_mutate_is_post() {
+    let doc = openapi_json();
+    assert!(doc["paths"]["/graphs/{graph_id}/mutate"]["post"].is_object());
+}
+
+// Deprecation flagging — `/read` and `/change` are kept indefinitely for
+// back-compat but are flagged so OpenAPI codegens (typescript-fetch,
+// openapi-generator, oapi-codegen, etc.) emit @deprecated on the generated
+// SDK methods. The canonical successors `/query` and `/mutate` are not
+// flagged. See `deprecation_headers` in `omnigraph-server/src/lib.rs` for
+// the matching runtime signal (RFC 9745 + RFC 8288 headers).
+#[test]
+fn openapi_read_is_deprecated() {
+    let doc = openapi_json();
+    assert_eq!(
+        doc["paths"]["/graphs/{graph_id}/read"]["post"]["deprecated"],
+        serde_json::Value::Bool(true),
+        "/read must be flagged deprecated in OpenAPI; use /query instead"
+    );
+}
+
+#[test]
+fn openapi_change_is_deprecated() {
+    let doc = openapi_json();
+    assert_eq!(
+        doc["paths"]["/graphs/{graph_id}/change"]["post"]["deprecated"],
+        serde_json::Value::Bool(true),
+        "/change must be flagged deprecated in OpenAPI; use /mutate instead"
+    );
+}
+
+#[test]
+fn openapi_query_is_not_deprecated() {
+    let doc = openapi_json();
+    let deprecated = doc["paths"]["/graphs/{graph_id}/query"]["post"]
+        .get("deprecated")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    assert!(
+        !deprecated,
+        "/query is the canonical read endpoint and must not be deprecated"
+    );
+}
+
+#[test]
+fn openapi_mutate_is_not_deprecated() {
+    let doc = openapi_json();
+    let deprecated = doc["paths"]["/graphs/{graph_id}/mutate"]["post"]
+        .get("deprecated")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    assert!(
+        !deprecated,
+        "/mutate is the canonical mutation endpoint and must not be deprecated"
+    );
 }
 
 #[test]
 fn openapi_ingest_is_post() {
     let doc = openapi_json();
-    assert!(doc["paths"]["/ingest"]["post"].is_object());
+    assert!(doc["paths"]["/graphs/{graph_id}/ingest"]["post"].is_object());
+}
+
+#[test]
+fn openapi_load_is_not_deprecated() {
+    // RFC-009 Phase 5: /load is the canonical bulk-load endpoint.
+    let doc = openapi_json();
+    assert!(doc["paths"]["/graphs/{graph_id}/load"]["post"].is_object());
+    let deprecated = doc["paths"]["/graphs/{graph_id}/load"]["post"]
+        .get("deprecated")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    assert!(
+        !deprecated,
+        "/load is the canonical load endpoint and must not be deprecated"
+    );
+}
+
+#[test]
+fn openapi_ingest_is_deprecated() {
+    // RFC-009 Phase 5: /ingest is now the deprecated alias of /load.
+    let doc = openapi_json();
+    assert_eq!(
+        doc["paths"]["/graphs/{graph_id}/ingest"]["post"]["deprecated"],
+        serde_json::Value::Bool(true),
+        "/ingest must be flagged deprecated now that /load is canonical"
+    );
 }
 
 #[test]
 fn openapi_branches_supports_get_and_post() {
     let doc = openapi_json();
-    assert!(doc["paths"]["/branches"]["get"].is_object());
-    assert!(doc["paths"]["/branches"]["post"].is_object());
+    assert!(doc["paths"]["/graphs/{graph_id}/branches"]["get"].is_object());
+    assert!(doc["paths"]["/graphs/{graph_id}/branches"]["post"].is_object());
 }
 
 #[test]
 fn openapi_branch_delete_is_delete() {
     let doc = openapi_json();
-    assert!(doc["paths"]["/branches/{branch}"]["delete"].is_object());
+    assert!(doc["paths"]["/graphs/{graph_id}/branches/{branch}"]["delete"].is_object());
 }
 
 #[test]
 fn openapi_branch_merge_is_post() {
     let doc = openapi_json();
-    assert!(doc["paths"]["/branches/merge"]["post"].is_object());
+    assert!(doc["paths"]["/graphs/{graph_id}/branches/merge"]["post"].is_object());
 }
 
 #[test]
 fn openapi_commits_is_get() {
     let doc = openapi_json();
-    assert!(doc["paths"]["/commits"]["get"].is_object());
+    assert!(doc["paths"]["/graphs/{graph_id}/commits"]["get"].is_object());
 }
 
 #[test]
 fn openapi_commit_show_is_get() {
     let doc = openapi_json();
-    assert!(doc["paths"]["/commits/{commit_id}"]["get"].is_object());
+    assert!(doc["paths"]["/graphs/{graph_id}/commits/{commit_id}"]["get"].is_object());
 }
 
 // ---------------------------------------------------------------------------
@@ -278,6 +376,7 @@ const EXPECTED_SCHEMAS: &[&str] = &[
     "BranchMergeRequest",
     "ChangeOutput",
     "ChangeRequest",
+    "QueryRequest",
     "CommitListOutput",
     "CommitOutput",
     "ErrorCode",
@@ -327,6 +426,7 @@ fn health_output_schema_has_expected_fields() {
     let props = schema["properties"].as_object().unwrap();
     assert!(props.contains_key("status"));
     assert!(props.contains_key("version"));
+    assert!(props.contains_key("internal_schema_version"));
     assert!(props.contains_key("source_version"));
 }
 
@@ -368,13 +468,65 @@ fn read_output_schema_has_expected_fields() {
 
 #[test]
 fn change_request_schema_has_expected_fields() {
+    // Canonical field names on the wire are now `query` and `name`. The
+    // schema descriptions document `query_source` and `query_name` as
+    // legacy deserialization aliases for backward compatibility.
     let doc = openapi_json();
     let schema = &doc["components"]["schemas"]["ChangeRequest"];
     let props = schema["properties"].as_object().unwrap();
-    assert!(props.contains_key("query_source"));
-    assert!(props.contains_key("query_name"));
+    assert!(props.contains_key("query"));
+    assert!(props.contains_key("name"));
     assert!(props.contains_key("params"));
     assert!(props.contains_key("branch"));
+    let query_desc = schema["properties"]["query"]["description"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        query_desc.contains("query_source"),
+        "expected `query` description to mention the legacy `query_source` alias, got: {query_desc}"
+    );
+}
+
+#[test]
+fn query_request_schema_has_expected_fields() {
+    let doc = openapi_json();
+    let schema = &doc["components"]["schemas"]["QueryRequest"];
+    let props = schema["properties"].as_object().unwrap();
+    assert!(props.contains_key("query"));
+    assert!(props.contains_key("name"));
+    assert!(props.contains_key("params"));
+    assert!(props.contains_key("branch"));
+    assert!(props.contains_key("snapshot"));
+}
+
+#[test]
+fn query_request_query_is_required() {
+    let doc = openapi_json();
+    let schema = &doc["components"]["schemas"]["QueryRequest"];
+    let required: Vec<&str> = schema["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(required.contains(&"query"));
+}
+
+#[test]
+fn openapi_query_is_post() {
+    let doc = openapi_json();
+    assert!(doc["paths"]["/graphs/{graph_id}/query"]["post"].is_object());
+}
+
+#[test]
+fn query_endpoint_documents_mutation_400() {
+    let doc = openapi_json();
+    let four_hundred = &doc["paths"]["/graphs/{graph_id}/query"]["post"]["responses"]["400"];
+    let description = four_hundred["description"].as_str().unwrap_or_default();
+    assert!(
+        description.contains("mutations") || description.contains("POST /mutate"),
+        "expected /query 400 response to mention mutation rejection, got: {description}"
+    );
 }
 
 #[test]
@@ -493,6 +645,7 @@ fn snapshot_output_schema_has_expected_fields() {
     let props = schema["properties"].as_object().unwrap();
     assert!(props.contains_key("branch"));
     assert!(props.contains_key("manifest_version"));
+    assert!(props.contains_key("internal_schema_version"));
     assert!(props.contains_key("tables"));
 }
 
@@ -580,18 +733,21 @@ fn openapi_defines_bearer_token_security_scheme() {
 fn protected_endpoints_reference_bearer_token_security() {
     let doc = openapi_json();
     let protected_paths = [
-        ("/read", "post"),
-        ("/change", "post"),
-        ("/schema/apply", "post"),
-        ("/ingest", "post"),
-        ("/export", "post"),
-        ("/snapshot", "get"),
-        ("/branches", "get"),
-        ("/branches", "post"),
-        ("/branches/{branch}", "delete"),
-        ("/branches/merge", "post"),
-        ("/commits", "get"),
-        ("/commits/{commit_id}", "get"),
+        ("/graphs/{graph_id}/read", "post"),
+        ("/graphs/{graph_id}/change", "post"),
+        ("/graphs/{graph_id}/schema/apply", "post"),
+        ("/graphs/{graph_id}/queries", "get"),
+        ("/graphs/{graph_id}/queries/{name}", "post"),
+        ("/graphs/{graph_id}/load", "post"),
+        ("/graphs/{graph_id}/ingest", "post"),
+        ("/graphs/{graph_id}/export", "post"),
+        ("/graphs/{graph_id}/snapshot", "get"),
+        ("/graphs/{graph_id}/branches", "get"),
+        ("/graphs/{graph_id}/branches", "post"),
+        ("/graphs/{graph_id}/branches/{branch}", "delete"),
+        ("/graphs/{graph_id}/branches/merge", "post"),
+        ("/graphs/{graph_id}/commits", "get"),
+        ("/graphs/{graph_id}/commits/{commit_id}", "get"),
     ];
 
     for (path, method) in protected_paths {
@@ -623,49 +779,61 @@ fn healthz_does_not_require_security() {
 #[test]
 fn branch_delete_has_branch_path_parameter() {
     let doc = openapi_json();
-    let params = doc["paths"]["/branches/{branch}"]["delete"]["parameters"]
+    let params = doc["paths"]["/graphs/{graph_id}/branches/{branch}"]["delete"]["parameters"]
         .as_array()
         .unwrap();
-    let has_branch = params.iter().any(|p| {
-        p["name"].as_str() == Some("branch") && p["in"].as_str() == Some("path")
-    });
-    assert!(has_branch, "DELETE /branches/{{branch}} must have 'branch' path parameter");
+    let has_branch = params
+        .iter()
+        .any(|p| p["name"].as_str() == Some("branch") && p["in"].as_str() == Some("path"));
+    assert!(
+        has_branch,
+        "DELETE /branches/{{branch}} must have 'branch' path parameter"
+    );
 }
 
 #[test]
 fn commit_show_has_commit_id_path_parameter() {
     let doc = openapi_json();
-    let params = doc["paths"]["/commits/{commit_id}"]["get"]["parameters"]
+    let params = doc["paths"]["/graphs/{graph_id}/commits/{commit_id}"]["get"]["parameters"]
         .as_array()
         .unwrap();
-    let has_commit_id = params.iter().any(|p| {
-        p["name"].as_str() == Some("commit_id") && p["in"].as_str() == Some("path")
-    });
-    assert!(has_commit_id, "GET /commits/{{commit_id}} must have 'commit_id' path parameter");
+    let has_commit_id = params
+        .iter()
+        .any(|p| p["name"].as_str() == Some("commit_id") && p["in"].as_str() == Some("path"));
+    assert!(
+        has_commit_id,
+        "GET /commits/{{commit_id}} must have 'commit_id' path parameter"
+    );
 }
 
 #[test]
 fn snapshot_has_branch_query_parameter() {
     let doc = openapi_json();
-    let params = doc["paths"]["/snapshot"]["get"]["parameters"]
+    let params = doc["paths"]["/graphs/{graph_id}/snapshot"]["get"]["parameters"]
         .as_array()
         .unwrap();
-    let has_branch = params.iter().any(|p| {
-        p["name"].as_str() == Some("branch") && p["in"].as_str() == Some("query")
-    });
-    assert!(has_branch, "GET /snapshot must have 'branch' query parameter");
+    let has_branch = params
+        .iter()
+        .any(|p| p["name"].as_str() == Some("branch") && p["in"].as_str() == Some("query"));
+    assert!(
+        has_branch,
+        "GET /snapshot must have 'branch' query parameter"
+    );
 }
 
 #[test]
 fn commits_has_branch_query_parameter() {
     let doc = openapi_json();
-    let params = doc["paths"]["/commits"]["get"]["parameters"]
+    let params = doc["paths"]["/graphs/{graph_id}/commits"]["get"]["parameters"]
         .as_array()
         .unwrap();
-    let has_branch = params.iter().any(|p| {
-        p["name"].as_str() == Some("branch") && p["in"].as_str() == Some("query")
-    });
-    assert!(has_branch, "GET /commits must have 'branch' query parameter");
+    let has_branch = params
+        .iter()
+        .any(|p| p["name"].as_str() == Some("branch") && p["in"].as_str() == Some("query"));
+    assert!(
+        has_branch,
+        "GET /commits must have 'branch' query parameter"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -696,7 +864,7 @@ fn openapi_operations_have_tags() {
 #[test]
 fn read_endpoint_200_references_read_output_schema() {
     let doc = openapi_json();
-    let content = &doc["paths"]["/read"]["post"]["responses"]["200"]["content"];
+    let content = &doc["paths"]["/graphs/{graph_id}/read"]["post"]["responses"]["200"]["content"];
     let schema = &content["application/json"]["schema"];
     let ref_path = schema["$ref"].as_str().unwrap();
     assert!(
@@ -708,7 +876,7 @@ fn read_endpoint_200_references_read_output_schema() {
 #[test]
 fn change_endpoint_200_references_change_output_schema() {
     let doc = openapi_json();
-    let content = &doc["paths"]["/change"]["post"]["responses"]["200"]["content"];
+    let content = &doc["paths"]["/graphs/{graph_id}/change"]["post"]["responses"]["200"]["content"];
     let schema = &content["application/json"]["schema"];
     let ref_path = schema["$ref"].as_str().unwrap();
     assert!(
@@ -733,16 +901,15 @@ fn healthz_200_references_health_output_schema() {
 fn error_responses_reference_error_output_schema() {
     let doc = openapi_json();
     let paths_with_errors = [
-        ("/read", "post", "400"),
-        ("/read", "post", "401"),
-        ("/change", "post", "400"),
-        ("/change", "post", "409"),
-        ("/branches", "post", "409"),
+        ("/graphs/{graph_id}/read", "post", "400"),
+        ("/graphs/{graph_id}/read", "post", "401"),
+        ("/graphs/{graph_id}/change", "post", "400"),
+        ("/graphs/{graph_id}/change", "post", "409"),
+        ("/graphs/{graph_id}/branches", "post", "409"),
     ];
 
     for (path, method, status) in paths_with_errors {
-        let content =
-            &doc["paths"][path][method]["responses"][status]["content"];
+        let content = &doc["paths"][path][method]["responses"][status]["content"];
         let schema = &content["application/json"]["schema"];
         let ref_path = schema["$ref"].as_str().unwrap();
         assert!(
@@ -760,13 +927,13 @@ fn error_responses_reference_error_output_schema() {
 fn post_endpoints_have_request_body() {
     let doc = openapi_json();
     let post_paths = [
-        ("/read", "ReadRequest"),
-        ("/change", "ChangeRequest"),
-        ("/schema/apply", "SchemaApplyRequest"),
-        ("/ingest", "IngestRequest"),
-        ("/export", "ExportRequest"),
-        ("/branches", "BranchCreateRequest"),
-        ("/branches/merge", "BranchMergeRequest"),
+        ("/graphs/{graph_id}/read", "ReadRequest"),
+        ("/graphs/{graph_id}/change", "ChangeRequest"),
+        ("/graphs/{graph_id}/schema/apply", "SchemaApplyRequest"),
+        ("/graphs/{graph_id}/ingest", "IngestRequest"),
+        ("/graphs/{graph_id}/export", "ExportRequest"),
+        ("/graphs/{graph_id}/branches", "BranchCreateRequest"),
+        ("/graphs/{graph_id}/branches/merge", "BranchMergeRequest"),
     ];
 
     for (path, expected_schema) in post_paths {
@@ -782,6 +949,34 @@ fn post_endpoints_have_request_body() {
             "POST {path} requestBody should reference {expected_schema}, got {ref_path}"
         );
     }
+}
+
+#[test]
+fn invoke_stored_query_request_body_is_optional() {
+    let doc = openapi_json();
+    let request_body = &doc["paths"]["/graphs/{graph_id}/queries/{name}"]["post"]["requestBody"];
+    assert!(
+        request_body.is_object(),
+        "POST /queries/{{name}} should document its optional request body"
+    );
+    assert_eq!(
+        request_body["required"].as_bool().unwrap_or(false),
+        false,
+        "stored-query invocation body should be optional"
+    );
+    let schema = &request_body["content"]["application/json"]["schema"];
+    let ref_path = schema["$ref"]
+        .as_str()
+        .or_else(|| {
+            schema["oneOf"]
+                .as_array()
+                .and_then(|schemas| schemas.iter().find_map(|schema| schema["$ref"].as_str()))
+        })
+        .unwrap();
+    assert!(
+        ref_path.contains("InvokeStoredQueryRequest"),
+        "POST /queries/{{name}} requestBody should reference InvokeStoredQueryRequest, got {ref_path}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -804,7 +999,7 @@ fn openapi_spec_round_trips_through_json() {
 
 #[tokio::test]
 async fn open_mode_spec_has_no_security_schemes() {
-    let (_temp, app) = app_for_loaded_repo().await;
+    let (_temp, app) = app_for_loaded_graph().await;
     let request = Request::builder()
         .method(Method::GET)
         .uri("/openapi.json")
@@ -820,7 +1015,7 @@ async fn open_mode_spec_has_no_security_schemes() {
 
 #[tokio::test]
 async fn open_mode_spec_has_no_operation_security() {
-    let (_temp, app) = app_for_loaded_repo().await;
+    let (_temp, app) = app_for_loaded_graph().await;
     let request = Request::builder()
         .method(Method::GET)
         .uri("/openapi.json")
@@ -841,7 +1036,7 @@ async fn open_mode_spec_has_no_operation_security() {
 
 #[tokio::test]
 async fn auth_mode_spec_includes_bearer_token_security_scheme() {
-    let (_temp, app) = app_for_loaded_repo_with_auth("secret").await;
+    let (_temp, app) = app_for_loaded_graph_with_auth("secret").await;
     let request = Request::builder()
         .method(Method::GET)
         .uri("/openapi.json")
@@ -855,19 +1050,21 @@ async fn auth_mode_spec_includes_bearer_token_security_scheme() {
 
 #[tokio::test]
 async fn auth_mode_spec_has_security_on_protected_operations() {
-    let (_temp, app) = app_for_loaded_repo_with_auth("secret").await;
+    let (_temp, app) = app_for_loaded_graph_with_auth("secret").await;
     let request = Request::builder()
         .method(Method::GET)
         .uri("/openapi.json")
         .body(Body::empty())
         .unwrap();
     let (_, json) = json_response(&app, request).await;
+    // RFC-011 cluster-only: the served spec always nests protected
+    // routes under `/graphs/{graph_id}/...`.
     let protected_paths = [
-        ("/read", "post"),
-        ("/change", "post"),
-        ("/snapshot", "get"),
-        ("/branches", "get"),
-        ("/commits", "get"),
+        ("/graphs/{graph_id}/read", "post"),
+        ("/graphs/{graph_id}/change", "post"),
+        ("/graphs/{graph_id}/snapshot", "get"),
+        ("/graphs/{graph_id}/branches", "get"),
+        ("/graphs/{graph_id}/commits", "get"),
     ];
     for (path, method) in protected_paths {
         let security = &json["paths"][path][method]["security"];
@@ -885,24 +1082,8 @@ async fn auth_mode_spec_has_security_on_protected_operations() {
 }
 
 #[tokio::test]
-async fn auth_mode_spec_matches_static_generation() {
-    let (_temp, app) = app_for_loaded_repo_with_auth("secret").await;
-    let request = Request::builder()
-        .method(Method::GET)
-        .uri("/openapi.json")
-        .body(Body::empty())
-        .unwrap();
-    let (_, served) = json_response(&app, request).await;
-    let static_doc = openapi_json();
-    assert_eq!(
-        served, static_doc,
-        "auth-mode served spec must match static generation"
-    );
-}
-
-#[tokio::test]
 async fn auth_mode_healthz_still_has_no_security() {
-    let (_temp, app) = app_for_loaded_repo_with_auth("secret").await;
+    let (_temp, app) = app_for_loaded_graph_with_auth("secret").await;
     let request = Request::builder()
         .method(Method::GET)
         .uri("/openapi.json")
@@ -918,8 +1099,7 @@ async fn auth_mode_healthz_still_has_no_security() {
 
 #[test]
 fn openapi_spec_is_up_to_date() {
-    let spec_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../openapi.json");
+    let spec_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../openapi.json");
 
     let generated = serde_json::to_string_pretty(&openapi_doc()).unwrap() + "\n";
 
@@ -942,4 +1122,313 @@ fn openapi_spec_is_up_to_date() {
         committed, generated,
         "openapi.json is out of date. Run: OMNIGRAPH_UPDATE_OPENAPI=1 cargo test -p omnigraph-server --test openapi openapi_spec_is_up_to_date"
     );
+}
+
+// ---------------------------------------------------------------------------
+// MR-668 — multi-mode OpenAPI cluster filter
+// ---------------------------------------------------------------------------
+//
+// In multi-graph mode, `/openapi.json` reports cluster routes
+// (`/graphs/{graph_id}/...`) instead of the legacy flat routes. The
+// only flat path that survives is `/healthz`. Operation IDs gain a
+// `cluster_` prefix so SDK generators have stable, unique ids.
+//
+// These tests exercise the request-time `server_openapi` handler via
+// `oneshot`, not the static `ApiDoc::openapi()` — the rewrite happens
+// only on the served document.
+
+const EXPECTED_CLUSTER_PATHS: &[&str] = &[
+    "/graphs/{graph_id}/snapshot",
+    "/graphs/{graph_id}/read",
+    "/graphs/{graph_id}/export",
+    "/graphs/{graph_id}/change",
+    "/graphs/{graph_id}/schema",
+    "/graphs/{graph_id}/schema/apply",
+    "/graphs/{graph_id}/ingest",
+    "/graphs/{graph_id}/branches",
+    "/graphs/{graph_id}/branches/{branch}",
+    "/graphs/{graph_id}/branches/merge",
+    "/graphs/{graph_id}/commits",
+    "/graphs/{graph_id}/commits/{commit_id}",
+];
+
+async fn app_for_multi_mode(graph_ids: &[&str]) -> (Vec<tempfile::TempDir>, Router) {
+    use std::sync::Arc;
+
+    use omnigraph_server::{GraphHandle, GraphId, GraphKey};
+
+    let mut dirs = Vec::with_capacity(graph_ids.len());
+    let mut handles = Vec::with_capacity(graph_ids.len());
+    for id in graph_ids {
+        let dir = tempfile::tempdir().unwrap();
+        let graph_uri = dir.path().join(id).to_str().unwrap().to_string();
+        let schema = fs::read_to_string(fixture("test.pg")).unwrap();
+        let engine = Omnigraph::init(&graph_uri, &schema).await.unwrap();
+        handles.push(Arc::new(GraphHandle {
+            key: GraphKey::cluster(GraphId::try_from(*id).unwrap()),
+            uri: graph_uri,
+            engine: Arc::new(engine),
+            policy: None,
+            queries: None,
+        }));
+        dirs.push(dir);
+    }
+    let workload = omnigraph_server::workload::WorkloadController::from_env();
+    let state = AppState::new_multi(handles, Vec::new(), None, workload, None).unwrap();
+    let app = build_app(state);
+    (dirs, app)
+}
+
+#[tokio::test]
+async fn multi_mode_openapi_lists_cluster_paths() {
+    let (_dirs, app) = app_for_multi_mode(&["alpha"]).await;
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/openapi.json")
+        .body(Body::empty())
+        .unwrap();
+    let (status, json) = json_response(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let paths = json["paths"].as_object().expect("paths must be an object");
+    let path_keys: HashSet<&str> = paths.keys().map(|k| k.as_str()).collect();
+    for expected in EXPECTED_CLUSTER_PATHS {
+        assert!(
+            path_keys.contains(expected),
+            "missing cluster path in multi-mode spec: {expected}. \
+             Found: {path_keys:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn multi_mode_openapi_drops_flat_protected_paths() {
+    let (_dirs, app) = app_for_multi_mode(&["alpha"]).await;
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/openapi.json")
+        .body(Body::empty())
+        .unwrap();
+    let (_, json) = json_response(&app, request).await;
+    let paths = json["paths"].as_object().unwrap();
+    // None of the legacy flat protected paths should appear in multi mode.
+    let flat_protected = [
+        "/snapshot",
+        "/read",
+        "/export",
+        "/change",
+        "/schema",
+        "/schema/apply",
+        "/ingest",
+        "/branches",
+        "/branches/{branch}",
+        "/branches/merge",
+        "/commits",
+        "/commits/{commit_id}",
+    ];
+    for flat in flat_protected {
+        assert!(
+            !paths.contains_key(flat),
+            "flat path {flat} must not appear in multi-mode spec; \
+             cluster routes are the only protected surface"
+        );
+    }
+}
+
+#[tokio::test]
+async fn multi_mode_openapi_keeps_management_paths_flat() {
+    let (_dirs, app) = app_for_multi_mode(&["alpha"]).await;
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/openapi.json")
+        .body(Body::empty())
+        .unwrap();
+    let (_, json) = json_response(&app, request).await;
+    let paths = json["paths"].as_object().unwrap();
+    for flat in ["/healthz", "/graphs"] {
+        assert!(
+            paths.contains_key(flat),
+            "{flat} must remain flat in multi mode"
+        );
+        let nested = format!("/graphs/{{graph_id}}{flat}");
+        assert!(
+            !paths.contains_key(&nested),
+            "{flat} must NOT be cluster-prefixed to {nested}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn multi_mode_openapi_prefixes_operation_ids_with_cluster() {
+    let (_dirs, app) = app_for_multi_mode(&["alpha"]).await;
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/openapi.json")
+        .body(Body::empty())
+        .unwrap();
+    let (_, json) = json_response(&app, request).await;
+    // Every cluster path operation must have a `cluster_` operation_id.
+    // Flat-mounted paths (healthz, management /graphs) keep their
+    // original operation_ids — they're not per-graph.
+    let paths = json["paths"].as_object().unwrap();
+    let mut checked = 0;
+    for (path, item) in paths {
+        if path == "/healthz" || path == "/graphs" {
+            continue;
+        }
+        for method in ["get", "post", "put", "delete", "patch"] {
+            if let Some(op) = item.get(method).filter(|v| v.is_object()) {
+                if let Some(id) = op["operationId"].as_str() {
+                    assert!(
+                        id.starts_with("cluster_"),
+                        "operation_id at {path}.{method} must start with `cluster_`, got `{id}`"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        checked >= EXPECTED_CLUSTER_PATHS.len(),
+        "expected at least {} cluster operation_ids; checked {checked}",
+        EXPECTED_CLUSTER_PATHS.len()
+    );
+}
+
+#[tokio::test]
+async fn multi_mode_openapi_declares_graph_id_path_parameter() {
+    let (_dirs, app) = app_for_multi_mode(&["alpha"]).await;
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/openapi.json")
+        .body(Body::empty())
+        .unwrap();
+    let (_, json) = json_response(&app, request).await;
+    let paths = json["paths"].as_object().unwrap();
+
+    for expected_path in EXPECTED_CLUSTER_PATHS {
+        let item = paths
+            .get(*expected_path)
+            .unwrap_or_else(|| panic!("missing cluster path {expected_path}"));
+        for method in ["get", "post", "put", "delete", "patch"] {
+            let Some(operation) = item.get(method).filter(|value| value.is_object()) else {
+                continue;
+            };
+            let parameters = operation["parameters"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{expected_path}.{method} missing parameters"));
+            let graph_id = parameters
+                .iter()
+                .find(|param| param["name"] == "graph_id" && param["in"] == "path")
+                .unwrap_or_else(|| {
+                    panic!("{expected_path}.{method} missing graph_id path parameter")
+                });
+            assert_eq!(
+                graph_id["required"].as_bool(),
+                Some(true),
+                "{expected_path}.{method} graph_id parameter must be required"
+            );
+            assert_eq!(
+                graph_id["schema"]["type"].as_str(),
+                Some("string"),
+                "{expected_path}.{method} graph_id parameter must be string typed"
+            );
+        }
+    }
+
+    for flat in ["/healthz", "/graphs"] {
+        let item = paths.get(flat).unwrap();
+        for method in ["get", "post", "put", "delete", "patch"] {
+            if let Some(operation) = item.get(method).filter(|value| value.is_object()) {
+                let has_graph_id = operation["parameters"]
+                    .as_array()
+                    .map(|params| {
+                        params
+                            .iter()
+                            .any(|param| param["name"] == "graph_id" && param["in"] == "path")
+                    })
+                    .unwrap_or(false);
+                assert!(
+                    !has_graph_id,
+                    "{flat}.{method} must not declare graph_id; it remains flat"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn multi_mode_operation_ids_are_unique() {
+    // Sanity check: the cluster_ prefix prevents collision with flat ids
+    // (which don't appear in multi mode, but the contract is "unique
+    // across the spec"). Verify every operation_id in the multi-mode
+    // spec is unique.
+    let (_dirs, app) = app_for_multi_mode(&["alpha"]).await;
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/openapi.json")
+        .body(Body::empty())
+        .unwrap();
+    let (_, json) = json_response(&app, request).await;
+    let paths = json["paths"].as_object().unwrap();
+    let mut seen_ids: HashSet<String> = HashSet::new();
+    for (_, item) in paths {
+        for method in ["get", "post", "put", "delete", "patch"] {
+            if let Some(op) = item.get(method).filter(|v| v.is_object()) {
+                if let Some(id) = op["operationId"].as_str() {
+                    assert!(
+                        seen_ids.insert(id.to_string()),
+                        "duplicate operation_id `{id}` in multi-mode spec"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn served_spec_always_nests_under_cluster_prefix() {
+    // RFC-011 cluster-only: even a one-graph convenience app serves the
+    // nested cluster surface and never the flat protected routes.
+    let (_temp, app) = app_for_loaded_graph().await;
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/openapi.json")
+        .body(Body::empty())
+        .unwrap();
+    let (_, json) = json_response(&app, request).await;
+    let paths = json["paths"].as_object().unwrap();
+    let path_keys: HashSet<&str> = paths.keys().map(|k| k.as_str()).collect();
+    for cluster in EXPECTED_CLUSTER_PATHS {
+        assert!(
+            path_keys.contains(cluster),
+            "served spec must emit cluster path: {cluster}. Found: {path_keys:?}"
+        );
+    }
+    // The flat protected routes must NOT appear — only the nested
+    // cluster surface plus the always-flat `/healthz` and `/graphs`.
+    let flat_protected = [
+        "/snapshot",
+        "/read",
+        "/query",
+        "/export",
+        "/change",
+        "/mutate",
+        "/queries",
+        "/queries/{name}",
+        "/schema",
+        "/schema/apply",
+        "/load",
+        "/ingest",
+        "/branches",
+        "/branches/{branch}",
+        "/branches/merge",
+        "/commits",
+        "/commits/{commit_id}",
+    ];
+    for flat in flat_protected {
+        assert!(
+            !path_keys.contains(flat),
+            "served spec must NOT emit flat protected path: {flat}"
+        );
+    }
 }

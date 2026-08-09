@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use std::io::{BufRead, BufReader, Cursor};
 use std::sync::Arc;
@@ -26,6 +26,14 @@ use crate::exec::staging::{MutationStaging, PendingMode};
 /// Result of a load operation.
 #[derive(Debug, Clone, Default)]
 pub struct LoadResult {
+    /// Branch the load landed on (`"main"` when no branch was given).
+    pub branch: String,
+    /// Base branch a fork was requested from (the `base` parameter of
+    /// `load_as`), recorded verbatim even when the target branch already
+    /// existed and no fork happened.
+    pub base_branch: Option<String>,
+    /// True when this load created `branch` by forking it from `base_branch`.
+    pub branch_created: bool,
     pub nodes_loaded: HashMap<String, usize>,
     pub edges_loaded: HashMap<String, usize>,
 }
@@ -57,60 +65,87 @@ pub enum LoadMode {
     Merge,
 }
 
-/// Load JSONL data into an Omnigraph database.
-pub async fn load_jsonl(db: &mut Omnigraph, data: &str, mode: LoadMode) -> Result<LoadResult> {
-    let current_branch = db.active_branch().map(str::to_string);
+/// Convenience: load JSONL data onto the database handle's *active branch*
+/// (`main` when unbound). Equivalent to `db.load(active_branch, data, mode)`;
+/// use `Omnigraph::load`/`load_as` directly when targeting an explicit branch
+/// or when fork-from-base semantics are needed.
+pub async fn load_jsonl(db: &Omnigraph, data: &str, mode: LoadMode) -> Result<LoadResult> {
+    let current_branch = db.active_branch().await;
     let branch = current_branch.as_deref().unwrap_or("main");
     db.load(branch, data, mode).await
 }
 
-/// Load JSONL data from a file path.
-pub async fn load_jsonl_file(db: &mut Omnigraph, path: &str, mode: LoadMode) -> Result<LoadResult> {
-    let current_branch = db.active_branch().map(str::to_string);
+/// Convenience: like [`load_jsonl`] but reading from a file path.
+pub async fn load_jsonl_file(db: &Omnigraph, path: &str, mode: LoadMode) -> Result<LoadResult> {
+    let current_branch = db.active_branch().await;
     let branch = current_branch.as_deref().unwrap_or("main");
     db.load_file(branch, path, mode).await
 }
 
 impl Omnigraph {
+    #[deprecated(
+        note = "use `load_as` with an explicit `base` instead; the ingest family will be removed in a future release"
+    )]
     pub async fn ingest(
-        &mut self,
+        &self,
         branch: &str,
         from: Option<&str>,
         data: &str,
         mode: LoadMode,
     ) -> Result<IngestResult> {
+        #[allow(deprecated)]
         self.ingest_as(branch, from, data, mode, None).await
     }
 
+    /// Deprecated shim over the unified `load_as`. Preserves the historical
+    /// ingest contract exactly: `from: None` means fork from `main`, and the
+    /// base branch is recorded in the result even when the target branch
+    /// already existed (no fork happened).
+    #[deprecated(
+        note = "use `load_as` with an explicit `base` instead; the ingest family will be removed in a future release"
+    )]
     pub async fn ingest_as(
-        &mut self,
+        &self,
         branch: &str,
         from: Option<&str>,
         data: &str,
         mode: LoadMode,
         actor_id: Option<&str>,
     ) -> Result<IngestResult> {
-        let previous_actor = self.audit_actor_id.clone();
-        self.audit_actor_id = actor_id.map(str::to_string);
         let result = self
-            .ingest_with_current_actor(branch, from, data, mode)
-            .await;
-        self.audit_actor_id = previous_actor;
-        result
+            .load_as(branch, Some(from.unwrap_or("main")), data, mode, actor_id)
+            .await?;
+        Ok(IngestResult {
+            branch: result.branch.clone(),
+            base_branch: result
+                .base_branch
+                .clone()
+                .unwrap_or_else(|| "main".to_string()),
+            branch_created: result.branch_created,
+            mode,
+            tables: result.to_ingest_tables(),
+        })
     }
 
+    #[deprecated(
+        note = "use `load_file_as` with an explicit `base` instead; the ingest family will be removed in a future release"
+    )]
     pub async fn ingest_file(
-        &mut self,
+        &self,
         branch: &str,
         from: Option<&str>,
         path: &str,
         mode: LoadMode,
     ) -> Result<IngestResult> {
+        #[allow(deprecated)]
         self.ingest_file_as(branch, from, path, mode, None).await
     }
 
+    #[deprecated(
+        note = "use `load_file_as` with an explicit `base` instead; the ingest family will be removed in a future release"
+    )]
     pub async fn ingest_file_as(
-        &mut self,
+        &self,
         branch: &str,
         from: Option<&str>,
         path: &str,
@@ -118,43 +153,51 @@ impl Omnigraph {
         actor_id: Option<&str>,
     ) -> Result<IngestResult> {
         let data = std::fs::read_to_string(path).map_err(OmniError::Io)?;
+        #[allow(deprecated)]
         self.ingest_as(branch, from, &data, mode, actor_id).await
     }
 
-    async fn ingest_with_current_actor(
-        &mut self,
-        branch: &str,
-        from: Option<&str>,
-        data: &str,
-        mode: LoadMode,
-    ) -> Result<IngestResult> {
-        self.ensure_schema_state_valid().await?;
-        let target_branch =
-            Self::normalize_branch_name(branch)?.unwrap_or_else(|| "main".to_string());
-        let base_branch = Self::normalize_branch_name(from.unwrap_or("main"))?
-            .unwrap_or_else(|| "main".to_string());
-        let branch_created = !self
-            .branch_list()
-            .await?
-            .iter()
-            .any(|name| name == &target_branch);
-        if branch_created {
-            self.branch_create_from(crate::db::ReadTarget::branch(&base_branch), &target_branch)
-                .await?;
-        }
-
-        let result = self.load(&target_branch, data, mode).await?;
-        Ok(IngestResult {
-            branch: target_branch,
-            base_branch,
-            branch_created,
-            mode,
-            tables: result.to_ingest_tables(),
-        })
+    pub async fn load(&self, branch: &str, data: &str, mode: LoadMode) -> Result<LoadResult> {
+        self.load_as(branch, None, data, mode, None).await
     }
 
-    pub async fn load(&mut self, branch: &str, data: &str, mode: LoadMode) -> Result<LoadResult> {
-        self.ensure_schema_state_valid().await?;
+    /// Load JSONL data onto `branch`.
+    ///
+    /// `base` selects the branch-creation behavior: with `Some(base)`, a
+    /// missing target branch is forked from `base` first (the former
+    /// `ingest` semantics); with `None`, the target branch must already
+    /// exist — staging fails on an unknown branch when it resolves the
+    /// manifest snapshot, so a typo'd branch name can never create one.
+    pub async fn load_as(
+        &self,
+        branch: &str,
+        base: Option<&str>,
+        data: &str,
+        mode: LoadMode,
+        actor_id: Option<&str>,
+    ) -> Result<LoadResult> {
+        // Engine-layer policy gate (MR-722 fan-out / PR #3). Scope is
+        // `Branch(branch)` to match the HTTP-layer Change convention.
+        // When a fork happens below, `branch_create_from_as` additionally
+        // checks `BranchCreate` — both authorities are genuinely needed
+        // for "load into a fresh branch", so the layered check is
+        // correct, not redundant.
+        self.enforce(
+            omnigraph_policy::PolicyAction::Change,
+            &omnigraph_policy::ResourceScope::Branch(branch.to_string()),
+            actor_id,
+        )?;
+        // Schema-contract validation is captured ONCE per write via the
+        // `WriteTxn` opened in `load_jsonl_reader` (after branch resolution).
+        // The redundant `ensure_schema_state_valid` that used to run here is
+        // subsumed by `open_write_txn`'s `resolved_branch_target` call.
+        // Converge any pending recovery sidecar (a previously failed
+        // writer's Phase B → Phase C residual) before staging anything:
+        // without this, sidecar-covered drift wedges every load on the
+        // commit-time drift guard until a process restart — `repair`
+        // refuses while a sidecar is pending. One `list_dir` when no
+        // sidecars exist (the steady state).
+        self.heal_pending_recovery_sidecars().await?;
         // Reject internal `__run__*` / system-prefixed branches at the
         // public write boundary. Direct-publish paths assert this
         // explicitly so a caller can't write to legacy or system
@@ -166,31 +209,73 @@ impl Omnigraph {
         // `commit_prepared_updates_on_branch_with_expected`) and leave
         // `self.coordinator` with a stale manifest snapshot.
         let requested = Self::normalize_branch_name(branch)?;
+        let base_branch = match base {
+            Some(base) => {
+                Some(Self::normalize_branch_name(base)?.unwrap_or_else(|| "main".to_string()))
+            }
+            None => None,
+        };
+        // Fork-if-missing only when a base branch was explicitly given.
+        // `requested == None` is `main`, which always exists.
+        let mut branch_created = false;
+        if let (Some(target), Some(base_name)) = (requested.as_deref(), base_branch.as_deref()) {
+            let exists = self.branch_list().await?.iter().any(|name| name == target);
+            if !exists {
+                // Thread the actor through to the implicit BranchCreate so
+                // policy decisions match what an explicit `branch_create_from_as`
+                // call would see. Calling the no-actor variant here would
+                // bypass BranchCreate enforcement when policy is installed —
+                // the footgun guard catches that case too, but threading is
+                // the correct fix.
+                self.branch_create_from_as(
+                    crate::db::ReadTarget::branch(base_name),
+                    target,
+                    actor_id,
+                )
+                .await?;
+                branch_created = true;
+            }
+        }
         // Direct-to-target writes: no Run state machine, no `__run__` staging
         // branch. Cross-table OCC is enforced by the publisher's
         // `expected_table_versions` CAS inside `load_jsonl_reader`.
-        self.load_direct_on_branch(requested.as_deref(), data, mode)
-            .await
+        let mut result = self
+            .load_direct_on_branch(requested.as_deref(), data, mode, actor_id)
+            .await?;
+        result.branch = requested.unwrap_or_else(|| "main".to_string());
+        result.base_branch = base_branch;
+        result.branch_created = branch_created;
+        Ok(result)
     }
 
-    pub async fn load_file(
-        &mut self,
+    pub async fn load_file(&self, branch: &str, path: &str, mode: LoadMode) -> Result<LoadResult> {
+        self.load_file_as(branch, None, path, mode, None).await
+    }
+
+    /// Read a file into memory and delegate to `load_as`. Used by the
+    /// CLI's `omnigraph load` so file-path-based writes flow through
+    /// the same engine-layer policy gate as in-memory `load_as` calls.
+    pub async fn load_file_as(
+        &self,
         branch: &str,
+        base: Option<&str>,
         path: &str,
         mode: LoadMode,
+        actor_id: Option<&str>,
     ) -> Result<LoadResult> {
-        let data = std::fs::read_to_string(path).map_err(|e| OmniError::Io(e))?;
-        self.load(branch, &data, mode).await
+        let data = std::fs::read_to_string(path).map_err(OmniError::Io)?;
+        self.load_as(branch, base, &data, mode, actor_id).await
     }
 
     async fn load_direct_on_branch(
-        &mut self,
+        &self,
         branch: Option<&str>,
         data: &str,
         mode: LoadMode,
+        actor_id: Option<&str>,
     ) -> Result<LoadResult> {
         let reader = BufReader::new(Cursor::new(data.as_bytes()));
-        load_jsonl_reader(self, branch, reader, mode).await
+        load_jsonl_reader(self, branch, reader, mode, actor_id).await
     }
 }
 
@@ -228,10 +313,11 @@ impl LoadResult {
 }
 
 async fn load_jsonl_reader<R: BufRead>(
-    db: &mut Omnigraph,
+    db: &Omnigraph,
     branch: Option<&str>,
     reader: R,
     mode: LoadMode,
+    actor_id: Option<&str>,
 ) -> Result<LoadResult> {
     let catalog = db.catalog().clone();
 
@@ -239,22 +325,24 @@ async fn load_jsonl_reader<R: BufRead>(
     let mut node_rows: HashMap<String, Vec<JsonValue>> = HashMap::new();
     let mut edge_rows: HashMap<String, Vec<(String, String, JsonValue)>> = HashMap::new();
 
-    for (line_num, line) in reader.lines().enumerate() {
-        let line = line?;
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let value: JsonValue = serde_json::from_str(line).map_err(|e| {
-            OmniError::manifest(format!("invalid JSON on line {}: {}", line_num + 1, e))
+    // Parse a stream of JSON values. Accepts both compact JSONL (one object
+    // per line) and pretty-printed JSON where a single object spans multiple
+    // lines — serde's streaming deserializer treats any whitespace (including
+    // newlines) between top-level values as a separator.
+    for (idx, parsed) in serde_json::Deserializer::from_reader(reader)
+        .into_iter::<JsonValue>()
+        .enumerate()
+    {
+        let record_num = idx + 1;
+        let value: JsonValue = parsed.map_err(|e| {
+            OmniError::manifest(format!("invalid JSON at record {}: {}", record_num, e))
         })?;
 
         if let Some(type_name) = value.get("type").and_then(|v| v.as_str()) {
             if !catalog.node_types.contains_key(type_name) {
                 return Err(OmniError::manifest(format!(
-                    "line {}: unknown node type '{}'",
-                    line_num + 1,
-                    type_name
+                    "record {}: unknown node type '{}'",
+                    record_num, type_name
                 )));
             }
             let data = value
@@ -268,23 +356,22 @@ async fn load_jsonl_reader<R: BufRead>(
         } else if let Some(edge_name) = value.get("edge").and_then(|v| v.as_str()) {
             if catalog.lookup_edge_by_name(edge_name).is_none() {
                 return Err(OmniError::manifest(format!(
-                    "line {}: unknown edge type '{}'",
-                    line_num + 1,
-                    edge_name
+                    "record {}: unknown edge type '{}'",
+                    record_num, edge_name
                 )));
             }
             let from = value
                 .get("from")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| {
-                    OmniError::manifest(format!("line {}: edge missing 'from'", line_num + 1))
+                    OmniError::manifest(format!("record {}: edge missing 'from'", record_num))
                 })?
                 .to_string();
             let to = value
                 .get("to")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| {
-                    OmniError::manifest(format!("line {}: edge missing 'to'", line_num + 1))
+                    OmniError::manifest(format!("record {}: edge missing 'to'", record_num))
                 })?
                 .to_string();
             let data = value
@@ -298,34 +385,88 @@ async fn load_jsonl_reader<R: BufRead>(
                 .push((from, to, data));
         } else {
             return Err(OmniError::manifest(format!(
-                "line {}: expected 'type' or 'edge' field",
-                line_num + 1
+                "record {}: expected 'type' or 'edge' field",
+                record_num
             )));
         }
     }
 
     // Phase 2: Build per-type RecordBatches and accumulate into the
-    // staging pipeline. For Append/Merge, batches go into an in-memory
-    // accumulator and a single `stage_*` + `commit_staged` per touched
-    // table runs at end-of-load — a mid-load failure (RI / cardinality
-    // violation) leaves Lance HEAD untouched. For Overwrite, the legacy
-    // inline-commit path is preserved (truncate+append doesn't fit the
-    // staged shape cleanly, and overwrite has no in-flight read-your-writes
-    // requirement).
+    // staging pipeline. Batches go into an in-memory accumulator and a
+    // single `stage_*` + `commit_staged` per touched table runs at
+    // end-of-load — a mid-load failure (RI / cardinality violation) leaves
+    // Lance HEAD untouched. `LoadMode::Overwrite` uses Lance's staged
+    // `Overwrite` transaction rather than the former truncate-then-append
+    // inline path.
 
     let mut result = LoadResult::default();
-    let snapshot = db.snapshot_for_branch(branch).await?;
-    let use_staging = !matches!(mode, LoadMode::Overwrite);
+    // Capture-once write transaction (RFC-013 step 3b). `open_write_txn`
+    // validates the schema contract ONCE and pins the base snapshot. Threaded
+    // as `Some(&txn)` through the per-table opens and the manifest publish so
+    // each resolve point reuses the pinned base instead of re-validating the
+    // contract. The branch already exists here (fork-if-missing ran in
+    // `load_as` before this), so this captures the post-fork snapshot. The
+    // load's own base read (`db.snapshot_for_branch` previously) is the same
+    // per-branch snapshot, so reuse `txn.base` for it — dropping a validation.
+    let txn = db.open_write_txn(branch).await?;
+    let snapshot = txn.base.clone();
     let mut staging = MutationStaging::default();
-    let mut overwrite_updates: Vec<crate::db::SubTableUpdate> = Vec::new();
-    let mut overwrite_expected: HashMap<String, u64> = HashMap::new();
     let pending_mode = match mode {
         LoadMode::Merge => PendingMode::Merge,
         // Append-mode loads accumulate as Append. Edge tables (no @key)
         // and no-key node tables stay safe on the stage_append path. The
         // Merge mode applies dedupe-by-id; Append assumes unique inputs.
         LoadMode::Append => PendingMode::Append,
-        LoadMode::Overwrite => PendingMode::Append, // unused
+        LoadMode::Overwrite => PendingMode::Overwrite,
+    };
+    // Map LoadMode to MutationOpKind for the version-check policy.
+    // Append/Merge skip the strict pre-stage check (concurrency-safe
+    // under the per-(table, branch) queue + publisher CAS); Overwrite
+    // uses the strict check because it truncates and replaces the
+    // dataset — concurrent advances change what "replace" means.
+    let load_op_kind = match mode {
+        LoadMode::Append => crate::db::MutationOpKind::Insert,
+        LoadMode::Merge => crate::db::MutationOpKind::Merge,
+        LoadMode::Overwrite => crate::db::MutationOpKind::SchemaRewrite,
+    };
+
+    // Up-front fork-queue acquisition. The first write to a table on a
+    // non-main branch forks it (create_branch), which advances Lance state
+    // before the manifest publish; the reclaim of any manifest-unreferenced
+    // leftover (`reclaim_orphaned_fork_and_refork`) must not race a concurrent
+    // in-process fork. So when this load will fork at least one touched table,
+    // acquire the per-(table, branch) write queues for ALL touched tables up
+    // front (one sorted `acquire_many`, keyed uniformly by the target branch
+    // so it covers what `commit_all` recomputes) and hold them through the
+    // publish. Main-branch loads never fork; branch loads where every touched
+    // table is already forked skip this and let `commit_all` acquire at commit.
+    let fork_queue_guards: Option<(
+        Vec<(String, Option<String>)>,
+        Vec<tokio::sync::OwnedMutexGuard<()>>,
+    )> = if let Some(active) = branch {
+        let touched: Vec<(String, Option<String>)> = node_rows
+            .keys()
+            .map(|t| (format!("node:{t}"), Some(active.to_string())))
+            .chain(
+                edge_rows
+                    .keys()
+                    .map(|e| (format!("edge:{e}"), Some(active.to_string()))),
+            )
+            .collect();
+        let needs_fork = touched.iter().any(|(table_key, _)| {
+            snapshot
+                .entry(table_key)
+                .map(|e| e.table_branch.as_deref() != Some(active))
+                .unwrap_or(false)
+        });
+        if needs_fork {
+            let guards = db.write_queue().acquire_many(&touched).await;
+            Some((touched, guards))
+        } else {
+            None
+        }
+    } else {
+        None
     };
 
     // Phase 2a: build and validate every node batch up front. Cheap and
@@ -335,247 +476,156 @@ async fn load_jsonl_reader<R: BufRead>(
     for (type_name, rows) in &node_rows {
         let node_type = &catalog.node_types[type_name];
         let batch = build_node_batch(node_type, rows)?;
-        validate_value_constraints(&batch, node_type)?;
-        validate_enum_constraints(&batch, &node_type.properties, type_name)?;
-        let unique_props = unique_property_names_for_node(node_type);
-        if !unique_props.is_empty() {
-            enforce_unique_constraints_intra_batch(&batch, type_name, &unique_props)?;
-        }
+        // Validation (value/enum/unique) runs end-of-load via the evaluator.
         let loaded_count = batch.num_rows();
         let table_key = format!("node:{}", type_name);
-        let entry = snapshot
+        let _entry = snapshot
             .entry(&table_key)
             .ok_or_else(|| OmniError::manifest(format!("no manifest entry for {}", table_key)))?;
-        if !use_staging {
-            overwrite_expected.insert(table_key.clone(), entry.table_version);
-        }
         prepared_nodes.push((type_name.clone(), table_key, batch, loaded_count));
     }
 
-    // Phase 2b: write every node type. Append/Merge → in-memory
-    // accumulator. Overwrite → concurrent inline-commit (legacy path).
-    if use_staging {
-        for (type_name, table_key, batch, loaded_count) in prepared_nodes {
-            let (ds, full_path, table_branch) = db
-                .open_for_mutation_on_branch(branch, &table_key)
-                .await?;
-            let expected_version = ds.version().version;
-            staging.ensure_path(
-                &table_key,
-                full_path,
-                table_branch,
-                expected_version,
-            );
-            let schema = batch.schema();
-            staging.append_batch(&table_key, schema, pending_mode, batch)?;
-            result.nodes_loaded.insert(type_name, loaded_count);
-        }
-    } else {
-        let node_write_results =
-            write_batches_concurrently(db, branch, mode, prepared_nodes).await?;
-        for (type_name, table_key, loaded_count, state, table_branch) in node_write_results {
-            overwrite_updates.push(crate::db::SubTableUpdate {
-                table_key,
-                table_version: state.version,
-                table_branch,
-                row_count: state.row_count,
-                version_metadata: state.version_metadata,
-            });
-            result.nodes_loaded.insert(type_name, loaded_count);
-        }
+    // Phase 2b: accumulate every node type in memory. Fragment writes are
+    // delayed until after all validation succeeds.
+    for (type_name, table_key, batch, loaded_count) in prepared_nodes {
+        // The loader only needs the captured expected version (the publisher's
+        // CAS fence) for `ensure_path` — it discards the handle. With a
+        // non-strict load op (Merge/Append) and a `WriteTxn`, collapse #1 skips
+        // the dataset open and returns the pinned base version directly.
+        let opened = db
+            .open_for_mutation_on_branch(branch, &table_key, load_op_kind, Some(&txn))
+            .await?;
+        staging.ensure_path(
+            &table_key,
+            opened.full_path,
+            opened.table_branch,
+            opened.expected_version,
+            load_op_kind,
+        );
+        let schema = batch.schema();
+        staging.append_batch(&table_key, schema, pending_mode, batch)?;
+        result.nodes_loaded.insert(type_name, loaded_count);
     }
 
-    // Phase 2c: Validate edge referential integrity — every src/dst must
-    // reference an existing node ID in the appropriate type. For staged
-    // loads, the lookup unions snapshot-committed IDs with the in-memory
-    // pending batches (which carry the just-staged node inserts).
-    for (edge_name, rows) in &edge_rows {
-        let edge_type = &catalog.edge_types[edge_name];
-        let from_ids = if use_staging {
-            collect_node_ids_with_pending(
-                db,
-                branch,
-                &edge_type.from_type,
-                &staging,
-            )
-            .await?
-        } else {
-            collect_node_ids(
-                db,
-                branch,
-                &edge_type.from_type,
-                &node_rows,
-                &catalog,
-                &overwrite_updates,
-            )
-            .await?
-        };
-        let to_ids = if use_staging {
-            collect_node_ids_with_pending(
-                db,
-                branch,
-                &edge_type.to_type,
-                &staging,
-            )
-            .await?
-        } else {
-            collect_node_ids(
-                db,
-                branch,
-                &edge_type.to_type,
-                &node_rows,
-                &catalog,
-                &overwrite_updates,
-            )
-            .await?
-        };
-
-        for (i, (src, dst, _)) in rows.iter().enumerate() {
-            if !from_ids.contains(src.as_str()) {
-                return Err(OmniError::manifest(format!(
-                    "edge {} row {}: src '{}' not found in {}",
-                    edge_name,
-                    i + 1,
-                    src,
-                    edge_type.from_type
-                )));
-            }
-            if !to_ids.contains(dst.as_str()) {
-                return Err(OmniError::manifest(format!(
-                    "edge {} row {}: dst '{}' not found in {}",
-                    edge_name,
-                    i + 1,
-                    dst,
-                    edge_type.to_type
-                )));
-            }
-        }
-    }
-
-    // Phase 2d: build edge batches.
+    // Phase 2d: build edge batches. Edge referential integrity (and the rest)
+    // runs end-of-load via the unified evaluator, below.
     let mut prepared_edges: Vec<(String, String, RecordBatch, usize)> =
         Vec::with_capacity(edge_rows.len());
     for (edge_name, rows) in &edge_rows {
         let edge_type = &catalog.edge_types[edge_name];
         let batch = build_edge_batch(edge_type, rows)?;
-        validate_enum_constraints(&batch, &edge_type.properties, edge_name)?;
-        let unique_props = unique_property_names_for_edge(edge_type);
-        if !unique_props.is_empty() {
-            enforce_unique_constraints_intra_batch(&batch, edge_name, &unique_props)?;
-        }
+        // Validation (enum/unique, edge-RI, @card) runs end-of-load via the evaluator.
         let loaded_count = batch.num_rows();
         let table_key = format!("edge:{}", edge_name);
-        let entry = snapshot
+        let _entry = snapshot
             .entry(&table_key)
             .ok_or_else(|| OmniError::manifest(format!("no manifest entry for {}", table_key)))?;
-        if !use_staging {
-            overwrite_expected.insert(table_key.clone(), entry.table_version);
-        }
         prepared_edges.push((edge_name.clone(), table_key, batch, loaded_count));
     }
 
-    // Phase 2e: write every edge type. Same dispatch as Phase 2b.
-    if use_staging {
-        for (edge_name, table_key, batch, loaded_count) in prepared_edges {
-            let (ds, full_path, table_branch) = db
-                .open_for_mutation_on_branch(branch, &table_key)
-                .await?;
-            let expected_version = ds.version().version;
-            staging.ensure_path(
-                &table_key,
-                full_path,
-                table_branch,
-                expected_version,
-            );
-            let schema = batch.schema();
-            staging.append_batch(&table_key, schema, pending_mode, batch)?;
-            result.edges_loaded.insert(edge_name, loaded_count);
-        }
-    } else {
-        let edge_write_results =
-            write_batches_concurrently(db, branch, mode, prepared_edges).await?;
-        for (edge_name, table_key, loaded_count, state, table_branch) in edge_write_results {
-            overwrite_updates.push(crate::db::SubTableUpdate {
-                table_key,
-                table_version: state.version,
-                table_branch,
-                row_count: state.row_count,
-                version_metadata: state.version_metadata,
-            });
-            result.edges_loaded.insert(edge_name, loaded_count);
-        }
+    // Phase 2e: accumulate every edge type. Same dispatch as Phase 2b.
+    for (edge_name, table_key, batch, loaded_count) in prepared_edges {
+        // Same as the node phase: only the captured expected version is used;
+        // collapse #1 skips the open for a non-strict load op under a `WriteTxn`.
+        let opened = db
+            .open_for_mutation_on_branch(branch, &table_key, load_op_kind, Some(&txn))
+            .await?;
+        staging.ensure_path(
+            &table_key,
+            opened.full_path,
+            opened.table_branch,
+            opened.expected_version,
+            load_op_kind,
+        );
+        let schema = batch.schema();
+        staging.append_batch(&table_key, schema, pending_mode, batch)?;
+        result.edges_loaded.insert(edge_name, loaded_count);
     }
 
-    // Phase 3: Validate edge cardinality constraints (before commit —
-    // invalid data must not be committed). Staged path scans committed
-    // edges via Lance + iterates pending edges in-memory. Overwrite path
-    // opens the just-written version (legacy behavior).
-    for (edge_name, _) in &edge_rows {
-        let edge_type = &catalog.edge_types[edge_name];
-        let table_key = format!("edge:{}", edge_name);
-        if use_staging {
-            validate_edge_cardinality_with_pending_loader(
-                db,
-                branch,
-                edge_type,
+    // Phase 3: end-of-load validation — one unified evaluator pass over the
+    // accumulated staging (value/enum, uniqueness incl. cross-version, edge-RI,
+    // cardinality) against the pinned pre-load base. `Overwrite` validates each
+    // touched table as its whole new image (that table's committed view empty),
+    // but is PER-TABLE — a table absent from the batch keeps `base`, so an
+    // edges-only overwrite still resolves RI against committed nodes;
+    // `Append`/`Merge` keep `base` everywhere. This shares the evaluator with the
+    // mutation + merge paths, so the surfaces cannot drift.
+    let mut changeset = staging.to_changeset();
+    // Overwrite replaces each touched table; a committed row absent from the new
+    // batch is REMOVED but is not in `to_changeset` (which only records the new
+    // batch). Express those removals as `deleted_ids` so edge-RI (path-b) and
+    // cardinality recompute against them — e.g. overwriting `node:Person` to drop
+    // Bob while a retained `edge:Knows(Alice->Bob)` would otherwise publish an
+    // orphan. (Per-table, like the rest of Overwrite handling.)
+    if mode == LoadMode::Overwrite {
+        let keys: Vec<String> = changeset.keys().cloned().collect();
+        for table_key in keys {
+            let removed = crate::validate::overwrite_removed_ids(
+                &snapshot,
                 &table_key,
-                &staging,
-                mode,
+                changeset.get(&table_key).expect("key from this changeset"),
             )
             .await?;
-        } else if let Some(update) = overwrite_updates.iter().find(|u| u.table_key == table_key) {
-            validate_edge_cardinality(
-                db,
-                branch,
-                edge_name,
-                update.table_version,
-                update.table_branch.as_deref(),
-            )
-            .await?;
-        }
-    }
-
-    // Phase 4: Atomic manifest commit with publisher-level OCC.
-    if use_staging {
-        let (updates, expected_versions, sidecar_handle) = staging
-            .finalize(db, branch, crate::db::manifest::SidecarKind::Load)
-            .await?;
-        // Same finalize → publisher residual as mutations: per-table
-        // staged commits have advanced Lance HEAD, but the manifest
-        // publish has not run yet. Reuse the mutation failpoint name so
-        // one failpoint pins the shared `MutationStaging` boundary.
-        crate::failpoints::maybe_fail("mutation.post_finalize_pre_publisher")?;
-        db.commit_updates_on_branch_with_expected(branch, &updates, &expected_versions)
-            .await?;
-        // The recovery sidecar protects the per-table commit_staged →
-        // manifest publish window. Phase C succeeded — clean up
-        // best-effort: failing the user here would error out a write
-        // that already landed durably.
-        if let Some(handle) = sidecar_handle {
-            if let Err(err) =
-                crate::db::manifest::delete_sidecar(&handle, db.storage_adapter()).await
-            {
-                tracing::warn!(
-                    error = %err,
-                    operation_id = handle.operation_id.as_str(),
-                    "recovery sidecar cleanup failed; the next open's recovery sweep will resolve it"
-                );
+            if !removed.is_empty() {
+                changeset
+                    .get_mut(&table_key)
+                    .expect("key from this changeset")
+                    .deleted_ids = removed;
             }
         }
-    } else {
-        // LoadMode::Overwrite keeps the legacy inline-commit path —
-        // truncate-then-append doesn't fit the staged shape (see
-        // `docs/runs.md` "LoadMode::Overwrite residual"). The recovery
-        // sidecar is not applicable here because the writer doesn't go
-        // through MutationStaging; per-table inline commits + a final
-        // manifest publish handle their own residual via the documented
-        // operator workflow (re-run overwrite to recover).
-        db.commit_updates_on_branch_with_expected(
+    }
+    let committed = crate::validate::CommittedState::load(&snapshot, mode, &changeset);
+    crate::validate::validate_changeset(&changeset, &committed, &catalog).await?;
+
+    // Phase 4: Atomic manifest commit with publisher-level OCC.
+    let staged = staging
+        .stage_all_with_concurrency(db, branch, load_write_concurrency())
+        .await?;
+    // `_queue_guards` holds per-(table_key, branch) write queues
+    // across the manifest publish below — see exec/mutation.rs for
+    // the rationale (interleaving prevention).
+    let crate::exec::staging::CommittedMutation {
+        updates,
+        expected_versions,
+        sidecar_handle,
+        guards: _queue_guards,
+        committed_handles,
+    } = staged
+        .commit_all(
+            db,
             branch,
-            &overwrite_updates,
-            &overwrite_expected,
+            crate::db::manifest::SidecarKind::Load,
+            actor_id,
+            fork_queue_guards,
+            Some(&txn),
         )
         .await?;
+    // Same finalize → publisher residual as mutations: per-table
+    // staged commits have advanced Lance HEAD, but the manifest
+    // publish has not run yet. Reuse the mutation failpoint name so
+    // one failpoint pins the shared `MutationStaging` boundary.
+    crate::failpoints::maybe_fail(crate::failpoints::names::MUTATION_POST_FINALIZE_PRE_PUBLISHER)?;
+    db.commit_updates_on_branch_with_expected(
+        branch,
+        &updates,
+        &expected_versions,
+        actor_id,
+        Some(&txn),
+        committed_handles,
+    )
+    .await?;
+    // The recovery sidecar protects the per-table commit_staged →
+    // manifest publish window. Phase C succeeded — clean up
+    // best-effort: failing the user here would error out a write
+    // that already landed durably.
+    if let Some(handle) = sidecar_handle {
+        if let Err(err) = crate::db::manifest::delete_sidecar(&handle, db.storage_adapter()).await {
+            tracing::warn!(
+                error = %err,
+                operation_id = handle.operation_id.as_str(),
+                "recovery sidecar cleanup failed; the next open's recovery sweep will resolve it"
+            );
+        }
     }
 
     Ok(result)
@@ -857,9 +907,18 @@ fn build_column_from_json(
                         )));
                     }
                     for val in arr {
-                        builder
-                            .values()
-                            .append_value(val.as_f64().unwrap_or(0.0) as f32);
+                        // Parity with the mutation path: non-numeric elements
+                        // (null — what json! emits for a non-finite float —
+                        // strings, bools) are rejected loudly, never coerced
+                        // to 0.0, which would silently corrupt the vector's
+                        // direction while passing every dimension check.
+                        let Some(v) = val.as_f64() else {
+                            return Err(OmniError::manifest(format!(
+                                "vector property '{}' elements must be numeric, got {}",
+                                name, val
+                            )));
+                        };
+                        builder.values().append_value(v as f32);
                     }
                     builder.append(true);
                 } else if nullable {
@@ -1105,83 +1164,6 @@ fn load_write_concurrency() -> usize {
         .unwrap_or(DEFAULT_LOAD_WRITE_CONCURRENCY)
 }
 
-/// Write a set of prepared `(type_name, table_key, batch, row_count)` tuples
-/// concurrently. Returns results in original iteration order so callers can
-/// zip them back to per-type metadata.
-async fn write_batches_concurrently(
-    db: &Omnigraph,
-    branch: Option<&str>,
-    mode: LoadMode,
-    prepared: Vec<(String, String, RecordBatch, usize)>,
-) -> Result<
-    Vec<(
-        String,
-        String,
-        usize,
-        crate::table_store::TableState,
-        Option<String>,
-    )>,
-> {
-    use futures::stream::StreamExt;
-
-    if prepared.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let concurrency = load_write_concurrency().min(prepared.len()).max(1);
-
-    futures::stream::iter(prepared.into_iter().map(
-        |(type_name, table_key, batch, loaded_count)| async move {
-            let (state, table_branch) =
-                write_batch_to_dataset(db, branch, &table_key, batch, mode).await?;
-            Ok::<_, OmniError>((type_name, table_key, loaded_count, state, table_branch))
-        },
-    ))
-    .buffered(concurrency)
-    .collect::<Vec<Result<_>>>()
-    .await
-    .into_iter()
-    .collect()
-}
-
-async fn write_batch_to_dataset(
-    db: &Omnigraph,
-    branch: Option<&str>,
-    table_key: &str,
-    batch: RecordBatch,
-    mode: LoadMode,
-) -> Result<(crate::table_store::TableState, Option<String>)> {
-    let (mut ds, full_path, table_branch) =
-        db.open_for_mutation_on_branch(branch, table_key).await?;
-    let table_store = db.table_store();
-
-    match mode {
-        LoadMode::Overwrite => {
-            let state = table_store
-                .overwrite_batch(&full_path, &mut ds, batch)
-                .await?;
-            Ok((state, table_branch))
-        }
-        LoadMode::Append => {
-            let state = table_store.append_batch(&full_path, &mut ds, batch).await?;
-            Ok((state, table_branch))
-        }
-        LoadMode::Merge => {
-            let state = table_store
-                .merge_insert_batch(
-                    &full_path,
-                    ds,
-                    batch,
-                    vec!["id".to_string()],
-                    lance::dataset::WhenMatched::UpdateAll,
-                    lance::dataset::WhenNotMatched::InsertAll,
-                )
-                .await?;
-            Ok((state, table_branch))
-        }
-    }
-}
-
 fn generate_id() -> String {
     ulid::Ulid::new().to_string()
 }
@@ -1367,112 +1349,106 @@ pub(crate) fn validate_enum_constraints(
     Ok(())
 }
 
-/// Detect duplicate values within a single `RecordBatch` for any of the named
-/// `unique_properties`. Returns an error on the first duplicate found.
+/// Build the composite uniqueness key for `row` over a constraint group's
+/// already-resolved columns (in declaration order).
 ///
-/// Note: this only catches duplicates *within* the batch. Cross-batch
-/// uniqueness against already-committed rows is not enforced here — that
-/// requires a dataset scan and is tracked separately.
-pub(crate) fn enforce_unique_constraints_intra_batch(
-    batch: &RecordBatch,
-    type_name: &str,
-    unique_properties: &[String],
-) -> Result<()> {
-    for property in unique_properties {
-        let Some(col_idx) = batch.schema().index_of(property).ok() else {
-            continue;
-        };
-        let arr = batch.column(col_idx);
-        let mut seen: HashMap<String, usize> = HashMap::new();
-        for row in 0..batch.num_rows() {
-            let Some(value) = scalar_to_string(arr, row) else {
-                continue;
-            };
-            if let Some(prev_row) = seen.insert(value.clone(), row) {
-                return Err(OmniError::manifest(format!(
-                    "@unique violation on {}.{}: value '{}' appears in rows {} and {}",
-                    type_name, property, value, prev_row, row
-                )));
-            }
+/// The key is the *tuple* of per-column scalar strings (`Vec<String>`), keyed
+/// directly in the dedup map — there is no separator, so no data value can
+/// forge a collision (an earlier version joined on `U+001F`, which a value
+/// containing that control char could still defeat).
+///
+/// - `Ok(None)` if any column is null: the row is exempt (a partial tuple
+///   can't violate uniqueness under SQL null semantics).
+/// - `Ok(Some(tuple))` otherwise.
+/// - `Err(..)` propagated from [`unique_key_scalar`] on an un-keyable value.
+///
+/// Shared by every write surface through the unified validation evaluator
+/// (`crate::validate::evaluate_unique`, used by the loader, mutation, and
+/// branch-merge paths) so they derive identical keys and cannot drift on
+/// separator or scalar conversion.
+pub(crate) fn composite_unique_key(
+    group_columns: &[ArrayRef],
+    row: usize,
+) -> Result<Option<Vec<String>>> {
+    let mut parts = Vec::with_capacity(group_columns.len());
+    for column in group_columns {
+        match unique_key_scalar(column, row)? {
+            Some(value) => parts.push(value),
+            None => return Ok(None),
         }
     }
-    Ok(())
+    Ok(Some(parts))
 }
 
-/// Reduce a single Arrow scalar at (`array`, `row`) to a `String` for
-/// uniqueness comparison. Returns `None` for null values (nulls are exempt
-/// from uniqueness in standard SQL semantics).
-fn scalar_to_string(array: &ArrayRef, row: usize) -> Option<String> {
-    use arrow_array::Array;
+/// Render a constraint's column tuple for error messages: a single item as
+/// `col`, a composite as `(a, b)`. Used for both the column list and the
+/// offending value tuple, which share the same shape.
+pub(crate) fn format_tuple(items: &[String]) -> String {
+    match items {
+        [single] => single.clone(),
+        _ => format!("({})", items.join(", ")),
+    }
+}
+
+/// Reduce a single Arrow scalar at (`array`, `row`) to its uniqueness-key
+/// string.
+///
+/// - `Ok(None)` for a null value: nulls are exempt from uniqueness (standard
+///   SQL semantics over nullable columns).
+/// - `Ok(Some(s))` for every scalar type a `@unique` / `@key` column can hold.
+///   Strings are covered in all three physical Arrow encodings (`Utf8`,
+///   `LargeUtf8`, `Utf8View`), so a legal string column is always keyable
+///   regardless of how Lance materializes it on read-back.
+/// - `Err(..)` for a non-null value whose Arrow type can't be reduced to a key
+///   (a list, blob, or vector column). This fails loudly rather than silently
+///   exempting the row, and because every legal scalar encoding is handled
+///   above, the error fires only for a genuinely un-keyable column type — never
+///   for a legal value that merely arrived in an unenumerated encoding.
+fn unique_key_scalar(array: &ArrayRef, row: usize) -> Result<Option<String>> {
+    use arrow_array::{Array, LargeStringArray, StringViewArray};
     if array.is_null(row) {
-        return None;
+        return Ok(None);
     }
     if let Some(a) = array.as_any().downcast_ref::<StringArray>() {
-        return Some(a.value(row).to_string());
+        return Ok(Some(a.value(row).to_string()));
+    }
+    if let Some(a) = array.as_any().downcast_ref::<LargeStringArray>() {
+        return Ok(Some(a.value(row).to_string()));
+    }
+    if let Some(a) = array.as_any().downcast_ref::<StringViewArray>() {
+        return Ok(Some(a.value(row).to_string()));
     }
     if let Some(a) = array.as_any().downcast_ref::<Int32Array>() {
-        return Some(a.value(row).to_string());
+        return Ok(Some(a.value(row).to_string()));
     }
     if let Some(a) = array.as_any().downcast_ref::<Int64Array>() {
-        return Some(a.value(row).to_string());
+        return Ok(Some(a.value(row).to_string()));
     }
     if let Some(a) = array.as_any().downcast_ref::<UInt32Array>() {
-        return Some(a.value(row).to_string());
+        return Ok(Some(a.value(row).to_string()));
     }
     if let Some(a) = array.as_any().downcast_ref::<UInt64Array>() {
-        return Some(a.value(row).to_string());
+        return Ok(Some(a.value(row).to_string()));
     }
     if let Some(a) = array.as_any().downcast_ref::<Float32Array>() {
-        return Some(a.value(row).to_string());
+        return Ok(Some(a.value(row).to_string()));
     }
     if let Some(a) = array.as_any().downcast_ref::<Float64Array>() {
-        return Some(a.value(row).to_string());
+        return Ok(Some(a.value(row).to_string()));
     }
     if let Some(a) = array.as_any().downcast_ref::<BooleanArray>() {
-        return Some(a.value(row).to_string());
+        return Ok(Some(a.value(row).to_string()));
     }
     if let Some(a) = array.as_any().downcast_ref::<Date32Array>() {
-        return Some(a.value(row).to_string());
+        return Ok(Some(a.value(row).to_string()));
     }
     if let Some(a) = array.as_any().downcast_ref::<Date64Array>() {
-        return Some(a.value(row).to_string());
+        return Ok(Some(a.value(row).to_string()));
     }
-    None
-}
-
-/// Build the flat list of property names that must be checked for uniqueness
-/// on a node type. Includes both `@unique` properties (from
-/// `NodeType.unique_constraints`) and the `@key` (which implies uniqueness).
-pub(crate) fn unique_property_names_for_node(
-    node_type: &omnigraph_compiler::catalog::NodeType,
-) -> Vec<String> {
-    let mut props: Vec<String> = node_type
-        .unique_constraints
-        .iter()
-        .flatten()
-        .cloned()
-        .collect();
-    if let Some(key) = &node_type.key {
-        props.extend(key.iter().cloned());
-    }
-    props.sort();
-    props.dedup();
-    props
-}
-
-/// Same as [`unique_property_names_for_node`] but for an edge type.
-pub(crate) fn unique_property_names_for_edge(
-    edge_type: &omnigraph_compiler::catalog::EdgeType,
-) -> Vec<String> {
-    let mut props: Vec<String> = edge_type
-        .unique_constraints
-        .iter()
-        .flatten()
-        .cloned()
-        .collect();
-    props.sort();
-    props.dedup();
-    props
+    Err(OmniError::manifest(format!(
+        "uniqueness key: unsupported column type {:?} for @unique/@key enforcement",
+        array.data_type()
+    )))
 }
 
 fn extract_numeric_value(col: &ArrayRef, row: usize) -> Option<f64> {
@@ -1506,260 +1482,6 @@ fn literal_value_to_f64(v: &omnigraph_compiler::catalog::LiteralValue) -> f64 {
         LiteralValue::Integer(n) => *n as f64,
         LiteralValue::Float(f) => *f,
     }
-}
-
-// ─── Edge cardinality validation ─────────────────────────────────────────────
-
-pub(crate) async fn validate_edge_cardinality(
-    db: &crate::db::Omnigraph,
-    branch: Option<&str>,
-    edge_name: &str,
-    written_version: u64,
-    written_branch: Option<&str>,
-) -> Result<()> {
-    use arrow_array::Array;
-    let catalog = db.catalog();
-    let edge_type = &catalog.edge_types[edge_name];
-    if edge_type.cardinality.is_default() {
-        return Ok(());
-    }
-
-    // Open edge sub-table at the just-written version, not the snapshot's
-    // (the snapshot still pins to the pre-write version).
-    let snapshot = db.snapshot_for_branch(branch).await?;
-    let table_key = format!("edge:{}", edge_name);
-    let entry = snapshot
-        .entry(&table_key)
-        .ok_or_else(|| OmniError::manifest(format!("no manifest entry for {}", table_key)))?;
-    let ds = db
-        .open_dataset_at_state(
-            &entry.table_path,
-            written_branch.or(entry.table_branch.as_deref()),
-            written_version,
-        )
-        .await?;
-
-    // Scan src column, count per source
-    let batches = db
-        .table_store()
-        .scan(&ds, Some(&["src"]), None, None)
-        .await?;
-
-    let mut counts: HashMap<String, u32> = HashMap::new();
-    for batch in &batches {
-        let srcs = batch
-            .column_by_name("src")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        for i in 0..srcs.len() {
-            *counts.entry(srcs.value(i).to_string()).or_insert(0) += 1;
-        }
-    }
-
-    let card = &edge_type.cardinality;
-    for (src, count) in &counts {
-        if let Some(max) = card.max {
-            if *count > max {
-                return Err(OmniError::manifest(format!(
-                    "@card violation on edge {}: source '{}' has {} edges (max {})",
-                    edge_name, src, count, max
-                )));
-            }
-        }
-        if *count < card.min {
-            return Err(OmniError::manifest(format!(
-                "@card violation on edge {}: source '{}' has {} edges (min {})",
-                edge_name, src, count, card.min
-            )));
-        }
-    }
-
-    Ok(())
-}
-
-/// Validate edge `@card` cardinality with in-memory pending edges visible.
-///
-/// Loader-level analog to `exec::mutation::validate_edge_cardinality_with_pending`:
-/// opens the committed dataset at the pre-load snapshot version, then
-/// delegates to the shared `count_src_per_edge` + `enforce_cardinality_bounds`
-/// helpers in `exec::staging`. Used by Append/Merge loads (the Overwrite
-/// path uses `validate_edge_cardinality` which opens the just-written
-/// Lance version).
-///
-/// `mode` controls dedup behavior. `LoadMode::Merge` passes `Some("id")`
-/// so committed edges that the load is *updating* (same edge id,
-/// possibly changed `src`) are not double-counted. `LoadMode::Append`
-/// passes `None` because each line generates a fresh ULID id that
-/// never collides with committed.
-async fn validate_edge_cardinality_with_pending_loader(
-    db: &Omnigraph,
-    branch: Option<&str>,
-    edge_type: &omnigraph_compiler::catalog::EdgeType,
-    table_key: &str,
-    staging: &MutationStaging,
-    mode: LoadMode,
-) -> Result<()> {
-    if edge_type.cardinality.is_default() {
-        return Ok(());
-    }
-    let snapshot = db.snapshot_for_branch(branch).await?;
-    let Some(entry) = snapshot.entry(table_key) else {
-        // No manifest entry — table doesn't exist yet. Pending-only is
-        // fine; the helper handles empty committed scans.
-        return Ok(());
-    };
-    let ds = db
-        .open_dataset_at_state(
-            &entry.table_path,
-            entry.table_branch.as_deref(),
-            entry.table_version,
-        )
-        .await?;
-    let dedupe_key = match mode {
-        LoadMode::Merge => Some("id"),
-        LoadMode::Append | LoadMode::Overwrite => None,
-    };
-    let counts =
-        crate::exec::staging::count_src_per_edge(db, &ds, table_key, staging, dedupe_key)
-            .await?;
-    crate::exec::staging::enforce_cardinality_bounds(edge_type, &counts)
-}
-
-/// Collect all valid node IDs for a given type, with in-memory pending
-/// node inserts visible. Used by the staged loader's Phase 2c
-/// referential-integrity validation.
-///
-/// Union of:
-/// - IDs from the staged loader's pending batches (in-memory; just-staged
-///   inserts of this type)
-/// - IDs from the committed sub-table at the pre-load snapshot version
-async fn collect_node_ids_with_pending(
-    db: &Omnigraph,
-    branch: Option<&str>,
-    type_name: &str,
-    staging: &MutationStaging,
-) -> Result<HashSet<String>> {
-    let mut ids = HashSet::new();
-    let table_key = format!("node:{}", type_name);
-
-    // From staging.pending: walk the in-memory accumulator's id column.
-    for batch in staging.pending_batches(&table_key) {
-        if let Some(col) = batch.column_by_name("id") {
-            if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
-                for i in 0..arr.len() {
-                    if arr.is_valid(i) {
-                        ids.insert(arr.value(i).to_string());
-                    }
-                }
-            }
-        }
-    }
-
-    // From the committed Lance sub-table at the pre-load snapshot version.
-    let snapshot = db.snapshot_for_branch(branch).await?;
-    let Some(entry) = snapshot.entry(&table_key) else {
-        return Ok(ids);
-    };
-    let ds = db
-        .open_dataset_at_state(
-            &entry.table_path,
-            entry.table_branch.as_deref(),
-            entry.table_version,
-        )
-        .await?;
-
-    let batches = db
-        .table_store()
-        .scan(&ds, Some(&["id"]), None, None)
-        .await?;
-
-    for batch in &batches {
-        let id_col = batch
-            .column_by_name("id")
-            .ok_or_else(|| OmniError::Lance("missing 'id' column".into()))?
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| OmniError::Lance("'id' column is not Utf8".into()))?;
-        for i in 0..batch.num_rows() {
-            // Defensive: `id` is the @key column on every node type and
-            // is non-nullable by schema, but a committed-row corruption
-            // (or future schema change) could surface a NULL. Skip
-            // rather than insert "" — pending-side does the same.
-            if id_col.is_valid(i) {
-                ids.insert(id_col.value(i).to_string());
-            }
-        }
-    }
-
-    Ok(ids)
-}
-
-/// Collect all valid node IDs for a given type. Union of:
-/// - IDs from the just-loaded batch (in memory, from node_rows)
-/// - IDs from the sub-table at the just-written version (if it was updated)
-/// - IDs from the sub-table at the snapshot-pinned version (if it was not updated)
-async fn collect_node_ids(
-    db: &Omnigraph,
-    branch: Option<&str>,
-    type_name: &str,
-    node_rows: &HashMap<String, Vec<JsonValue>>,
-    catalog: &omnigraph_compiler::catalog::Catalog,
-    updates: &[crate::db::SubTableUpdate],
-) -> Result<HashSet<String>> {
-    let mut ids = HashSet::new();
-
-    // IDs from the in-memory batch (just loaded in this operation)
-    if let Some(rows) = node_rows.get(type_name) {
-        if let Some(node_type) = catalog.node_types.get(type_name) {
-            if let Some(key_prop) = node_type.key_property() {
-                for row in rows {
-                    if let Some(id) = row.get(key_prop).and_then(|v| v.as_str()) {
-                        ids.insert(id.to_string());
-                    }
-                }
-            }
-        }
-    }
-
-    // IDs from the Lance sub-table
-    let table_key = format!("node:{}", type_name);
-    let snapshot = db.snapshot_for_branch(branch).await?;
-    let Some(entry) = snapshot.entry(&table_key) else {
-        return Ok(ids);
-    };
-    // Use the just-written version if this type was updated, else snapshot version
-    let updated = updates
-        .iter()
-        .find(|u| u.table_key == table_key)
-        .map(|u| (u.table_version, u.table_branch.as_deref()));
-    let (version, branch) = updated.unwrap_or((entry.table_version, entry.table_branch.as_deref()));
-    let ds = db
-        .open_dataset_at_state(&entry.table_path, branch, version)
-        .await?;
-
-    let batches = db
-        .table_store()
-        .scan(&ds, Some(&["id"]), None, None)
-        .await?;
-
-    for batch in &batches {
-        let id_col = batch
-            .column_by_name("id")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        for i in 0..batch.num_rows() {
-            if !id_col.is_valid(i) {
-                continue;
-            }
-            ids.insert(id_col.value(i).to_string());
-        }
-    }
-
-    Ok(ids)
 }
 
 #[cfg(test)]
@@ -1817,7 +1539,7 @@ edge WorksAt: Person -> Company
             .unwrap();
 
         // Read back via snapshot
-        let snap = db.snapshot();
+        let snap = db.snapshot().await;
         let person_ds = snap.open("node:Person").await.unwrap();
 
         assert_eq!(person_ds.count_rows(None).await.unwrap(), 2);
@@ -1854,7 +1576,7 @@ edge WorksAt: Person -> Company
             .await
             .unwrap();
 
-        let snap = db.snapshot();
+        let snap = db.snapshot().await;
         let knows_ds = snap.open("edge:Knows").await.unwrap();
 
         let batches: Vec<RecordBatch> = knows_ds
@@ -1889,13 +1611,13 @@ edge WorksAt: Person -> Company
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
         let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-        let v1 = db.version();
+        let v1 = db.version().await;
 
         load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite)
             .await
             .unwrap();
 
-        assert!(db.version() > v1);
+        assert!(db.version().await > v1);
     }
 
     #[tokio::test]
@@ -1912,7 +1634,7 @@ edge WorksAt: Person -> Company
             .unwrap();
         load_jsonl(&mut db, batch2, LoadMode::Append).await.unwrap();
 
-        let snap = db.snapshot();
+        let snap = db.snapshot().await;
         let person_ds = snap.open("node:Person").await.unwrap();
         assert_eq!(person_ds.count_rows(None).await.unwrap(), 2);
     }
@@ -1929,6 +1651,7 @@ edge WorksAt: Person -> Company
     }
 
     #[tokio::test]
+    #[allow(deprecated)]
     async fn test_ingest_creates_branch_and_reports_tables() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
@@ -1973,6 +1696,7 @@ edge WorksAt: Person -> Company
     }
 
     #[tokio::test]
+    #[allow(deprecated)]
     async fn test_ingest_existing_branch_ignores_from_and_merges_data() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
@@ -2047,6 +1771,7 @@ edge WorksAt: Person -> Company
     }
 
     #[tokio::test]
+    #[allow(deprecated)]
     async fn test_ingest_as_stamps_actor_on_branch_head_commit() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
@@ -2070,6 +1795,68 @@ edge WorksAt: Person -> Company
             .last()
             .unwrap();
         assert_eq!(head.actor_id.as_deref(), Some("act-andrew"));
+    }
+
+    #[tokio::test]
+    async fn test_load_as_with_base_forks_missing_branch_and_stamps_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+
+        let result = db
+            .load_as("feature", Some("main"), TEST_DATA, LoadMode::Merge, None)
+            .await
+            .unwrap();
+
+        assert_eq!(result.branch, "feature");
+        assert_eq!(result.base_branch.as_deref(), Some("main"));
+        assert!(result.branch_created);
+        assert!(
+            db.branch_list()
+                .await
+                .unwrap()
+                .contains(&"feature".to_string())
+        );
+
+        // Re-loading onto the now-existing branch records the base but
+        // performs no fork.
+        let again = db
+            .load_as(
+                "feature",
+                Some("main"),
+                r#"{"type":"Person","data":{"name":"Bob","age":26}}"#,
+                LoadMode::Merge,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(!again.branch_created);
+        assert_eq!(again.base_branch.as_deref(), Some("main"));
+    }
+
+    #[tokio::test]
+    async fn test_load_as_without_base_errors_on_missing_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+
+        let result = db
+            .load_as("nonexistent", None, TEST_DATA, LoadMode::Merge, None)
+            .await;
+        assert!(result.is_err(), "load without base must not create branches");
+        assert!(
+            !db.branch_list()
+                .await
+                .unwrap()
+                .contains(&"nonexistent".to_string()),
+            "failed load must not leave a branch behind"
+        );
+
+        // Loads to main carry the default branch metadata.
+        let main_load = db.load("main", TEST_DATA, LoadMode::Overwrite).await.unwrap();
+        assert_eq!(main_load.branch, "main");
+        assert_eq!(main_load.base_branch, None);
+        assert!(!main_load.branch_created);
     }
 
     #[test]
@@ -2114,5 +1901,67 @@ edge WorksAt: Person -> Company
         assert!(result.is_err(), "expected NaN to be rejected");
         let err = result.unwrap_err().to_string();
         assert!(err.contains("NaN"), "error should mention NaN: {}", err);
+    }
+
+    #[test]
+    fn composite_unique_key_builds_tuple_and_exempts_null() {
+        let a: ArrayRef = Arc::new(StringArray::from(vec![Some("x|y"), Some("x"), None]));
+        let b: ArrayRef = Arc::new(StringArray::from(vec![Some("z"), Some("y|z"), Some("q")]));
+        let cols = [a, b];
+
+        // Tuple key, so `("x|y", "z")` and `("x", "y|z")` stay distinct —
+        // a separator-joined key (the old `|` join) would collapse both to
+        // `x|y|z`.
+        assert_eq!(
+            composite_unique_key(&cols, 0).unwrap(),
+            Some(vec!["x|y".to_string(), "z".to_string()])
+        );
+        assert_eq!(
+            composite_unique_key(&cols, 1).unwrap(),
+            Some(vec!["x".to_string(), "y|z".to_string()])
+        );
+        assert_ne!(
+            composite_unique_key(&cols, 0).unwrap(),
+            composite_unique_key(&cols, 1).unwrap()
+        );
+
+        // Any null column → the whole row is exempt (SQL null semantics).
+        assert_eq!(composite_unique_key(&cols, 2).unwrap(), None);
+    }
+
+    #[test]
+    fn unique_key_scalar_errors_loudly_on_unkeyable_type() {
+        use arrow_array::LargeBinaryArray;
+        // A binary/blob column can't be reduced to a uniqueness key. Before the
+        // hardening this returned `None`, so a `@unique` on such a column was
+        // silently un-enforced; now it errors instead of weakening the
+        // constraint in silence.
+        let blob: ArrayRef = Arc::new(LargeBinaryArray::from(vec![Some(&b"abc"[..])]));
+        let err = unique_key_scalar(&blob, 0).unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported column type"),
+            "un-keyable type must fail loudly (got: {err})"
+        );
+    }
+
+    #[test]
+    fn unique_key_scalar_handles_all_string_encodings() {
+        use arrow_array::{LargeStringArray, StringViewArray};
+        // A legal string column is keyable in every physical Arrow encoding
+        // Lance might hand back (Utf8 / LargeUtf8 / Utf8View). None of these may
+        // fall through to the loud `Err` path — that branch is reserved for
+        // genuinely un-keyable column types, not a legal value in an
+        // unenumerated encoding.
+        let utf8: ArrayRef = Arc::new(StringArray::from(vec![Some("v")]));
+        let large: ArrayRef = Arc::new(LargeStringArray::from(vec![Some("v")]));
+        let view: ArrayRef = Arc::new(StringViewArray::from(vec![Some("v")]));
+        for array in [&utf8, &large, &view] {
+            assert_eq!(
+                unique_key_scalar(array, 0).unwrap(),
+                Some("v".to_string()),
+                "string array {:?} must render, not error",
+                array.data_type()
+            );
+        }
     }
 }

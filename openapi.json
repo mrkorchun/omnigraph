@@ -7,17 +7,85 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "0.4.1"
+    "version": "0.8.1"
   },
   "paths": {
-    "/branches": {
+    "/graphs": {
+      "get": {
+        "tags": [
+          "management"
+        ],
+        "summary": "List every graph currently registered with this server (MR-668).",
+        "description": "Multi-graph mode only. In single mode, the route returns 405 — there's\nno registry to enumerate. Cedar-gated by the server-level policy via\nthe `graph_list` action against `Omnigraph::Server::\"root\"`.\n\nOrder: alphabetical by `graph_id` (server-sorted so clients see\ndeterministic output across requests).",
+        "operationId": "listGraphs",
+        "responses": {
+          "200": {
+            "description": "List of registered graphs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GraphListResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "405": {
+            "description": "Method not allowed (single-graph mode)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/graphs/{graph_id}/branches": {
       "get": {
         "tags": [
           "branches"
         ],
         "summary": "List all branches.",
         "description": "Returns branch names sorted alphabetically. Read-only.",
-        "operationId": "listBranches",
+        "operationId": "cluster_listBranches",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "List of branches",
@@ -62,7 +130,18 @@
         ],
         "summary": "Create a new branch.",
         "description": "Forks `name` off of `from` (defaults to `main`). The new branch shares\ntable data with its parent until it is mutated. Returns 409 if `name`\nalready exists.",
-        "operationId": "createBranch",
+        "operationId": "cluster_createBranch",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -123,6 +202,16 @@
                 }
               }
             }
+          },
+          "429": {
+            "description": "Per-actor admission cap exceeded; honor `Retry-After` header",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -132,14 +221,25 @@
         ]
       }
     },
-    "/branches/merge": {
+    "/graphs/{graph_id}/branches/merge": {
       "post": {
         "tags": [
           "branches"
         ],
         "summary": "Merge one branch into another.",
         "description": "Merges `source` into `target` (defaults to `main`). Outcome is one of\n`already_up_to_date`, `fast_forward`, or `merged`. Returns 409 with the\nlist of conflicts if the merge cannot be completed; the target is left\nunchanged in that case. **Destructive** to `target` on success.",
-        "operationId": "mergeBranches",
+        "operationId": "cluster_mergeBranches",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -200,6 +300,16 @@
                 }
               }
             }
+          },
+          "429": {
+            "description": "Per-actor admission cap exceeded; honor `Retry-After` header",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -209,15 +319,24 @@
         ]
       }
     },
-    "/branches/{branch}": {
+    "/graphs/{graph_id}/branches/{branch}": {
       "delete": {
         "tags": [
           "branches"
         ],
         "summary": "Delete a branch.",
         "description": "**Irreversible.** Removes the branch pointer; commits remain reachable\nonly if referenced by another branch. Returns 404 if the branch does not\nexist.",
-        "operationId": "deleteBranch",
+        "operationId": "cluster_deleteBranch",
         "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
           {
             "name": "branch",
             "in": "path",
@@ -268,6 +387,16 @@
                 }
               }
             }
+          },
+          "429": {
+            "description": "Per-actor admission cap exceeded; honor `Retry-After` header",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -277,14 +406,521 @@
         ]
       }
     },
-    "/change": {
+    "/graphs/{graph_id}/change": {
       "post": {
         "tags": [
           "mutations"
         ],
-        "summary": "Apply a GQ mutation to a branch.",
-        "description": "Writes to the named `branch` (defaults to `main`). Mutations are atomic\nper call and produce a new commit. Returns counts of nodes and edges\naffected. **Destructive**: on success the branch is updated; rejected\nmutations may still acquire locks briefly. Returns 409 on merge conflict.",
-        "operationId": "change",
+        "summary": "**Deprecated** — use [`POST /mutate`](#tag/mutations/operation/mutate) instead.",
+        "description": "Apply a GQ mutation to a branch. Behavior is unchanged; the route is\nkept indefinitely for back-compat. New integrations should target\n`POST /mutate`, which has identical semantics and a name that pairs\ncleanly with `POST /query`. Responses from this route include\n`Deprecation: true` and `Link: <mutate>; rel=\"successor-version\"`\nheaders per RFC 9745 / RFC 8288 so SDKs and proxies can surface the\nsignal.",
+        "operationId": "cluster_change",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChangeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Mutation results (response includes `Deprecation: true` + `Link: <mutate>; rel=\"successor-version\"`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeOutput"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Merge conflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Per-actor admission cap exceeded; honor `Retry-After` header",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "deprecated": true,
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/graphs/{graph_id}/commits": {
+      "get": {
+        "tags": [
+          "commits"
+        ],
+        "summary": "List commits.",
+        "description": "Filter by `branch` to get the commits on a single branch (most recent\nfirst); omit to list across all branches. Read-only.",
+        "operationId": "cluster_listCommits",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "branch",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of commits",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommitListOutput"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/graphs/{graph_id}/commits/{commit_id}": {
+      "get": {
+        "tags": [
+          "commits"
+        ],
+        "summary": "Get a single commit.",
+        "description": "Returns the commit's manifest version, parent commit(s), and creation\nmetadata. Read-only.",
+        "operationId": "cluster_getCommit",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "commit_id",
+            "in": "path",
+            "description": "Commit identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Commit details",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommitOutput"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Commit not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/graphs/{graph_id}/export": {
+      "post": {
+        "tags": [
+          "queries"
+        ],
+        "summary": "Stream the contents of a branch as NDJSON.",
+        "description": "Emits one JSON object per line (`application/x-ndjson`). Filter with\n`type_names` (node/edge type names) and/or `table_keys`; both empty\nstreams the entire branch. Suitable for large exports — the response is\nstreamed, not buffered. Read-only.",
+        "operationId": "cluster_export",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExportRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Exported data as NDJSON",
+            "content": {
+              "application/x-ndjson": {}
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/graphs/{graph_id}/ingest": {
+      "post": {
+        "tags": [
+          "mutations"
+        ],
+        "summary": "**Deprecated** — use [`POST /load`](#tag/mutations/operation/load) instead.",
+        "description": "Bulk-load NDJSON data into a branch. Behavior is unchanged; the route is\nkept indefinitely for back-compat. New integrations should target\n`POST /load`, which has identical semantics. Responses from this route\ninclude `Deprecation: true` and `Link: <load>; rel=\"successor-version\"`\nheaders per RFC 9745 / RFC 8288 so SDKs and proxies can surface the signal.",
+        "operationId": "cluster_ingest",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/IngestRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Load results (response includes `Deprecation: true` + `Link: <load>; rel=\"successor-version\"`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IngestOutput"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Per-actor admission cap exceeded; honor `Retry-After` header",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "deprecated": true,
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/graphs/{graph_id}/load": {
+      "post": {
+        "tags": [
+          "mutations"
+        ],
+        "summary": "Bulk-load NDJSON data into a branch (canonical load endpoint).",
+        "description": "`data` is NDJSON with one record per line. `mode` controls behavior on\nexisting rows: `merge` upserts by id (default), `append` blindly inserts,\n`overwrite` replaces table contents. Branch creation is opt-in by\npresence of `from`: with `from` set, a missing `branch` is created from\nit; without `from`, `branch` must already exist — a missing branch is a\n404, never an implicit fork. **Destructive** when `mode` is `overwrite`\nor when the load produces conflicting writes.\n\nThe legacy `POST /ingest` route has identical semantics and is kept as a\ndeprecated alias.",
+        "operationId": "cluster_load",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/IngestRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Load results",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IngestOutput"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Per-actor admission cap exceeded; honor `Retry-After` header",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/graphs/{graph_id}/mutate": {
+      "post": {
+        "tags": [
+          "mutations"
+        ],
+        "summary": "Apply a GQ mutation to a branch (canonical mutation endpoint).",
+        "description": "Writes to the named `branch` (defaults to `main`). Mutations are atomic\nper call and produce a new commit. Returns counts of nodes and edges\naffected. **Destructive**: on success the branch is updated; rejected\nmutations may still acquire locks briefly. Returns 409 on merge conflict.\n\nPairs with `POST /query` (read-only). The legacy `POST /change` route\nhas identical semantics and is kept as a deprecated alias.",
+        "operationId": "cluster_mutate",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -345,6 +981,16 @@
                 }
               }
             }
+          },
+          "429": {
+            "description": "Per-actor admission cap exceeded; honor `Retry-After` header",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -354,15 +1000,528 @@
         ]
       }
     },
-    "/commits": {
+    "/graphs/{graph_id}/queries": {
       "get": {
         "tags": [
-          "commits"
+          "queries"
         ],
-        "summary": "List commits.",
-        "description": "Filter by `branch` to get the commits on a single branch (most recent\nfirst); omit to list across all branches. Read-only.",
-        "operationId": "listCommits",
+        "summary": "List the graph's exposed stored queries as a typed tool catalog.",
+        "description": "Returns every stored query in the `queries:` registry, each\nwith its MCP tool name, read/mutate flag, description/instruction, and\ntyped parameters — enough for a client to register them as tools without\nfetching `.gq` source. Cluster-served graphs have no per-query expose flag,\nso the catalog lists them all. Read-gated; the catalog is graph-wide (branch\nindependent — `read` is authorized against `main`). **Not** Cedar-filtered\nper query yet, so it can list a query whose `invoke_query` the caller\nlacks (a known gap until per-query authorization lands).",
+        "operationId": "cluster_list_queries",
         "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Stored-query catalog (every stored query, with typed params)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QueriesCatalogOutput"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/graphs/{graph_id}/queries/{name}": {
+      "post": {
+        "tags": [
+          "queries"
+        ],
+        "summary": "Invoke a curated, server-side stored query by name.",
+        "description": "The query source comes from the graph's `queries:` registry, not the\nrequest body — callers send only runtime inputs (`params`, `branch`,\n`snapshot`). Gated by the `invoke_query` Cedar action at the boundary;\na stored *mutation* additionally passes the engine's `change` gate\n(double-gated). An actor **without** `invoke_query` cannot tell a denied\nquery from a missing one — both return the same 404, so the catalog\ncan't be probed without the grant. Once `invoke_query` is held, the\ninner `read`/`change` gate may surface a 403 for an existing query the\nactor can't run (the intended double-gate signal).",
+        "operationId": "cluster_invoke_query",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Stored query name (the registry key)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/InvokeStoredQueryRequest"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Read envelope (ReadOutput) or mutation envelope (ChangeOutput), serialized untagged",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvokeStoredQueryResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request (param type error; snapshot on a stored mutation)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden (the inner `change` gate for a stored mutation)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown stored query, or `invoke_query` denied — indistinguishable to a caller without the grant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Merge conflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Per-actor admission cap exceeded; honor `Retry-After` header",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Policy evaluation error (a denial is reported as 404, not 500)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/graphs/{graph_id}/query": {
+      "post": {
+        "tags": [
+          "queries"
+        ],
+        "summary": "Execute an inline read query (friendlier-named alternative to `POST /read`).",
+        "description": "Designed for ad-hoc exploration and AI-agent tool-use: short field\nnames (`query`, `name`) match the CLI `-e` flag and the GQ `query`\nkeyword. Mutations (`insert`/`update`/`delete`) are rejected with 400\n-- use `POST /mutate` (or its deprecated alias `POST /change`) for\nwrite queries. Otherwise behaves identically to `POST /read`: same\ntarget semantics (branch xor snapshot), same Cedar action (Read),\nsame response shape.",
+        "operationId": "cluster_query",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/QueryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Query results",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReadOutput"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request - also returned when the query body contains mutations; use POST /mutate (or its deprecated alias POST /change) for write queries",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/graphs/{graph_id}/read": {
+      "post": {
+        "tags": [
+          "queries"
+        ],
+        "summary": "**Deprecated** — use [`POST /query`](#tag/queries/operation/query) instead.",
+        "description": "Execute a GQ read query. Behavior is unchanged from prior releases; the\nroute is kept indefinitely for byte-stable back-compat. New integrations\nshould target `POST /query`, which has clean field names (`query` /\n`name`) and a 400-on-mutation guard. Responses from this route include\n`Deprecation: true` and `Link: <query>; rel=\"successor-version\"`\nheaders per RFC 9745 / RFC 8288 so SDKs and proxies can surface the\nsignal.",
+        "operationId": "cluster_read",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReadRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Query results (response includes `Deprecation: true` + `Link: <query>; rel=\"successor-version\"`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReadOutput"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "deprecated": true,
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/graphs/{graph_id}/schema": {
+      "get": {
+        "tags": [
+          "schema"
+        ],
+        "summary": "Read the current schema source.",
+        "description": "Returns the project's schema as a single string in `.pg` source form.\nUseful for clients that want to introspect available types and tables\nbefore constructing GQ queries. Read-only.",
+        "operationId": "cluster_getSchema",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current schema source",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SchemaOutput"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/graphs/{graph_id}/schema/apply": {
+      "post": {
+        "tags": [
+          "mutations"
+        ],
+        "summary": "Apply a schema migration.",
+        "description": "Cluster-backed servers reject this route with `409 Conflict`; operators\nmust apply schema changes through `omnigraph cluster apply` and restart.\n\nDiffs `schema_source` against the current schema and applies the resulting\nmigration steps (add/drop type, add/drop column, etc.). **Destructive**:\nsome steps drop data. Returns the list of steps applied; if `applied` is\nfalse the diff was unsupported and no changes were made.",
+        "operationId": "cluster_applySchema",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SchemaApplyRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Schema apply results",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SchemaApplyOutput"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Schema apply is disabled for cluster-backed serving; use `omnigraph cluster apply` and restart",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Per-actor admission cap exceeded; honor `Retry-After` header",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/graphs/{graph_id}/snapshot": {
+      "get": {
+        "tags": [
+          "snapshots"
+        ],
+        "summary": "Read the current snapshot of a branch.",
+        "description": "Returns the manifest version plus per-table metadata (path, version, row\ncount) for every table on the branch. Defaults to `main` when `branch` is\nomitted. Read-only.",
+        "operationId": "cluster_getSnapshot",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
           {
             "name": "branch",
             "in": "query",
@@ -377,142 +1536,11 @@
         ],
         "responses": {
           "200": {
-            "description": "List of commits",
+            "description": "Database snapshot",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/CommitListOutput"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Unauthorized",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "403": {
-            "description": "Forbidden",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          }
-        },
-        "security": [
-          {
-            "bearer_token": []
-          }
-        ]
-      }
-    },
-    "/commits/{commit_id}": {
-      "get": {
-        "tags": [
-          "commits"
-        ],
-        "summary": "Get a single commit.",
-        "description": "Returns the commit's manifest version, parent commit(s), and creation\nmetadata. Read-only.",
-        "operationId": "getCommit",
-        "parameters": [
-          {
-            "name": "commit_id",
-            "in": "path",
-            "description": "Commit identifier",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Commit details",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/CommitOutput"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Unauthorized",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "403": {
-            "description": "Forbidden",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Commit not found",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          }
-        },
-        "security": [
-          {
-            "bearer_token": []
-          }
-        ]
-      }
-    },
-    "/export": {
-      "post": {
-        "tags": [
-          "queries"
-        ],
-        "summary": "Stream the contents of a branch as NDJSON.",
-        "description": "Emits one JSON object per line (`application/x-ndjson`). Filter with\n`type_names` (node/edge type names) and/or `table_keys`; both empty\nstreams the entire branch. Suitable for large exports — the response is\nstreamed, not buffered. Read-only.",
-        "operationId": "export",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/ExportRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Exported data as NDJSON",
-            "content": {
-              "application/x-ndjson": {}
-            }
-          },
-          "400": {
-            "description": "Bad request",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
+                  "$ref": "#/components/schemas/SnapshotOutput"
                 }
               }
             }
@@ -565,314 +1593,6 @@
             }
           }
         }
-      }
-    },
-    "/ingest": {
-      "post": {
-        "tags": [
-          "mutations"
-        ],
-        "summary": "Bulk-ingest NDJSON data into a branch.",
-        "description": "`data` is NDJSON with one record per line. `mode` controls behavior on\nexisting rows: `merge` upserts by id (default), `append` blindly inserts,\n`overwrite` replaces table contents. If `branch` does not exist it is\ncreated from `from` (defaults to `main`). **Destructive** when `mode` is\n`overwrite` or when ingest produces conflicting writes.",
-        "operationId": "ingest",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/IngestRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Ingest results",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/IngestOutput"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Bad request",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Unauthorized",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "403": {
-            "description": "Forbidden",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          }
-        },
-        "security": [
-          {
-            "bearer_token": []
-          }
-        ]
-      }
-    },
-    "/read": {
-      "post": {
-        "tags": [
-          "queries"
-        ],
-        "summary": "Execute a GQ read query.",
-        "description": "Runs the query in `query_source` against either a branch or a frozen\nsnapshot (mutually exclusive). When `query_source` defines multiple named\nqueries, pick one with `query_name`. `params` is a JSON object whose keys\nmatch the parameters declared by the query. Returns rows as a JSON array\nplus a `columns` list. Read-only.",
-        "operationId": "read",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/ReadRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Query results",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ReadOutput"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Bad request",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Unauthorized",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "403": {
-            "description": "Forbidden",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          }
-        },
-        "security": [
-          {
-            "bearer_token": []
-          }
-        ]
-      }
-    },
-    "/schema": {
-      "get": {
-        "tags": [
-          "schema"
-        ],
-        "summary": "Read the current schema source.",
-        "description": "Returns the project's schema as a single string in `.pg` source form.\nUseful for clients that want to introspect available types and tables\nbefore constructing GQ queries. Read-only.",
-        "operationId": "getSchema",
-        "responses": {
-          "200": {
-            "description": "Current schema source",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/SchemaOutput"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Unauthorized",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "403": {
-            "description": "Forbidden",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          }
-        },
-        "security": [
-          {
-            "bearer_token": []
-          }
-        ]
-      }
-    },
-    "/schema/apply": {
-      "post": {
-        "tags": [
-          "mutations"
-        ],
-        "summary": "Apply a schema migration.",
-        "description": "Diffs `schema_source` against the current schema and applies the resulting\nmigration steps (add/drop type, add/drop column, etc.). **Destructive**:\nsome steps drop data. Returns the list of steps applied; if `applied` is\nfalse the diff was unsupported and no changes were made.",
-        "operationId": "applySchema",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/SchemaApplyRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Schema apply results",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/SchemaApplyOutput"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Bad request",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Unauthorized",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "403": {
-            "description": "Forbidden",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          }
-        },
-        "security": [
-          {
-            "bearer_token": []
-          }
-        ]
-      }
-    },
-    "/snapshot": {
-      "get": {
-        "tags": [
-          "snapshots"
-        ],
-        "summary": "Read the current snapshot of a branch.",
-        "description": "Returns the manifest version plus per-table metadata (path, version, row\ncount) for every table on the branch. Defaults to `main` when `branch` is\nomitted. Read-only.",
-        "operationId": "getSnapshot",
-        "parameters": [
-          {
-            "name": "branch",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Database snapshot",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/SnapshotOutput"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Unauthorized",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "403": {
-            "description": "Forbidden",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          }
-        },
-        "security": [
-          {
-            "bearer_token": []
-          }
-        ]
       }
     }
   },
@@ -1043,7 +1763,7 @@
       "ChangeRequest": {
         "type": "object",
         "required": [
-          "query_source"
+          "query"
         ],
         "properties": {
           "branch": {
@@ -1053,19 +1773,19 @@
             ],
             "description": "Target branch. Defaults to `main`."
           },
-          "params": {
-            "description": "JSON object whose keys match the mutation's declared parameters."
-          },
-          "query_name": {
+          "name": {
             "type": [
               "string",
               "null"
             ],
-            "description": "Name of the mutation to run when `query_source` declares multiple."
+            "description": "Name of the mutation to run when `query` declares multiple.\n\nAccepts the legacy field name `query_name` as a deserialization alias."
           },
-          "query_source": {
+          "params": {
+            "description": "JSON object whose keys match the mutation's declared parameters."
+          },
+          "query": {
             "type": "string",
-            "description": "GQ mutation source containing `insert`, `update`, or `delete` statements.\nMay declare multiple named mutations; pick one with `query_name`.",
+            "description": "GQ mutation source containing `insert`, `update`, or `delete` statements.\nMay declare multiple named mutations; pick one with `name`.\n\nAccepts the legacy field name `query_source` as a deserialization alias.",
             "example": "query insert_person($name: String, $age: I32) {\n    insert Person { name: $name, age: $age }\n}"
           }
         }
@@ -1139,7 +1859,9 @@
           "forbidden",
           "bad_request",
           "not_found",
+          "method_not_allowed",
           "conflict",
+          "too_many_requests",
           "internal"
         ]
       },
@@ -1207,13 +1929,51 @@
           }
         }
       },
+      "GraphInfo": {
+        "type": "object",
+        "description": "One entry in the response from `GET /graphs`. Cluster operators\nconsume this list to discover which graphs the server is currently\nserving. The shape is intentionally minimal — `graph_id` and `uri`\nare the only fields a routing client needs.",
+        "required": [
+          "graph_id",
+          "uri"
+        ],
+        "properties": {
+          "graph_id": {
+            "type": "string"
+          },
+          "uri": {
+            "type": "string"
+          }
+        }
+      },
+      "GraphListResponse": {
+        "type": "object",
+        "description": "Response from `GET /graphs`. Lists every graph registered with the\nserver in alphabetical order by `graph_id` (sorted server-side so\nclients get deterministic output across requests).",
+        "required": [
+          "graphs"
+        ],
+        "properties": {
+          "graphs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GraphInfo"
+            }
+          }
+        }
+      },
       "HealthOutput": {
         "type": "object",
         "required": [
           "status",
-          "version"
+          "version",
+          "internal_schema_version"
         ],
         "properties": {
+          "internal_schema_version": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The internal-schema (storage-format) version this binary writes and reads.",
+            "minimum": 0
+          },
           "source_version": {
             "type": [
               "string",
@@ -1233,7 +1993,6 @@
         "required": [
           "uri",
           "branch",
-          "base_branch",
           "branch_created",
           "mode",
           "tables"
@@ -1246,7 +2005,11 @@
             ]
           },
           "base_branch": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Base branch a fork was requested from (the request's `from`), echoed\neven when the branch already existed. `null` when `from` was absent."
           },
           "branch": {
             "type": "string"
@@ -1279,7 +2042,7 @@
               "string",
               "null"
             ],
-            "description": "Target branch. Created from `from` if it does not yet exist. Defaults to `main`."
+            "description": "Target branch. Defaults to `main`. Without `from`, the branch must\nalready exist — a missing branch is a 404, never an implicit fork."
           },
           "data": {
             "type": "string",
@@ -1291,7 +2054,7 @@
               "string",
               "null"
             ],
-            "description": "Parent branch used to create `branch` if it does not exist. Defaults to `main`."
+            "description": "Parent branch used to create `branch` if it does not exist. Branch\ncreation is opt-in by presence of this field; omit it to require an\nexisting branch."
           },
           "mode": {
             "oneOf": [
@@ -1321,6 +2084,47 @@
             "type": "string"
           }
         }
+      },
+      "InvokeStoredQueryRequest": {
+        "type": "object",
+        "description": "Body for `POST /queries/{name}` — invokes the server-side stored query\nnamed in the path. The query source and name come from the registry,\nnever the body; only the runtime inputs are supplied here.",
+        "properties": {
+          "branch": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Branch to run against. Defaults to `main`; for a stored mutation the\nwrite targets this branch."
+          },
+          "expect_mutation": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "The kind the caller expects (RFC-011 Decision 3): `Some(false)` for\n`omnigraph query <name>`, `Some(true)` for `omnigraph mutate <name>`.\nWhen set and it disagrees with the stored query's actual kind, the\nserver rejects the call (400) so the verb asserts the kind. `None`\n(the default) skips the check — preserving older clients and aliases."
+          },
+          "params": {
+            "description": "JSON object whose keys match the stored query's declared parameters."
+          },
+          "snapshot": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Snapshot id to read from (read queries only — rejected for a stored\nmutation). Mutually exclusive with `branch`."
+          }
+        }
+      },
+      "InvokeStoredQueryResponse": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/ReadOutput"
+          },
+          {
+            "$ref": "#/components/schemas/ChangeOutput"
+          }
+        ],
+        "description": "Response for `POST /queries/{name}`: the read envelope for a stored\nread, or the mutation envelope for a stored mutation. Serialized\n**untagged**, so the wire shape is exactly [`ReadOutput`] or\n[`ChangeOutput`] — classification follows the stored query, not a\nwrapper field."
       },
       "LoadMode": {
         "type": "string",
@@ -1389,6 +2193,158 @@
           },
           "table_key": {
             "type": "string"
+          }
+        }
+      },
+      "ParamDescriptor": {
+        "type": "object",
+        "description": "One declared parameter of a stored query, projected for the catalog.",
+        "required": [
+          "name",
+          "kind",
+          "nullable"
+        ],
+        "properties": {
+          "item_kind": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ParamKind",
+                "description": "Element kind when `kind == list` (always a scalar — the grammar\nforbids lists of vectors or nested lists)."
+              }
+            ]
+          },
+          "kind": {
+            "$ref": "#/components/schemas/ParamKind"
+          },
+          "name": {
+            "type": "string"
+          },
+          "nullable": {
+            "type": "boolean",
+            "description": "`false` → the caller must supply it; `true` → optional."
+          },
+          "vector_dim": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Dimension when `kind == vector`.",
+            "minimum": 0
+          }
+        }
+      },
+      "ParamKind": {
+        "type": "string",
+        "description": "The kind of a stored-query parameter, decomposed so a client (e.g. an\nMCP server) can build a typed input schema with a closed `match` and\nnever re-parse omnigraph's type spelling. `bigint`/`date`/`datetime`/\n`blob` are carried as JSON strings on the wire: a 64-bit integer past\n2^53 loses precision as a JSON number, and Date/DateTime are ISO\nstrings, Blob a blob-URI string.",
+        "enum": [
+          "string",
+          "bool",
+          "int",
+          "bigint",
+          "float",
+          "date",
+          "datetime",
+          "blob",
+          "vector",
+          "list"
+        ]
+      },
+      "QueriesCatalogOutput": {
+        "type": "object",
+        "description": "Response for `GET /queries`: every stored query in a graph's\nregistry, each with typed parameters.",
+        "required": [
+          "queries"
+        ],
+        "properties": {
+          "queries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/QueryCatalogEntry"
+            }
+          }
+        }
+      },
+      "QueryCatalogEntry": {
+        "type": "object",
+        "description": "One entry in the stored-query catalog (`GET /queries`).",
+        "required": [
+          "name",
+          "tool_name",
+          "mutation",
+          "params"
+        ],
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "instruction": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mutation": {
+            "type": "boolean",
+            "description": "`true` for a stored mutation → an MCP read-only hint of `false`."
+          },
+          "name": {
+            "type": "string",
+            "description": "Registry key / invoke path segment (`POST /queries/{name}`)."
+          },
+          "params": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ParamDescriptor"
+            }
+          },
+          "tool_name": {
+            "type": "string",
+            "description": "MCP tool id (the `tool_name` override, else `name`)."
+          }
+        }
+      },
+      "QueryRequest": {
+        "type": "object",
+        "description": "Inline read-query request for `POST /query`.\n\nFriendlier-named alternative to [`ReadRequest`] for ad-hoc reads and\nAI-agent integration. Mutations are rejected with 400 — use `POST\n/mutate` (or its deprecated alias `POST /change`) for write queries.\nField names are deliberately short (`query`, `name`) to match the GQ\nkeyword and the CLI `-e` flag.",
+        "required": [
+          "query"
+        ],
+        "properties": {
+          "branch": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Branch to read from. Mutually exclusive with `snapshot`. Defaults to `main`."
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Name of the query to run when `query` declares multiple. Optional when\nonly one query is declared."
+          },
+          "params": {
+            "description": "JSON object whose keys match the query's declared parameters."
+          },
+          "query": {
+            "type": "string",
+            "description": "GQ read-query source. May declare one or more named queries; pick one\nwith `name` when more than one is declared. Mutations\n(`insert`/`update`/`delete`) get 400 — use `POST /mutate` (or its\ndeprecated alias `POST /change`) instead.",
+            "example": "query get_person($name: String) {\n    match {\n        $p: Person { name: $name }\n    }\n    return { $p.name, $p.age }\n}"
+          },
+          "snapshot": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Snapshot id to read from. Mutually exclusive with `branch`."
           }
         }
       },
@@ -1515,6 +2471,10 @@
           "schema_source"
         ],
         "properties": {
+          "allow_data_loss": {
+            "type": "boolean",
+            "description": "When true, promote every `DropMode::Soft` step in the plan to\n`DropMode::Hard`, making the prior column data unreachable\nafter the apply. Matches the CLI's `--allow-data-loss` flag.\nDefaults to `false` (drops remain reversible via time travel)."
+          },
           "schema_source": {
             "type": "string",
             "description": "Project schema in `.pg` source form. The diff against the current\nschema produces the migration steps that will be applied.",
@@ -1538,11 +2498,18 @@
         "required": [
           "branch",
           "manifest_version",
+          "internal_schema_version",
           "tables"
         ],
         "properties": {
           "branch": {
             "type": "string"
+          },
+          "internal_schema_version": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The on-disk internal-schema (storage-format) version this graph's branch\nis stamped at.",
+            "minimum": 0
           },
           "manifest_version": {
             "type": "integer",

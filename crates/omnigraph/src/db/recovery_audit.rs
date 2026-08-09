@@ -1,28 +1,25 @@
 //! Recovery audit row storage in `_graph_commit_recoveries.lance`.
 //!
-//! Sibling to `_graph_commits.lance` (`commit_graph.rs`). Each successful
+//! A standalone internal table (not catalog-tracked). Each successful
 //! recovery sweep — roll-forward or roll-back — records one row here so
 //! operators investigating a sidecar-attributed mutation can correlate
 //! `omnigraph commit list --filter actor=omnigraph:recovery` with the
 //! original actor whose mutation was rolled forward / back.
 //!
-//! Sibling-table is additive: it doesn't bump
-//! `INTERNAL_MANIFEST_SCHEMA_VERSION`, and can be removed in favor of a
-//! schema migration later if the join cost matters. The schema-migration
-//! alternative (adding `recovery_for_actor` and `recovery_kind` columns
-//! to `_graph_commits.lance` itself) was considered and rejected to keep
-//! this change additive.
+//! This standalone table is additive: it doesn't bump
+//! `INTERNAL_MANIFEST_SCHEMA_VERSION`. Folding `recovery_for_actor` and
+//! `recovery_kind` into the `__manifest` `graph_commit` rows instead was
+//! considered and rejected to keep this change additive.
 //!
 //! Atomicity caveat: append to `_graph_commit_recoveries.lance` is
-//! sequential w.r.t. the `CommitGraph::append_commit` write. A crash
-//! between the two leaves an orphan commit-graph row with no audit row.
-//! Same shape as the existing `_graph_commits` + `_graph_commit_actors`
-//! split; the recovery sweep tolerates it the same way (re-entry sees
-//! `NoMovement` for already-restored / already-published tables; the
-//! audit append is retried).
+//! sequential w.r.t. the recovery commit, which RFC-013 Phase 7 records in
+//! `__manifest` (folded into the recovery publish CAS via `publish_recovery_commit`).
+//! A crash between the publish and this audit append leaves a recovery commit
+//! with no audit row. The recovery sweep tolerates it the same way (re-entry
+//! sees `NoMovement` for already-restored / already-published tables; the audit
+//! append is retried, minting a fresh recovery commit).
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow_array::{
     Array, RecordBatch, RecordBatchIterator, StringArray, TimestampMicrosecondArray,
@@ -43,6 +40,11 @@ const RECOVERIES_DIR: &str = "_graph_commit_recoveries.lance";
 pub(crate) enum RecoveryKind {
     RolledForward,
     RolledBack,
+    /// The sidecar's branch no longer exists in the manifest: its tree
+    /// and forks are reclaimed, the pinned drift is unreachable, and the
+    /// sidecar is provably moot — discarded with this audit row instead
+    /// of wedging every heal/sweep on a dead-branch open.
+    OrphanedBranchDiscarded,
 }
 
 impl RecoveryKind {
@@ -50,6 +52,7 @@ impl RecoveryKind {
         match self {
             RecoveryKind::RolledForward => "RolledForward",
             RecoveryKind::RolledBack => "RolledBack",
+            RecoveryKind::OrphanedBranchDiscarded => "OrphanedBranchDiscarded",
         }
     }
 
@@ -57,6 +60,7 @@ impl RecoveryKind {
         match s {
             "RolledForward" => Ok(RecoveryKind::RolledForward),
             "RolledBack" => Ok(RecoveryKind::RolledBack),
+            "OrphanedBranchDiscarded" => Ok(RecoveryKind::OrphanedBranchDiscarded),
             other => Err(OmniError::manifest_internal(format!(
                 "unknown recovery_kind '{}' in _graph_commit_recoveries.lance",
                 other
@@ -93,12 +97,18 @@ pub(crate) struct RecoveryAudit {
 }
 
 impl RecoveryAudit {
-    /// Open the recovery-audit dataset for the repo, or return a handle
-    /// with no dataset yet (created on first append). Mirrors the
-    /// optional-dataset pattern from `_graph_commit_actors.lance`.
+    /// Open the recovery-audit dataset for the graph, or return a handle
+    /// with no dataset yet (it is created lazily on the first append).
     pub(crate) async fn open(root_uri: &str) -> Result<Self> {
         let root = root_uri.trim_end_matches('/').to_string();
-        let dataset = Dataset::open(&recoveries_uri(&root)).await.ok();
+        let dataset = crate::instrumentation::open_dataset(
+            &recoveries_uri(&root),
+            crate::instrumentation::VersionResolution::Latest,
+            None,
+            crate::instrumentation::manifest_wrapper(),
+        )
+        .await
+        .ok();
         Ok(Self {
             root_uri: root,
             dataset,
@@ -106,8 +116,8 @@ impl RecoveryAudit {
     }
 
     /// Append one recovery audit record. Lazily initializes the dataset
-    /// on first call (idempotent under racy creation via the same
-    /// `Dataset already exists` rebound as `_graph_commit_actors.lance`).
+    /// on first call (idempotent under racy creation: a `Dataset already
+    /// exists` error is rebound to an open of the just-created dataset).
     pub(crate) async fn append(&mut self, record: RecoveryAuditRecord) -> Result<()> {
         let batch = recovery_record_to_batch(&record)?;
         let reader = RecordBatchIterator::new(vec![Ok(batch)], recoveries_schema());
@@ -182,13 +192,25 @@ async fn create_recoveries_dataset(root_uri: &str) -> Result<Dataset> {
         mode: WriteMode::Create,
         enable_stable_row_ids: true,
         data_storage_version: Some(LanceFileVersion::V2_2),
+        auto_cleanup: None,
+        skip_auto_cleanup: true,
         ..Default::default()
     };
     match Dataset::write(reader, &uri as &str, Some(params)).await {
         Ok(dataset) => Ok(dataset),
-        Err(err) if err.to_string().contains("Dataset already exists") => Dataset::open(&uri)
+        // Create-or-open idempotency — match the typed `DatasetAlreadyExists`
+        // variant, not the display string (not a Lance API contract). Same
+        // discipline as `commit_graph.rs`'s create-or-open; pinned by
+        // `lance_surface_guards.rs::lance_error_dataset_already_exists_variant_exists`.
+        Err(lance::Error::DatasetAlreadyExists { .. }) => {
+            crate::instrumentation::open_dataset(
+                &uri,
+                crate::instrumentation::VersionResolution::Latest,
+                None,
+                crate::instrumentation::manifest_wrapper(),
+            )
             .await
-            .map_err(|open_err| OmniError::Lance(open_err.to_string())),
+        }
         Err(err) => Err(OmniError::Lance(err.to_string())),
     }
 }
@@ -205,9 +227,7 @@ fn recovery_record_to_batch(record: &RecoveryAuditRecord) -> Result<RecordBatch>
         vec![
             Arc::new(StringArray::from(vec![record.graph_commit_id.clone()])),
             Arc::new(StringArray::from(vec![record.recovery_kind.as_str()])),
-            Arc::new(StringArray::from(vec![record
-                .recovery_for_actor
-                .clone()])),
+            Arc::new(StringArray::from(vec![record.recovery_for_actor.clone()])),
             Arc::new(StringArray::from(vec![record.operation_id.clone()])),
             Arc::new(StringArray::from(vec![record.sidecar_writer_kind.clone()])),
             Arc::new(StringArray::from(vec![outcomes_json])),
@@ -221,10 +241,14 @@ fn decode_row(batch: &RecordBatch, row: usize) -> Result<RecoveryAuditRecord> {
     let str_col = |name: &str| -> Result<&StringArray> {
         batch
             .column_by_name(name)
-            .ok_or_else(|| OmniError::manifest_internal(format!("missing column '{}' in recovery audit", name)))?
+            .ok_or_else(|| {
+                OmniError::manifest_internal(format!("missing column '{}' in recovery audit", name))
+            })?
             .as_any()
             .downcast_ref::<StringArray>()
-            .ok_or_else(|| OmniError::manifest_internal(format!("column '{}' has wrong type", name)))
+            .ok_or_else(|| {
+                OmniError::manifest_internal(format!("column '{}' has wrong type", name))
+            })
     };
     let ts_col = batch
         .column_by_name("created_at")
@@ -265,15 +289,6 @@ fn decode_row(batch: &RecordBatch, row: usize) -> Result<RecoveryAuditRecord> {
     })
 }
 
-pub(crate) fn now_micros() -> Result<i64> {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_micros() as i64)
-        .map_err(|e| {
-            OmniError::manifest_internal(format!("system clock before unix epoch: {}", e))
-        })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,7 +322,7 @@ mod tests {
         let root = dir.path().to_str().unwrap();
 
         let mut audit = RecoveryAudit::open(root).await.unwrap();
-        // Empty repo: list returns empty.
+        // Empty graph: list returns empty.
         assert!(audit.list().await.unwrap().is_empty());
 
         // Append + list.

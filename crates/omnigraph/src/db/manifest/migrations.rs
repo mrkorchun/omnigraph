@@ -1,37 +1,43 @@
-//! Internal schema migrations for the `__manifest` Lance dataset.
+//! Internal schema versioning for the `__manifest` Lance dataset.
 //!
 //! ## Why this exists
 //!
-//! The on-disk shape of `__manifest` evolves alongside the engine. We do not
-//! want healing hooks scattered through every read/write path that ask
-//! "is this an old shape? am I supposed to upgrade it?" — that pattern
-//! accrues liability with every change. Instead this module is the *single*
-//! place where on-disk shape is reconciled with what the binary expects:
+//! The on-disk shape of `__manifest` evolves alongside the engine. This module
+//! is the *single* place where on-disk shape is reconciled with what the binary
+//! expects:
 //!
 //! - One constant `INTERNAL_MANIFEST_SCHEMA_VERSION` declares the shape this
 //!   binary writes.
 //! - One stamp `omnigraph:internal_schema_version` in the manifest dataset's
 //!   schema-level metadata records the on-disk shape.
-//! - One dispatcher `migrate_internal_schema` walks the on-disk stamp forward
-//!   to the expected version via `match`-arm steps. Each future change adds
-//!   one arm + one test, never a new branch in unrelated code paths.
+//! - One guard `refuse_if_stamp_unsupported` rejects any graph this binary
+//!   cannot serve — in either direction — with a clear, actionable error.
 //!
-//! After the dispatcher runs, the rest of the engine assumes current shape.
-//! No code outside this module should ever inspect the stamp.
+//! ## Single-version contract (strand + export/import)
 //!
-//! ## When it runs
+//! This binary reads exactly ONE internal-schema version (`MIN_SUPPORTED ==
+//! CURRENT`). There is no in-place migration: a graph stamped below CURRENT is
+//! refused on open with a "rebuild via `omnigraph export` + `init`/`load`"
+//! message, not silently upgraded. This is the deliberate pre-release contract —
+//! storage-format changes are a cutover, not a rolling in-place migration (see
+//! `docs/user/operations/upgrade.md` and the versioning policy in `docs/dev`).
+//! `stamp_current_version` stamps fresh graphs at CURRENT, so newly initialized
+//! graphs always pass.
 //!
-//! Only on open-for-write paths (the publisher's `load_publish_state`).
-//! Reads are side-effect-free by contract; an old-shape `__manifest` reads
-//! fine, it just lacks the protections introduced by later versions.
-//! `init_manifest_repo` stamps the current version at creation, so newly
-//! initialized repos never need migration.
+//! ## If an in-place migration is ever needed
+//!
+//! The stamp + `refuse_if_stamp_unsupported` are the seam a future migration
+//! would plug into: re-introduce a dispatcher that walks the stamp forward and
+//! lower `MIN_SUPPORTED` below CURRENT for exactly the versions it can upgrade.
+//! Until a concrete graph demands it, that machinery is unearned complexity and
+//! is deliberately absent. A future converter is best shaped as a standalone
+//! one-shot tool, not a framework baked into the open path.
 //!
 //! ## Forward-version protection
 //!
-//! A stamp *higher* than this binary's known version triggers a clear
-//! "upgrade omnigraph first" error. An old binary cannot clobber a newer
-//! schema by silently treating "unknown stamp" as "missing stamp".
+//! A stamp *higher* than this binary's version triggers a clear "upgrade
+//! omnigraph first" error. An old binary cannot clobber a newer schema by
+//! silently treating "unknown stamp" as "missing stamp".
 
 use lance::Dataset;
 
@@ -41,19 +47,54 @@ use crate::error::{OmniError, Result};
 ///
 /// History:
 /// - v1 — implicit (pre-stamp). `__manifest.object_id` carried no
-///   `lance-schema:unenforced-primary-key` annotation; the publisher had
-///   no row-level CAS protection (see `.context/merge-insert-cas-granularity.md`).
+///   `lance-schema:unenforced-primary-key` annotation.
 /// - v2 — `__manifest.object_id` carries the unenforced-PK annotation,
-///   engaging Lance's bloom-filter conflict resolver at commit time. Added
-///   alongside `expected_table_versions` OCC on `ManifestBatchPublisher::publish`.
-pub(super) const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 = 2;
+///   engaging Lance's bloom-filter conflict resolver at commit time.
+/// - v3 — one-time sweep of legacy `__run__<id>` staging branches left on the
+///   `__manifest` dataset by the pre-v0.4.0 Run state machine.
+/// - v4 — RFC-013 Phase 7 folds graph lineage into `__manifest` as
+///   `graph_commit`/`graph_head` rows written in the publish CAS (no
+///   `_graph_commits.lance`).
+///
+/// v1–v3 graphs are not served by this binary (see `MIN_SUPPORTED`); the history
+/// is kept for provenance and to document what each stamp value meant.
+pub(crate) const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 = 4;
+
+/// The oldest on-disk internal-schema stamp this binary will open. With no
+/// in-place migration, this equals `INTERNAL_MANIFEST_SCHEMA_VERSION`: a graph
+/// stamped below it is refused (`refuse_if_stamp_unsupported`) with a
+/// rebuild-via-export/import message rather than silently upgraded.
+///
+/// Lowering this below CURRENT only makes sense alongside a re-introduced
+/// migration dispatcher that can actually walk those versions forward (see the
+/// module doc).
+pub(crate) const MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION: u32 = INTERNAL_MANIFEST_SCHEMA_VERSION;
+
+/// The omnigraph release line that wrote a given internal-schema stamp. The
+/// open-refusal uses it to tell an operator exactly which binary to use to
+/// export a sub-CURRENT graph (the export side of the strand-model upgrade —
+/// see `docs/user/operations/upgrade.md`). Ranges are the release tags that
+/// stamped each version (verify with
+/// `git show vX.Y.Z:crates/omnigraph/src/db/manifest/migrations.rs`):
+/// v1 ≤ 0.3.1, v2 0.4.1–0.6.1, v3 0.6.2–0.7.2, v4 0.8.x.
+pub(crate) fn release_for_internal_schema_version(stamp: u32) -> &'static str {
+    match stamp {
+        1 => "0.3.1 or earlier",
+        2 => "0.4.1 to 0.6.1",
+        3 => "0.6.2 to 0.7.2",
+        4 => "0.8.x",
+        // Unreachable today (1–3 are mapped; ≥ CURRENT is caught by the ceiling
+        // guard before this is consulted). Worded to read naturally after
+        // "created by omnigraph " if a future bump ever leaves a gap.
+        _ => "an unrecognized older release",
+    }
+}
 
 const INTERNAL_SCHEMA_VERSION_KEY: &str = "omnigraph:internal_schema_version";
-const OBJECT_ID_PK_KEY: &str = "lance-schema:unenforced-primary-key";
 
 /// Read the on-disk stamp from `__manifest`'s schema-level metadata.
-/// Absent ⇒ v1 (pre-stamp world).
-pub(super) fn read_stamp(dataset: &Dataset) -> u32 {
+/// Absent ⇒ v1 (pre-stamp world), which is below `MIN_SUPPORTED` and so refused.
+pub(crate) fn read_stamp(dataset: &Dataset) -> u32 {
     dataset
         .schema()
         .metadata
@@ -68,64 +109,96 @@ pub(super) async fn stamp_current_version(dataset: &mut Dataset) -> Result<()> {
     set_stamp(dataset, INTERNAL_MANIFEST_SCHEMA_VERSION).await
 }
 
-/// Apply any pending internal-schema migrations to the manifest dataset.
+/// Refuse to open a manifest whose stamp this binary cannot serve — in either
+/// direction — with a clear, actionable path. Shared by every open path (the
+/// read-write open guard, the read-only open guard, and the publisher), so a new
+/// stamp-reading caller gets the floor and the ceiling together and cannot
+/// half-enforce.
 ///
-/// Idempotent: when the on-disk stamp matches the binary, this is a single
-/// metadata read with no writes.
-pub(super) async fn migrate_internal_schema(dataset: &mut Dataset) -> Result<()> {
-    let mut current = read_stamp(dataset);
-
-    if current > INTERNAL_MANIFEST_SCHEMA_VERSION {
+/// - `stamp > CURRENT`: the graph was written by a newer binary — upgrade omnigraph.
+/// - `stamp < MIN_SUPPORTED`: the graph was made by an older omnigraph whose
+///   storage format this binary does not read — rebuild it via export/import.
+pub(crate) fn refuse_if_stamp_unsupported(stamp: u32) -> Result<()> {
+    if stamp > INTERNAL_MANIFEST_SCHEMA_VERSION {
         return Err(OmniError::manifest(format!(
             "__manifest is stamped at internal schema v{} but this binary expects v{} \
-             — upgrade omnigraph before opening this repo for writes",
-            current, INTERNAL_MANIFEST_SCHEMA_VERSION,
+             — upgrade omnigraph before opening this graph",
+            stamp, INTERNAL_MANIFEST_SCHEMA_VERSION,
         )));
     }
-
-    while current < INTERNAL_MANIFEST_SCHEMA_VERSION {
-        match current {
-            1 => {
-                migrate_v1_to_v2(dataset).await?;
-                current = 2;
-            }
-            other => {
-                return Err(OmniError::manifest_internal(format!(
-                    "no internal-schema migration registered for v{} → v{}",
-                    other,
-                    other + 1,
-                )));
-            }
-        }
+    if stamp < MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION {
+        return Err(OmniError::manifest(format!(
+            "__manifest is stamped at internal schema v{stamp}, but this omnigraph reads only v{current}. \
+             This graph was created by omnigraph {release}. Rebuild it: with an omnigraph {release} binary run \
+             `omnigraph export <graph> > graph.jsonl`, then with this binary run \
+             `omnigraph init --schema <schema.pg> <new-graph>` and \
+             `omnigraph load --mode overwrite --data graph.jsonl <new-graph>`. \
+             (Data, vectors, and blobs are preserved; commit history and branches are not.) \
+             See docs/user/operations/upgrade.md.",
+            current = INTERNAL_MANIFEST_SCHEMA_VERSION,
+            release = release_for_internal_schema_version(stamp),
+        )));
     }
     Ok(())
-}
-
-/// v1 → v2: annotate `__manifest.object_id` as Lance's unenforced primary key
-/// so the merge-insert conflict resolver enforces row-level CAS at commit
-/// time, then bump the stamp.
-///
-/// Both steps are idempotent under retry: re-applying the field annotation
-/// at its current value is a no-op-ish bump in Lance, and the stamp is a
-/// simple key-value write. A crash between the two leaves the field set
-/// without a stamp; the next open re-runs this fn and only the stamp lands.
-async fn migrate_v1_to_v2(dataset: &mut Dataset) -> Result<()> {
-    dataset
-        .update_field_metadata()
-        .update("object_id", [(OBJECT_ID_PK_KEY.to_string(), "true".to_string())])
-        .map_err(|e| OmniError::Lance(e.to_string()))?
-        .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
-    set_stamp(dataset, 2).await
 }
 
 async fn set_stamp(dataset: &mut Dataset, version: u32) -> Result<()> {
     dataset
-        .update_schema_metadata([(
-            INTERNAL_SCHEMA_VERSION_KEY.to_string(),
-            version.to_string(),
-        )])
+        .update_schema_metadata([(INTERNAL_SCHEMA_VERSION_KEY.to_string(), version.to_string())])
         .await
         .map_err(|e| OmniError::Lance(e.to_string()))?;
     Ok(())
+}
+
+/// Test-only: force the on-disk internal-schema stamp to `version`. The minimal
+/// seam used to synthesize a sub-CURRENT graph and assert the open path refuses
+/// it. Its only caller is the in-source refusal test, so it is `cfg(test)`-only.
+#[cfg(test)]
+pub(crate) async fn set_stamp_for_test(dataset: &mut Dataset, version: u32) -> Result<()> {
+    set_stamp(dataset, version).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The guard accepts exactly the single served version and refuses anything
+    /// below the floor or above the ceiling. With `MIN == CURRENT == 4` the live
+    /// range is exactly `[4, 4]`.
+    #[test]
+    fn unsupported_guard_accepts_exactly_the_supported_range() {
+        for stamp in MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION..=INTERNAL_MANIFEST_SCHEMA_VERSION {
+            assert!(
+                refuse_if_stamp_unsupported(stamp).is_ok(),
+                "stamp v{stamp} is within [MIN, CURRENT] and must be accepted"
+            );
+        }
+        if MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION > 0 {
+            assert!(
+                refuse_if_stamp_unsupported(MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION - 1).is_err(),
+                "a sub-floor stamp must be refused"
+            );
+        }
+        assert!(
+            refuse_if_stamp_unsupported(INTERNAL_MANIFEST_SCHEMA_VERSION + 1).is_err(),
+            "a future stamp must be refused"
+        );
+    }
+
+    /// The refusal names the release line that wrote each stamp so an operator
+    /// knows which binary to use for the export step; unknown stamps fall back
+    /// without panicking.
+    #[test]
+    fn release_names_the_writing_line_for_each_stamp() {
+        assert_eq!(release_for_internal_schema_version(3), "0.6.2 to 0.7.2");
+        assert_eq!(release_for_internal_schema_version(4), "0.8.x");
+        assert_eq!(
+            release_for_internal_schema_version(99),
+            "an unrecognized older release"
+        );
+        // The sub-CURRENT refusal embeds the named release.
+        let err = refuse_if_stamp_unsupported(3).unwrap_err().to_string();
+        assert!(err.contains("0.6.2 to 0.7.2"), "got: {err}");
+        assert!(err.contains("omnigraph export"), "got: {err}");
+    }
 }

@@ -56,7 +56,7 @@ async fn composite_flow_canonical_lifecycle() {
     let uri = dir.path().to_str().unwrap();
 
     // ─────────────────────────────────────────────────────────────────
-    // Step 1: init a fresh repo with the standard test schema.
+    // Step 1: init a fresh graph with the standard test schema.
     // ─────────────────────────────────────────────────────────────────
     let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
     let v_init = version_branch(&db, "main").await.unwrap();
@@ -70,7 +70,9 @@ async fn composite_flow_canonical_lifecycle() {
     // Step 2: load JSONL seed data (Person + Company nodes,
     // Knows + WorksAt edges).
     // ─────────────────────────────────────────────────────────────────
-    load_jsonl(&mut db, TEST_DATA, LoadMode::Append).await.unwrap();
+    load_jsonl(&mut db, TEST_DATA, LoadMode::Append)
+        .await
+        .unwrap();
     let v_after_load = version_branch(&db, "main").await.unwrap();
     assert!(
         v_after_load > v_init,
@@ -119,19 +121,13 @@ async fn composite_flow_canonical_lifecycle() {
         "feature",
         MUTATION_QUERIES,
         "insert_person_and_friend",
-        &mixed_params(
-            &[("$name", "Frank"), ("$friend", "Eve")],
-            &[("$age", 33)],
-        ),
+        &mixed_params(&[("$name", "Frank"), ("$friend", "Eve")], &[("$age", 33)]),
     )
     .await
     .expect("multi-statement insert+edge on feature");
 
     // After: feature has 4 + Eve + Frank = 6 Persons.
-    let snap = db
-        .snapshot_of(ReadTarget::branch("feature"))
-        .await
-        .unwrap();
+    let snap = db.snapshot_of(ReadTarget::branch("feature")).await.unwrap();
     let person_ds = snap.open("node:Person").await.unwrap();
     assert_eq!(
         person_ds.count_rows(None).await.unwrap(),
@@ -298,21 +294,19 @@ async fn composite_flow_canonical_lifecycle() {
     );
 
     // ─────────────────────────────────────────────────────────────────
-    // Step 10: optimize the post-merge graph — verify indices stay
-    // valid and queryable.
+    // Step 10: optimize the post-merge graph — verify compaction is
+    // published to the manifest (so the manifest pin tracks the compacted
+    // Lance HEAD), indices stay valid and queryable, and a post-optimize
+    // strict write commits.
     //
-    // **Known limitation**: `optimize_all_tables` calls Lance
-    // `compact_files` directly — it advances per-table Lance HEAD
-    // without updating the omnigraph `__manifest` pin. After optimize,
-    // the next writer's expected_table_versions captures the
-    // pre-optimize manifest pin, but the publisher's pre-check reads
-    // a higher version from the manifest dataset (because some other
-    // path — possibly schema-state recovery on reopen — wrote a newer
-    // __manifest row). The `ExpectedVersionMismatch` is benign
-    // (re-issuing the mutation after a snapshot refresh succeeds), but
-    // a composite test cannot reliably exercise post-optimize mutations
-    // until that path is investigated. Coverage of post-optimize
-    // mutations is left to a focused optimize+cleanup integration test.
+    // This step used to carry a "Known limitation": `optimize_all_tables`
+    // ran Lance `compact_files` without publishing the new version to
+    // `__manifest`, so the manifest pin lagged the Lance HEAD and the next
+    // strict write / schema apply failed with `ExpectedVersionMismatch`
+    // ("stale view … refresh and retry") — so post-optimize mutations were
+    // deliberately omitted here. optimize now publishes the compacted
+    // version, and this flow exercises exactly that previously-failing
+    // write below.
     // ─────────────────────────────────────────────────────────────────
     let optimize_stats = db.optimize().await.unwrap();
     assert!(
@@ -321,14 +315,10 @@ async fn composite_flow_canonical_lifecycle() {
     );
 
     // Re-run a query to verify post-optimize correctness.
-    let post_optimize_total = query_main(
-        &mut db,
-        TEST_QUERIES,
-        "total_people",
-        &ParamMap::default(),
-    )
-    .await
-    .unwrap();
+    let post_optimize_total =
+        query_main(&mut db, TEST_QUERIES, "total_people", &ParamMap::default())
+            .await
+            .unwrap();
     assert!(
         !post_optimize_total.batches().is_empty(),
         "queries must still work after optimize"
@@ -337,6 +327,28 @@ async fn composite_flow_canonical_lifecycle() {
         count_rows(&db, "node:Person").await,
         6,
         "row counts unchanged by optimize"
+    );
+
+    // A strict update on a compacted table is exactly the write that
+    // failed with "stale view" before optimize published its compaction.
+    // It must now commit (Alice is one of the seed Persons; an update
+    // leaves the row count at 6).
+    let post_optimize_update = mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "set_age",
+        &mixed_params(&[("$name", "Alice")], &[("$age", 41)]),
+    )
+    .await
+    .expect("post-optimize strict update must commit — optimize published the manifest");
+    assert_eq!(
+        post_optimize_update.affected_nodes, 1,
+        "post-optimize update must affect exactly Alice"
+    );
+    assert_eq!(
+        count_rows(&db, "node:Person").await,
+        6,
+        "an update must not change the Person row count"
     );
 
     // ─────────────────────────────────────────────────────────────────
@@ -381,19 +393,160 @@ async fn composite_flow_canonical_lifecycle() {
         branches,
     );
 
-    // Final query exercise — full read path works post-reopen,
-    // post-cleanup. Post-cleanup mutation is omitted here pending
-    // resolution of the optimize-vs-manifest-pin interaction documented
-    // in Step 10.
-    let final_total = query_main(
+    // Final exercise — full read AND write path works post-reopen,
+    // post-cleanup. (The post-cleanup mutation was previously omitted
+    // pending resolution of the optimize-vs-manifest-pin interaction in
+    // Step 10; that is now fixed, so a strict write here must commit.)
+    let final_total = query_main(&mut db, TEST_QUERIES, "total_people", &ParamMap::default())
+        .await
+        .unwrap();
+    assert!(!final_total.batches().is_empty());
+
+    let post_reopen_update = mutate_main(
         &mut db,
-        TEST_QUERIES,
-        "total_people",
-        &ParamMap::default(),
+        MUTATION_QUERIES,
+        "set_age",
+        &mixed_params(&[("$name", "Alice")], &[("$age", 42)]),
     )
     .await
-    .unwrap();
-    assert!(!final_total.batches().is_empty());
+    .expect("post-reopen, post-cleanup strict update must commit");
+    assert_eq!(
+        post_reopen_update.affected_nodes, 1,
+        "post-reopen update must affect exactly Alice"
+    );
+}
+
+/// Cross-handle sequence that exercises operations after a schema_apply
+/// invalidates a peer handle's cached `_schema.pg`. The narrow load-bearing
+/// pin is that `Omnigraph::refresh()` must not deadlock when its
+/// `reload_schema_if_source_changed()` step needs to acquire a read on the
+/// coordinator's `RwLock`. The broader sequencing — schema_apply →
+/// branch_create → branch_delete → branch_merge → mutate (using the new
+/// schema's added property) → reopen — pins that the fix doesn't regress
+/// any of the related call sites.
+///
+/// Pre-fix bug class: `Omnigraph::refresh()` held
+/// `coordinator.write().await` from start to finish, including across the
+/// `self.reload_schema_if_source_changed()` call. That helper's
+/// `self.coordinator.read().await` (only reached when the on-disk schema
+/// source differs from the in-memory cache) deadlocks against the outer
+/// write guard because tokio's `RwLock` is not reentrant. Reachable from
+/// every public refresh-using API: `branch_delete` (`omnigraph.rs:910`),
+/// `branch_merge` (post-merge refresh on bound target), and any caller
+/// that calls `Omnigraph::refresh` directly.
+///
+/// The cross-handle setup is the realistic trigger: handle A applies a
+/// schema, advancing `_schema.pg` on disk; handle B has stale in-memory
+/// schema_source. B's next `refresh()` (via branch_delete here) hits the
+/// read-after-write reload path. Single-handle is unreachable because
+/// `apply_schema` updates the local ArcSwap cache in-line.
+///
+/// Post-fix invariant: `refresh()` scopes its write guard to the recovery
+/// section only, releasing it before `reload_schema_if_source_changed()`.
+/// The reload's read acquisition is uncontested.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn composite_flow_schema_apply_then_branch_ops_no_deadlock_in_refresh() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+
+    // Step 1: init + load on handle A.
+    let mut db_a = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    load_jsonl(&mut db_a, TEST_DATA, LoadMode::Append)
+        .await
+        .unwrap();
+    assert_eq!(count_rows(&db_a, "node:Person").await, 4);
+
+    // Step 2: open handle B on the same graph. B's in-memory schema_source
+    // cache is now a snapshot of `_schema.pg` at open time.
+    let db_b = Omnigraph::open(uri).await.unwrap();
+
+    // Step 3: A applies a schema that adds a nullable property to Person.
+    // A's on-disk `_schema.pg` is rewritten; A's in-memory cache is updated
+    // in-line by `apply_schema`. B's in-memory cache is now STALE relative
+    // to disk.
+    const TEST_SCHEMA_V2: &str = "node Person {\n    name: String @key\n    age: I32?\n    nickname: String?\n}\n\nnode Company {\n    name: String @key\n}\n\nedge Knows: Person -> Person {\n    since: Date?\n}\n\nedge WorksAt: Person -> Company\n";
+    let plan = db_a.apply_schema(TEST_SCHEMA_V2).await.unwrap();
+    assert!(plan.applied, "apply_schema must succeed on a clean graph");
+    assert!(
+        !plan.steps.is_empty(),
+        "apply_schema must record the AddProperty step"
+    );
+
+    // Step 4: deadlock vector. B.branch_delete calls B.refresh() internally
+    // (omnigraph.rs:910). refresh() pre-fix holds the coord write guard
+    // across reload_schema_if_source_changed; with B's cache stale, that
+    // helper takes the not-early-return branch and tries
+    // self.coordinator.read().await — deadlocks against the outer write.
+    //
+    // Wrap in tokio::time::timeout so a deadlock surfaces as a clean test
+    // panic instead of a stuck CI job. 15s is well above natural completion
+    // on local FS (sub-second under normal conditions).
+    db_b.branch_create("post-schema-apply-test").await.unwrap();
+    let delete_result = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        db_b.branch_delete("post-schema-apply-test"),
+    )
+    .await;
+    assert!(
+        delete_result.is_ok(),
+        "branch_delete deadlocked in refresh() with stale schema cache. \
+         Pre-fix symptom: Omnigraph::refresh() holds coordinator.write().await \
+         across reload_schema_if_source_changed(), which acquires \
+         coordinator.read().await on the same non-reentrant RwLock when the \
+         on-disk schema source differs from the in-memory cache.",
+    );
+    delete_result
+        .unwrap()
+        .expect("branch_delete must succeed once refresh() releases its write guard");
+
+    // Step 5: continuing operations on B post-refresh — verify the broader
+    // sequence works. B's catalog should now reflect the new schema (the
+    // refresh path includes reload_schema_if_source_changed which calls
+    // store_catalog).
+    db_b.branch_create("feature-after-apply").await.unwrap();
+
+    // Step 6: branch_merge from B exercises the post-merge refresh() path
+    // (merge.rs:1100-1107) — same deadlock surface as branch_delete,
+    // sanity-pinned by reusing the same handle whose cache was just
+    // refreshed.
+    let _outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        db_b.branch_merge("feature-after-apply", "main"),
+    )
+    .await
+    .expect("branch_merge deadlocked in refresh() post-schema-apply")
+    .expect("branch_merge must succeed");
+
+    // Step 7: mutation on main using the new schema's added property —
+    // verifies the catalog reload completed and the engine accepts a
+    // mutation referencing `nickname`.
+    const NICKNAME_QUERY: &str = "query set_nickname($name: String, $nickname: String) {\n    update Person set { nickname: $nickname } where name = $name\n}";
+    db_b.mutate_as(
+        "main",
+        NICKNAME_QUERY,
+        "set_nickname",
+        &mixed_params(&[("$name", "Alice"), ("$nickname", "Ali")], &[]),
+        None,
+    )
+    .await
+    .expect("update using post-apply schema property must succeed");
+
+    // Step 8: reopen — final integration check that the post-deadlock-fix
+    // state persists across handle drop/open.
+    drop(db_a);
+    drop(db_b);
+    let db_c = Omnigraph::open(uri).await.unwrap();
+    assert_eq!(
+        count_rows(&db_c, "node:Person").await,
+        4,
+        "Person count consistent across reopen post-schema-apply",
+    );
+    let branches = db_c.branch_list().await.unwrap();
+    assert!(
+        !branches.iter().any(|b| b == "post-schema-apply-test"),
+        "deleted branch must stay deleted across reopen; got {:?}",
+        branches,
+    );
 }
 
 /// Multi-branch sequential merges with main writes interleaved between
@@ -430,7 +583,9 @@ async fn composite_flow_multi_branch_sequential_merges() {
     // edges from test.jsonl).
     // ─────────────────────────────────────────────────────────────────
     let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-    load_jsonl(&mut db, TEST_DATA, LoadMode::Append).await.unwrap();
+    load_jsonl(&mut db, TEST_DATA, LoadMode::Append)
+        .await
+        .unwrap();
     assert_eq!(count_rows(&db, "node:Person").await, 4);
     assert_eq!(count_rows(&db, "edge:Knows").await, 3);
 
@@ -556,10 +711,7 @@ async fn composite_flow_multi_branch_sequential_merges() {
         "feat-a",
         MUTATION_QUERIES,
         "insert_person_and_friend",
-        &mixed_params(
-            &[("$name", "Grace"), ("$friend", "Eve")],
-            &[("$age", 28)],
-        ),
+        &mixed_params(&[("$name", "Grace"), ("$friend", "Eve")], &[("$age", 28)]),
     )
     .await
     .expect("insert Grace + Knows(Grace → Eve) on feat-a");
@@ -690,15 +842,14 @@ async fn composite_flow_multi_branch_sequential_merges() {
     // `total_people` returns count(Person) = 10. Catches regressions in
     // group-by/count execution against a multi-fragment table whose
     // current shape was produced by two sequential merges.
-    let total_post_merges = query_main(
-        &mut db,
-        TEST_QUERIES,
-        "total_people",
-        &ParamMap::default(),
-    )
-    .await
-    .unwrap();
-    assert_total(&total_post_merges, 10, "post both merges, main must total 10 Persons");
+    let total_post_merges = query_main(&mut db, TEST_QUERIES, "total_people", &ParamMap::default())
+        .await
+        .unwrap();
+    assert_total(
+        &total_post_merges,
+        10,
+        "post both merges, main must total 10 Persons",
+    );
 
     // ─────────────────────────────────────────────────────────────────
     // Step 14: time-travel to pre-merge-a-version. Reads must return
@@ -890,14 +1041,9 @@ async fn composite_flow_multi_branch_sequential_merges() {
     // correctly to disk but the reopened catalog can't bind them.
     // ─────────────────────────────────────────────────────────────────
     let mut db = db;
-    let post_reopen_total = query_main(
-        &mut db,
-        TEST_QUERIES,
-        "total_people",
-        &ParamMap::default(),
-    )
-    .await
-    .unwrap();
+    let post_reopen_total = query_main(&mut db, TEST_QUERIES, "total_people", &ParamMap::default())
+        .await
+        .unwrap();
     assert_total(
         &post_reopen_total,
         10,

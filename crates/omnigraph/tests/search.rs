@@ -3,7 +3,8 @@ mod helpers;
 use std::env;
 
 use arrow_array::{Array, StringArray};
-use lance_index::{DatasetIndexExt, is_system_index};
+use lance::index::DatasetIndexExt;
+use lance_index::is_system_index;
 use serial_test::serial;
 
 use omnigraph::db::Omnigraph;
@@ -59,6 +60,15 @@ query hybrid_search_string($vq: String, $tq: String) {
     limit 3
 }
 "#;
+// Same shape as MOCK_SEARCH_SCHEMA but the vector records the model that
+// produced its stored vectors, opting into the query-time same-space check.
+const MODEL_RECORDED_SCHEMA: &str = r#"
+node Doc {
+    slug: String @key
+    title: String @index
+    embedding: Vector(4) @embed("title", model="test-model-a") @index
+}
+"#;
 const SEARCH_MUTATIONS: &str = r#"
 query insert_doc($slug: String, $title: String, $body: String, $embedding: Vector(4)) {
     insert Doc {
@@ -82,6 +92,15 @@ async fn init_search_db(dir: &tempfile::TempDir) -> Omnigraph {
 async fn init_mock_embedding_search_db(dir: &tempfile::TempDir) -> Omnigraph {
     let uri = dir.path().to_str().unwrap();
     let mut db = Omnigraph::init(uri, MOCK_SEARCH_SCHEMA).await.unwrap();
+    load_jsonl(&mut db, &mock_embedding_seed_data(), LoadMode::Overwrite)
+        .await
+        .unwrap();
+    db
+}
+
+async fn init_model_recorded_search_db(dir: &tempfile::TempDir) -> Omnigraph {
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, MODEL_RECORDED_SCHEMA).await.unwrap();
     load_jsonl(&mut db, &mock_embedding_seed_data(), LoadMode::Overwrite)
         .await
         .unwrap();
@@ -368,6 +387,75 @@ async fn phrase_search_is_documented_fts_fallback() {
 
 // ─── Vector search (nearest) ────────────────────────────────────────────────
 
+/// iss-nearest-postfilter-starves-results: a scalar `match` predicate combined
+/// with `nearest` must return the top-k of the MATCHING rows. Lance's default
+/// is post-filtering (filter applied AFTER the ANN top-k), under which this
+/// fixture — where every filter-matching doc sits far from the query vector,
+/// so the global top-k is entirely non-matching — returns 0 rows despite 3
+/// matches existing. The engine must set prefilter(true) whenever a filter
+/// rides the same scanner as a search.
+#[tokio::test]
+#[serial]
+async fn filtered_nearest_returns_matching_rows_not_postfiltered_topk() {
+    const SCHEMA: &str = r#"
+node Doc {
+    slug: String @key
+    status: String
+    embedding: Vector(4)
+}
+"#;
+    // Query vector is +e1. The three status="miss" docs cluster around +e1
+    // (global top-3); the three status="hit" docs cluster around -e1.
+    const DATA: &str = r#"{"type":"Doc","data":{"slug":"miss-1","status":"miss","embedding":[1.0,0.01,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"miss-2","status":"miss","embedding":[1.0,0.0,0.02,0.0]}}
+{"type":"Doc","data":{"slug":"miss-3","status":"miss","embedding":[1.0,0.0,0.0,0.03]}}
+{"type":"Doc","data":{"slug":"hit-1","status":"hit","embedding":[-1.0,0.01,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"hit-2","status":"hit","embedding":[-1.0,0.0,0.02,0.0]}}
+{"type":"Doc","data":{"slug":"hit-3","status":"hit","embedding":[-1.0,0.0,0.0,0.03]}}
+"#;
+    const QUERIES: &str = r#"
+query filtered_nearest($q: Vector(4)) {
+    match { $d: Doc { status: "hit" } }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 3
+}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, SCHEMA).await.unwrap();
+    load_jsonl(&mut db, DATA, LoadMode::Overwrite).await.unwrap();
+
+    let result = query_main(
+        &mut db,
+        QUERIES,
+        "filtered_nearest",
+        &vector_param("$q", &[1.0, 0.0, 0.0, 0.0]),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        result.num_rows(),
+        3,
+        "filtered nearest must return the top-k of MATCHING rows (3 hits exist), \
+         not the post-filtered remainder of the global top-k"
+    );
+    let batch = result.concat_batches().unwrap();
+    let slugs = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    for i in 0..slugs.len() {
+        assert!(
+            slugs.value(i).starts_with("hit-"),
+            "only matching docs may appear, got {}",
+            slugs.value(i)
+        );
+    }
+}
+
 #[tokio::test]
 #[serial]
 async fn nearest_returns_k_closest() {
@@ -509,9 +597,14 @@ async fn explicit_vector_nearest_does_not_require_gemini_credentials() {
 
 #[tokio::test]
 #[serial]
-async fn string_nearest_requires_gemini_credentials_when_mock_is_disabled() {
+async fn string_nearest_requires_provider_credentials_when_mock_is_disabled() {
+    // With mock off and no provider key, the default (openai-compatible)
+    // provider fails loudly rather than silently producing garbage vectors.
     let _guard = EnvGuard::set(&[
         ("OMNIGRAPH_EMBEDDINGS_MOCK", None),
+        ("OMNIGRAPH_EMBED_PROVIDER", None),
+        ("OPENROUTER_API_KEY", None),
+        ("OPENAI_API_KEY", None),
         ("GEMINI_API_KEY", None),
     ]);
 
@@ -527,7 +620,105 @@ async fn string_nearest_requires_gemini_credentials_when_mock_is_disabled() {
     .await
     .unwrap_err();
 
-    assert!(err.to_string().contains("GEMINI_API_KEY"));
+    assert!(
+        err.to_string()
+            .contains("OPENROUTER_API_KEY or OPENAI_API_KEY"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn nearest_string_passes_when_query_model_matches_recorded_model() {
+    let _guard = EnvGuard::set(&[
+        ("OMNIGRAPH_EMBEDDINGS_MOCK", Some("1")),
+        ("OMNIGRAPH_EMBED_MODEL", Some("test-model-a")),
+        ("OMNIGRAPH_EMBED_PROVIDER", None),
+        ("OPENROUTER_API_KEY", None),
+        ("OPENAI_API_KEY", None),
+        ("GEMINI_API_KEY", None),
+    ]);
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_model_recorded_search_db(&dir).await;
+
+    let result = query_main(
+        &mut db,
+        MOCK_SEARCH_QUERIES,
+        "vector_search_string",
+        &params(&[("$q", "alpha")]),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result_slugs(&result)[0], "alpha-doc");
+}
+
+#[tokio::test]
+#[serial]
+async fn nearest_string_errors_when_query_model_differs_from_recorded_model() {
+    let _guard = EnvGuard::set(&[
+        ("OMNIGRAPH_EMBEDDINGS_MOCK", Some("1")),
+        ("OMNIGRAPH_EMBED_MODEL", Some("test-model-b")),
+        ("OMNIGRAPH_EMBED_PROVIDER", None),
+        ("OPENROUTER_API_KEY", None),
+        ("OPENAI_API_KEY", None),
+        ("GEMINI_API_KEY", None),
+    ]);
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_model_recorded_search_db(&dir).await;
+
+    let err = query_main(
+        &mut db,
+        MOCK_SEARCH_QUERIES,
+        "vector_search_string",
+        &params(&[("$q", "alpha")]),
+    )
+    .await
+    .unwrap_err();
+
+    // The error must name both the recorded model and the resolved one.
+    let msg = err.to_string();
+    assert!(msg.contains("test-model-a"), "got: {msg}");
+    assert!(msg.contains("test-model-b"), "got: {msg}");
+}
+
+#[tokio::test]
+#[serial]
+async fn injected_embedding_config_is_used_instead_of_env() {
+    // No mock flag and no provider keys in env, so `from_env()` would error.
+    // Injecting a Mock config proves the resolver uses the injected config
+    // (RFC-012 Phase 5), and its model satisfies the recorded same-space check.
+    let _guard = EnvGuard::set(&[
+        ("OMNIGRAPH_EMBEDDINGS_MOCK", None),
+        ("OMNIGRAPH_EMBED_PROVIDER", None),
+        ("OMNIGRAPH_EMBED_MODEL", None),
+        ("OPENROUTER_API_KEY", None),
+        ("OPENAI_API_KEY", None),
+        ("GEMINI_API_KEY", None),
+    ]);
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_model_recorded_search_db(&dir)
+        .await
+        .with_embedding_config(std::sync::Arc::new(omnigraph::embedding::EmbeddingConfig {
+            provider: omnigraph::embedding::Provider::Mock,
+            model: "test-model-a".to_string(),
+            base_url: String::new(),
+            api_key: String::new(),
+        }));
+
+    let result = query_main(
+        &mut db,
+        MOCK_SEARCH_QUERIES,
+        "vector_search_string",
+        &params(&[("$q", "alpha")]),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result_slugs(&result)[0], "alpha-doc");
 }
 
 // ─── BM25 search ────────────────────────────────────────────────────────────
@@ -553,6 +744,111 @@ async fn bm25_returns_ranked_results() {
         "bm25 should return results for 'Learning'"
     );
     assert!(result.num_rows() <= 3, "bm25 should respect limit 3");
+}
+
+// Full rank-ORDER golden (not just top-1 / non-empty): pins ranks 2..k so a
+// regression corrupting the tail or reversing the sort direction fails loudly.
+// nearest skips apply_ordering (is_search_ordered) and returns Lance native
+// order, so result_slugs row order == rank order.
+#[tokio::test]
+#[serial]
+async fn nearest_full_rank_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_search_db(&dir).await;
+    let result = query_main(
+        &mut db,
+        SEARCH_QUERIES,
+        "vector_search",
+        &vector_param("$q", &[0.1, 0.2, 0.3, 0.4]),
+    )
+    .await
+    .unwrap();
+    // [0.1,0.2,0.3,0.4] == ml-intro's embedding (dist 0); the rest by ascending L2.
+    assert_eq!(result_slugs(&result), vec!["ml-intro", "nlp-guide", "rl-intro"]);
+}
+
+#[tokio::test]
+#[serial]
+async fn bm25_full_rank_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_search_db(&dir).await;
+    let result = query_main(
+        &mut db,
+        SEARCH_QUERIES,
+        "bm25_search",
+        &params(&[("$q", "Learning")]),
+    )
+    .await
+    .unwrap();
+    // Descending BM25 score order.
+    assert_eq!(result_slugs(&result), vec!["rl-intro", "ml-intro", "dl-basics"]);
+}
+
+// Characterization: fuzzy() does NOT match under the default tokenizer/index in
+// this setup — a one-edit typo ("Introductio" for "Introduction") returns no
+// rows. (`search`/`match_text` DO work, so FTS itself is fine; fuzzy term
+// queries specifically are inert here.) This pins that documented limitation
+// instead of leaving fuzzy silently unasserted: if a Lance/tokenizer change
+// makes fuzzy match, this turns red and should be promoted to a real
+// matched-set + exclusion golden.
+#[tokio::test]
+#[serial]
+async fn fuzzy_does_not_match_under_default_tokenizer() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_search_db(&dir).await;
+    let r = query_main(&mut db, SEARCH_QUERIES, "fuzzy_search", &params(&[("$q", "Introductio")]))
+        .await
+        .unwrap();
+    assert!(
+        result_slugs(&r).is_empty(),
+        "fuzzy now matches — promote this to a real matched-set/exclusion golden"
+    );
+}
+
+// match_text is a FILTER on the body: assert the exact matched set, not contains.
+#[tokio::test]
+#[serial]
+async fn match_text_matches_exact_set_excludes_unrelated() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_search_db(&dir).await;
+    // "neural" appears only in dl-basics's body ("neural networks").
+    let r = query_main(&mut db, SEARCH_QUERIES, "phrase_search", &params(&[("$q", "neural")]))
+        .await
+        .unwrap();
+    let mut got = result_slugs(&r);
+    got.sort();
+    assert_eq!(got, vec!["dl-basics"]);
+}
+
+// RRF fuses arms OTHER than the default nearest+bm25: two FTS arms (title+body).
+// Proves primary_var resolves when neither arm is `nearest`, and fusion runs.
+#[tokio::test]
+#[serial]
+async fn rrf_fuses_two_fts_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_search_db(&dir).await;
+    let r = query_main(&mut db, SEARCH_QUERIES, "rrf_two_fts", &params(&[("$q", "learning")]))
+        .await
+        .unwrap();
+    assert_eq!(result_slugs(&r), vec!["dl-basics", "ml-intro", "rl-intro"]);
+}
+
+// RRF fuses two vector arms (no embedding creds — explicit vectors). A doc near
+// BOTH query vectors out-ranks one near only one.
+#[tokio::test]
+#[serial]
+async fn rrf_fuses_two_vector_queries() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_search_db(&dir).await;
+    let r = query_main(
+        &mut db,
+        SEARCH_QUERIES,
+        "rrf_two_vectors",
+        &two_vector_params("$q1", &[0.1, 0.2, 0.3, 0.4], "$q2", &[0.5, 0.6, 0.7, 0.8]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result_slugs(&r), vec!["rl-intro", "ml-intro", "dl-basics"]);
 }
 
 #[tokio::test]

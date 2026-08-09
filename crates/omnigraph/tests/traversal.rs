@@ -8,6 +8,140 @@ use omnigraph_compiler::ir::ParamMap;
 
 use helpers::*;
 
+// ─── Undirected traversal (`$a <edge> $b`, Direction::Both) ─────────────────
+//
+// iss-gq-undirected-traversal: the CSR arm unions csr+csc under the existing
+// per-source dedup gates; pairs present in both directions and self-loops
+// appear once. Fixture Knows edges: Alice->Bob, Alice->Charlie, Bob->Diana.
+
+#[tokio::test]
+async fn undirected_one_hop_unions_out_and_in_neighbors() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    let queries = r#"
+query connected($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p <knows> $f
+    }
+    return { $f.name }
+}
+query connected_directional($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p knows $f
+    }
+    return { $f.name }
+}
+"#;
+    // Directional from Bob misses the incoming Alice->Bob edge — the
+    // motivating dashboard bug.
+    let directional = query_main(
+        &mut db,
+        queries,
+        "connected_directional",
+        &params(&[("$name", "Bob")]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        first_column_sorted(&directional),
+        vec!["Diana"],
+        "directional sees only outgoing"
+    );
+
+    let undirected = query_main(&mut db, queries, "connected", &params(&[("$name", "Bob")]))
+        .await
+        .unwrap();
+    assert_eq!(
+        first_column_sorted(&undirected),
+        vec!["Alice", "Diana"],
+        "undirected sees out ∪ in"
+    );
+
+    // Dedup: add the reverse edge Diana->Bob so (Bob, Diana) exists both
+    // ways; Diana must still appear exactly once.
+    load_jsonl(
+        &mut db,
+        r#"{"edge": "Knows", "from": "Diana", "to": "Bob"}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    let deduped = query_main(&mut db, queries, "connected", &params(&[("$name", "Bob")]))
+        .await
+        .unwrap();
+    assert_eq!(
+        first_column_sorted(&deduped),
+        vec!["Alice", "Diana"],
+        "a pair connected in both directions appears once (set semantics)"
+    );
+}
+
+#[tokio::test]
+async fn undirected_variable_hops() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    let queries = r#"
+query reach_both($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p <knows>{1,2} $f
+    }
+    return { $f.name }
+}
+"#;
+    // Charlie's only edge is INCOMING (Alice->Charlie). Undirected: hop 1
+    // reaches Alice; hop 2 from Alice reaches Bob (out) — Charlie itself is
+    // the visited source, never re-emitted.
+    let result = query_main(&mut db, queries, "reach_both", &params(&[("$name", "Charlie")]))
+        .await
+        .unwrap();
+    assert_eq!(
+        first_column_sorted(&result),
+        vec!["Alice", "Bob"],
+        "undirected 2-hop frontier from a node with only incoming edges"
+    );
+}
+
+#[tokio::test]
+async fn undirected_anti_join_excludes_both_directions() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    let queries = r#"
+query isolated() {
+    match {
+        $p: Person
+        not { $p <knows> $x }
+    }
+    return { $p.name }
+}
+query no_outgoing() {
+    match {
+        $p: Person
+        not { $p knows $x }
+    }
+    return { $p.name }
+}
+"#;
+    // Directional `not`: keeps people with no OUTGOING edge — Charlie and
+    // Diana (both have only incoming).
+    let directional = query_main(&mut db, queries, "no_outgoing", &ParamMap::new())
+        .await
+        .unwrap();
+    assert_eq!(first_column_sorted(&directional), vec!["Charlie", "Diana"]);
+
+    // Undirected `not`: no edge in EITHER direction — every fixture person
+    // has at least one, so the result is empty.
+    let undirected = query_main(&mut db, queries, "isolated", &ParamMap::new())
+        .await
+        .unwrap();
+    assert_eq!(undirected.num_rows(), 0, "everyone touches a Knows edge");
+}
+
 // ─── Anti-join slow path (predicated negation) ──────────────────────────────
 
 #[tokio::test]
@@ -44,6 +178,194 @@ query not_at_acme() {
     let mut names_vec: Vec<&str> = (0..names.len()).map(|i| names.value(i)).collect();
     names_vec.sort();
     assert_eq!(names_vec, vec!["Bob", "Charlie", "Diana"]);
+}
+
+// Nested anti-join (double negation): proves `not { … not { … } }` recurses
+// through execute_pipeline. "People who do NOT work at any NON-Acme company":
+// inner `not { $c.name = "Acme" }` keeps the non-Acme employers, the outer `not`
+// removes anyone who has one. Alice (Acme only), Charlie & Diana (no employer)
+// remain — distinct from plain unemployed {Charlie, Diana}.
+#[tokio::test]
+async fn nested_anti_join_double_negation() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    let queries = r#"
+query no_nonacme_employer() {
+    match {
+        $p: Person
+        not {
+            $p worksAt $c
+            not {
+                $c.name = "Acme"
+            }
+        }
+    }
+    return { $p.name }
+}
+"#;
+    let result = query_main(&mut db, queries, "no_nonacme_employer", &ParamMap::new())
+        .await
+        .unwrap();
+
+    let batch = result.concat_batches().unwrap();
+    let names = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let mut names_vec: Vec<&str> = (0..names.len()).map(|i| names.value(i)).collect();
+    names_vec.sort();
+    assert_eq!(names_vec, vec!["Alice", "Charlie", "Diana"]);
+}
+
+// The anti-join has two execution forks: the CSR `has_neighbors` fast path
+// (bare single-op Expand inner) and the set-oriented inner-pipeline replay (when
+// dst_filters force a multi-op inner). They must agree. `not { $p worksAt $_ }`
+// takes the fast path; the same negation with an always-true dst filter
+// (`$c.name != ""`) is semantically identical but forces the slow path.
+#[tokio::test]
+async fn anti_join_fast_and_slow_paths_agree() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    let queries = r#"
+query fast() {
+    match {
+        $p: Person
+        not { $p worksAt $_ }
+    }
+    return { $p.name }
+}
+query slow() {
+    match {
+        $p: Person
+        not {
+            $p worksAt $c
+            $c.name != ""
+        }
+    }
+    return { $p.name }
+}
+"#;
+    let names = |result: omnigraph_compiler::result::QueryResult| {
+        let batch = result.concat_batches().unwrap();
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let mut v: Vec<String> = (0..col.len()).map(|i| col.value(i).to_string()).collect();
+        v.sort();
+        v
+    };
+
+    let fast = names(query_main(&mut db, queries, "fast", &ParamMap::new()).await.unwrap());
+    let slow = names(query_main(&mut db, queries, "slow", &ParamMap::new()).await.unwrap());
+
+    assert_eq!(fast, slow, "anti-join fast and slow paths must agree");
+    // Alice->Acme, Bob->Globex employed; Charlie & Diana have no employer.
+    assert_eq!(fast, vec!["Charlie", "Diana"]);
+}
+
+// Regression: nested slow-path anti-joins must not collide on the synthetic
+// correlation tag. The outer anti-join tags rows with a correlation column that
+// rides through its inner pipeline; when the inner pipeline contains ANOTHER
+// slow-path anti-join, a fixed tag name would duplicate, and reading it by name
+// returns the OUTER tag — mis-correlating the inner negation. Fan-out (p1 works
+// at two companies) makes the inner row indices diverge from the outer tags, so
+// the bug produces a different person set than the correct one.
+#[tokio::test]
+async fn nested_anti_join_with_fanout_correlates_correctly() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    // p1 -> {Acme, Globex} (fan-out), p2 -> Globex, p3 -> Acme, p4 -> (none).
+    let data = r#"{"type":"Person","data":{"name":"p1"}}
+{"type":"Person","data":{"name":"p2"}}
+{"type":"Person","data":{"name":"p3"}}
+{"type":"Person","data":{"name":"p4"}}
+{"type":"Company","data":{"name":"Acme"}}
+{"type":"Company","data":{"name":"Globex"}}
+{"edge":"WorksAt","from":"p1","to":"Acme"}
+{"edge":"WorksAt","from":"p1","to":"Globex"}
+{"edge":"WorksAt","from":"p2","to":"Globex"}
+{"edge":"WorksAt","from":"p3","to":"Acme"}"#;
+    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    load_jsonl(&mut db, data, LoadMode::Overwrite).await.unwrap();
+
+    let queries = r#"
+query no_nonacme_employer() {
+    match {
+        $p: Person
+        not {
+            $p worksAt $c
+            not {
+                $c.name = "Acme"
+            }
+        }
+    }
+    return { $p.name }
+}
+"#;
+    let result = query_main(&mut db, queries, "no_nonacme_employer", &ParamMap::new())
+        .await
+        .unwrap();
+    let batch = result.concat_batches().unwrap();
+    let names = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let mut names_vec: Vec<&str> = (0..names.len()).map(|i| names.value(i)).collect();
+    names_vec.sort();
+    // p1 & p2 have a non-Acme employer (Globex) -> excluded; p3 (Acme only) and
+    // p4 (no employer) remain.
+    assert_eq!(names_vec, vec!["p3", "p4"]);
+}
+
+// Regression: a multi-hop anti-join must not take the bulk fast path. The fast
+// path answers via `has_neighbors` (ONE-hop existence), so `not { $p knows{2,2}
+// $x }` would wrongly drop a node that has a 1-hop neighbor but no 2-hop path.
+// Graph: a->b (b is a sink, so a has no 2-hop path), c->d->e (c has a 2-hop
+// path). Only c has a 2-hop knows path, so only c is removed.
+#[tokio::test]
+async fn anti_join_respects_multi_hop_bounds() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let data = r#"{"type":"Person","data":{"name":"a"}}
+{"type":"Person","data":{"name":"b"}}
+{"type":"Person","data":{"name":"c"}}
+{"type":"Person","data":{"name":"d"}}
+{"type":"Person","data":{"name":"e"}}
+{"edge":"Knows","from":"a","to":"b"}
+{"edge":"Knows","from":"c","to":"d"}
+{"edge":"Knows","from":"d","to":"e"}"#;
+    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    load_jsonl(&mut db, data, LoadMode::Overwrite).await.unwrap();
+
+    let queries = r#"
+query no_two_hop() {
+    match {
+        $p: Person
+        not { $p knows{2,2} $x }
+    }
+    return { $p.name }
+}
+"#;
+    let result = query_main(&mut db, queries, "no_two_hop", &ParamMap::new())
+        .await
+        .unwrap();
+    let batch = result.concat_batches().unwrap();
+    let names = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let mut names_vec: Vec<&str> = (0..names.len()).map(|i| names.value(i)).collect();
+    names_vec.sort();
+    // Only c has a 2-hop knows path → removed; everyone else (incl. a, which has
+    // a 1-hop neighbor but no 2-hop path) is kept.
+    assert_eq!(names_vec, vec!["a", "b", "d", "e"]);
 }
 
 // ─── Variable-length hops ───────────────────────────────────────────────────
@@ -504,9 +826,21 @@ query fof_chain($name: String) {
 
     let batch = result.concat_batches().unwrap();
     assert_eq!(batch.num_rows(), 1);
-    let col0 = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
-    let col1 = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
-    let col2 = batch.column(2).as_any().downcast_ref::<StringArray>().unwrap();
+    let col0 = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let col1 = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let col2 = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
     assert_eq!(col0.value(0), "Alice");
     assert_eq!(col1.value(0), "Bob");
     assert_eq!(col2.value(0), "Diana");
@@ -574,8 +908,16 @@ query at_acme_named() {
 
     let batch = result.concat_batches().unwrap();
     assert_eq!(batch.num_rows(), 1);
-    let person = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
-    let company = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+    let person = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let company = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
     assert_eq!(person.value(0), "Alice");
     assert_eq!(company.value(0), "Acme");
 }
@@ -608,8 +950,16 @@ query at_company($company: String) {
 
     let batch = result.concat_batches().unwrap();
     assert_eq!(batch.num_rows(), 1);
-    let person = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
-    let company = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+    let person = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let company = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
     assert_eq!(person.value(0), "Bob");
     assert_eq!(company.value(0), "Globex");
 }
@@ -633,19 +983,22 @@ query fan_out($name: String) {
 "#;
     // Alice knows Bob and Charlie, works at Acme.
     // Each friend paired with her company → 2 rows.
-    let result = query_main(
-        &mut db,
-        queries,
-        "fan_out",
-        &params(&[("$name", "Alice")]),
-    )
-    .await
-    .unwrap();
+    let result = query_main(&mut db, queries, "fan_out", &params(&[("$name", "Alice")]))
+        .await
+        .unwrap();
 
     let batch = result.concat_batches().unwrap();
     assert_eq!(batch.num_rows(), 2);
-    let friends = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
-    let companies = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+    let friends = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let companies = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
 
     let mut pairs: Vec<(&str, &str)> = (0..batch.num_rows())
         .map(|i| (friends.value(i), companies.value(i)))

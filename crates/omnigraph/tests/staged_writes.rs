@@ -2,7 +2,7 @@
 //! exercise `stage_append`, `stage_merge_insert`, `scan_with_staged`,
 //! and `count_rows_with_staged` directly against a Lance dataset — no
 //! Omnigraph engine involved. The engine-level use of these primitives
-//! is exercised by `tests/runs.rs`.
+//! is exercised by `tests/writes.rs`.
 //!
 //! Test surface here:
 //! 1. `stage_append` + `scan_with_staged` shows committed + staged data
@@ -22,9 +22,18 @@ use arrow_array::{Array, Int32Array, RecordBatch, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use futures::TryStreamExt;
 use lance::Dataset;
-use lance::dataset::{WhenMatched, WhenNotMatched};
+use lance::dataset::{DeleteBuilder, WhenMatched, WhenNotMatched};
+use lance::index::DatasetIndexExt;
+use lance_index::IndexType;
+use lance_linalg::distance::MetricType;
 use lance_table::format::Fragment;
 use omnigraph::table_store::{StagedWrite, TableStore};
+
+/// A standalone Lance `Session` per test store (this binary is primitive-level
+/// and deliberately does not include the shared `helpers` module).
+fn test_session() -> std::sync::Arc<lance::session::Session> {
+    std::sync::Arc::new(lance::session::Session::default())
+}
 use std::sync::Arc;
 
 fn person_schema() -> Arc<Schema> {
@@ -34,9 +43,38 @@ fn person_schema() -> Arc<Schema> {
     ]))
 }
 
+/// Test-only helper: raw `Dataset::append` to advance Lance HEAD without
+/// going through the manifest. Mirrors `TableStore::append_batch`'s body
+/// (which is `pub(crate)` after MR-854) — kept local so these
+/// drift-simulation tests don't depend on the demoted crate-internal API.
+async fn lance_append_inline_local(ds: &mut Dataset, batch: RecordBatch) {
+    use lance::dataset::{WriteMode, WriteParams};
+    let schema = batch.schema();
+    let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let params = WriteParams {
+        mode: WriteMode::Append,
+        allow_external_blob_outside_bases: true,
+        ..Default::default()
+    };
+    ds.append(reader, Some(params)).await.unwrap();
+}
+
 fn person_batch(rows: &[(&str, Option<i32>)]) -> RecordBatch {
     let ids: Vec<&str> = rows.iter().map(|(id, _)| *id).collect();
     let ages: Vec<Option<i32>> = rows.iter().map(|(_, age)| *age).collect();
+    RecordBatch::try_new(
+        person_schema(),
+        vec![
+            Arc::new(StringArray::from(ids)),
+            Arc::new(Int32Array::from(ages)),
+        ],
+    )
+    .unwrap()
+}
+
+fn numbered_person_batch(range: std::ops::Range<i32>) -> RecordBatch {
+    let ids: Vec<String> = range.clone().map(|i| format!("p{i}")).collect();
+    let ages: Vec<Option<i32>> = range.map(Some).collect();
     RecordBatch::try_new(
         person_schema(),
         vec![
@@ -64,11 +102,34 @@ fn collect_ids(batches: &[RecordBatch]) -> Vec<String> {
     out
 }
 
+fn collect_age_for_id(batches: &[RecordBatch], needle: &str) -> Option<i32> {
+    for batch in batches {
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let ages = batch
+            .column_by_name("age")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        for row in 0..batch.num_rows() {
+            if ids.value(row) == needle && !ages.is_null(row) {
+                return Some(ages.value(row));
+            }
+        }
+    }
+    None
+}
+
 #[tokio::test]
 async fn stage_append_is_visible_via_scan_with_staged() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
-    let store = TableStore::new(dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
 
     // Seed: one committed row.
     let ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
@@ -98,7 +159,7 @@ async fn stage_append_is_visible_via_scan_with_staged() {
 async fn stage_merge_insert_dedupes_superseded_committed_fragment() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
-    let store = TableStore::new(dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
 
     // Seed: alice age 30 in one committed fragment.
     let ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
@@ -119,7 +180,7 @@ async fn stage_merge_insert_dedupes_superseded_committed_fragment() {
         .await
         .unwrap();
     assert!(
-        !staged.removed_fragment_ids.is_empty(),
+        !staged.removed_fragment_ids().is_empty(),
         "merge_insert that rewrites a committed row must set removed_fragment_ids \
          so the scan-with-staged composer can shadow the superseded committed \
          fragment — without it, the committed row and its rewrite both appear, \
@@ -132,7 +193,11 @@ async fn stage_merge_insert_dedupes_superseded_committed_fragment() {
         .await
         .unwrap();
     let ids = collect_ids(&batches);
-    assert_eq!(ids, vec!["alice"], "merge_insert must not surface duplicates");
+    assert_eq!(
+        ids,
+        vec!["alice"],
+        "merge_insert must not surface duplicates"
+    );
 
     // Confirm the visible row is the rewritten one.
     let total: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -156,7 +221,7 @@ async fn stage_merge_insert_dedupes_superseded_committed_fragment() {
 async fn count_rows_with_staged_matches_scan() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
-    let store = TableStore::new(dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
 
     let ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
         .await
@@ -191,7 +256,7 @@ async fn count_rows_with_staged_matches_scan() {
 async fn chained_stage_appends_have_distinct_row_ids() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
-    let store = TableStore::new(dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
 
     let ds = TableStore::write_dataset(&uri, person_batch(&[("seed", Some(0))]))
         .await
@@ -254,7 +319,7 @@ async fn chained_stage_appends_have_distinct_row_ids() {
 fn combine_for_scan(ds: &Dataset, staged: &[StagedWrite]) -> Vec<Fragment> {
     let removed: std::collections::HashSet<u64> = staged
         .iter()
-        .flat_map(|w| w.removed_fragment_ids.iter().copied())
+        .flat_map(|w| w.removed_fragment_ids().iter().copied())
         .collect();
     let mut combined: Vec<_> = ds
         .manifest
@@ -264,7 +329,7 @@ fn combine_for_scan(ds: &Dataset, staged: &[StagedWrite]) -> Vec<Fragment> {
         .cloned()
         .collect();
     for s in staged {
-        combined.extend(s.new_fragments.iter().cloned());
+        combined.extend(s.new_fragments().iter().cloned());
     }
     combined
 }
@@ -277,7 +342,7 @@ fn combine_for_scan(ds: &Dataset, staged: &[StagedWrite]) -> Vec<Fragment> {
 async fn stage_append_then_commit_persists_data() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
-    let store = TableStore::new(dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
 
     let ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
         .await
@@ -290,7 +355,7 @@ async fn stage_append_then_commit_persists_data() {
         .unwrap();
 
     let new_ds = store
-        .commit_staged(Arc::new(ds.clone()), staged.transaction)
+        .commit_staged(Arc::new(ds.clone()), staged)
         .await
         .unwrap();
     assert!(
@@ -310,7 +375,7 @@ async fn stage_append_then_commit_persists_data() {
 async fn stage_merge_insert_then_commit_persists_merged_view() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
-    let store = TableStore::new(dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
 
     let ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
         .await
@@ -327,10 +392,7 @@ async fn stage_merge_insert_then_commit_persists_merged_view() {
         .await
         .unwrap();
 
-    store
-        .commit_staged(Arc::new(ds), staged.transaction)
-        .await
-        .unwrap();
+    store.commit_staged(Arc::new(ds), staged).await.unwrap();
 
     let reopened = Dataset::open(&uri).await.unwrap();
     let batches = store.scan_batches(&reopened).await.unwrap();
@@ -341,13 +403,60 @@ async fn stage_merge_insert_then_commit_persists_merged_view() {
     assert_eq!(total, 2, "merge_insert must not duplicate the matched row");
 }
 
+#[tokio::test]
+async fn stage_merge_insert_commit_rebases_over_disjoint_committed_delete() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
+
+    let ds = TableStore::write_dataset(&uri, numbered_person_batch(0..100))
+        .await
+        .unwrap();
+    let update_ids: Vec<String> = (0..10).map(|i| format!("p{i}")).collect();
+    let update_ages: Vec<Option<i32>> = (0..10).map(|i| Some(1000 + i)).collect();
+    let update_batch = RecordBatch::try_new(
+        person_schema(),
+        vec![
+            Arc::new(StringArray::from(update_ids)),
+            Arc::new(Int32Array::from(update_ages)),
+        ],
+    )
+    .unwrap();
+
+    let staged = store
+        .stage_merge_insert(
+            ds.clone(),
+            update_batch,
+            vec!["id".to_string()],
+            WhenMatched::UpdateAll,
+            WhenNotMatched::DoNothing,
+        )
+        .await
+        .unwrap();
+
+    DeleteBuilder::new(Arc::new(ds.clone()), "age >= 10 AND age < 20")
+        .execute()
+        .await
+        .unwrap();
+
+    let committed = store
+        .commit_staged(Arc::new(ds.clone()), staged)
+        .await
+        .unwrap();
+    assert_eq!(committed.count_rows(None).await.unwrap(), 90);
+
+    let batches = store.scan_batches(&committed).await.unwrap();
+    assert_eq!(collect_age_for_id(&batches, "p0"), Some(1000));
+    assert_eq!(collect_age_for_id(&batches, "p10"), None);
+}
+
 /// **Documented limitation** (see `scan_with_staged` doc): when a filter
 /// is supplied, Lance's stats-based pruning drops the staged fragment from
 /// the filtered scan because uncommitted fragments produced by
 /// `write_fragments_internal` lack per-column statistics. The result
 /// contains only matching committed rows; matching staged rows are
 /// silently absent. `scanner.use_stats(false)` does not bypass this in
-/// lance 4.0.0.
+/// lance 6.0.1.
 ///
 /// This test pins the actual behavior so a future change either
 /// preserves it (and updates the doc) or fixes it (and rewrites this
@@ -358,7 +467,7 @@ async fn stage_merge_insert_then_commit_persists_merged_view() {
 async fn scan_with_staged_with_filter_silently_drops_staged_rows() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
-    let store = TableStore::new(dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
 
     // Committed: alice=30, carol=40
     let ds = TableStore::write_dataset(
@@ -382,12 +491,7 @@ async fn scan_with_staged_with_filter_silently_drops_staged_rows() {
     // Actual: dave (staged, age=35) is dropped — only the committed matches
     // come back.
     let batches = store
-        .scan_with_staged(
-            &ds,
-            std::slice::from_ref(&staged),
-            None,
-            Some("age >= 30"),
-        )
+        .scan_with_staged(&ds, std::slice::from_ref(&staged), None, Some("age >= 30"))
         .await
         .unwrap();
     assert_eq!(
@@ -403,12 +507,7 @@ async fn scan_with_staged_with_filter_silently_drops_staged_rows() {
     // Without filter, staged data IS visible — confirms the issue is
     // specifically filter pushdown, not fragment scanning per se.
     let unfiltered = store
-        .scan_with_staged(
-            &ds,
-            std::slice::from_ref(&staged),
-            None,
-            None,
-        )
+        .scan_with_staged(&ds, std::slice::from_ref(&staged), None, None)
         .await
         .unwrap();
     assert_eq!(
@@ -435,7 +534,7 @@ async fn scan_with_staged_with_filter_silently_drops_staged_rows() {
 async fn chained_stage_merge_insert_with_shared_key_documents_duplicate_behavior() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
-    let store = TableStore::new(dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
 
     // Seed empty (an unrelated row keeps the schema unambiguous).
     let ds = TableStore::write_dataset(&uri, person_batch(&[("seed", Some(0))]))
@@ -501,7 +600,7 @@ async fn chained_stage_merge_insert_with_shared_key_documents_duplicate_behavior
 async fn stage_overwrite_does_not_advance_head_until_commit() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
-    let store = TableStore::new(dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
 
     let ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
         .await
@@ -524,12 +623,60 @@ async fn stage_overwrite_does_not_advance_head_until_commit() {
     // After commit_staged, HEAD advances and the dataset shows the
     // overwrite result (zoe alone — alice replaced).
     let new_ds = store
-        .commit_staged(Arc::new(ds.clone()), staged.transaction)
+        .commit_staged(Arc::new(ds.clone()), staged)
         .await
         .unwrap();
     assert!(new_ds.version().version > pre_version);
     let after = store.scan_batches(&new_ds).await.unwrap();
     assert_eq!(collect_ids(&after), vec!["zoe"]);
+}
+
+/// `stage_overwrite` is used by `schema_apply` to rewrite tables when
+/// an additive migration touches data. The rewrite MUST preserve the
+/// source dataset's `enable_stable_row_ids` flag — otherwise every
+/// schema_apply that triggers a rewrite would silently disable stable
+/// row IDs on the affected tables, and downstream readers depending on
+/// `_rowid` stability (change-feed validators, index reconcilers) would
+/// observe silent corruption.
+///
+/// Pinned invariant — see `docs/storage.md` "Stable row IDs".
+#[tokio::test]
+async fn stage_overwrite_preserves_stable_row_ids() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
+
+    // `write_dataset` creates with `enable_stable_row_ids: true` — see
+    // ADR 0001. We verify that as a precondition so a future change to
+    // the bootstrap helper that drops the flag surfaces here rather
+    // than turning this test into a silent no-op.
+    let ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
+        .await
+        .unwrap();
+    assert!(
+        ds.manifest.uses_stable_row_ids(),
+        "precondition: TableStore::write_dataset must create datasets \
+         with stable row IDs enabled — see ADR 0001"
+    );
+
+    let staged = store
+        .stage_overwrite(&ds, person_batch(&[("zoe", Some(99))]))
+        .await
+        .unwrap();
+    let new_ds = store
+        .commit_staged(Arc::new(ds.clone()), staged)
+        .await
+        .unwrap();
+
+    assert!(
+        new_ds.manifest.uses_stable_row_ids(),
+        "stage_overwrite + commit_staged must preserve \
+         enable_stable_row_ids from the source dataset. If this fails, \
+         schema_apply has been silently disabling stable row IDs on \
+         every additive migration that triggers a table rewrite. Fix \
+         is in WriteParams at table_store.rs::stage_overwrite — see \
+         ADR 0001."
+    );
 }
 
 /// `stage_overwrite` semantically REPLACES every committed fragment.
@@ -539,7 +686,7 @@ async fn stage_overwrite_does_not_advance_head_until_commit() {
 async fn stage_overwrite_replaces_all_fragments() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
-    let store = TableStore::new(dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
 
     let ds = TableStore::write_dataset(
         &uri,
@@ -555,7 +702,7 @@ async fn stage_overwrite_replaces_all_fragments() {
         .await
         .unwrap();
     let removed: std::collections::HashSet<u64> =
-        staged.removed_fragment_ids.iter().copied().collect();
+        staged.removed_fragment_ids().iter().copied().collect();
     assert_eq!(
         removed, committed_fragment_ids,
         "stage_overwrite must list every committed fragment as removed so \
@@ -574,6 +721,58 @@ async fn stage_overwrite_replaces_all_fragments() {
     );
 }
 
+#[tokio::test]
+async fn stage_overwrite_empty_batch_replaces_all_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
+
+    let ds = TableStore::write_dataset(
+        &uri,
+        person_batch(&[("alice", Some(30)), ("bob", Some(25))]),
+    )
+    .await
+    .unwrap();
+    let pre_version = ds.version().version;
+
+    let target_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("age", DataType::Int32, true),
+        Field::new("nickname", DataType::Utf8, true),
+    ]));
+    let staged = store
+        .stage_overwrite(&ds, RecordBatch::new_empty(target_schema.clone()))
+        .await
+        .unwrap();
+    assert!(
+        staged.new_fragments().is_empty(),
+        "empty overwrite should produce a zero-fragment Lance Overwrite transaction"
+    );
+    assert_eq!(
+        staged.removed_fragment_ids().len(),
+        ds.manifest.fragments.len(),
+        "empty overwrite still removes every committed fragment"
+    );
+    assert_eq!(
+        ds.version().version,
+        pre_version,
+        "staging empty overwrite must not advance HEAD"
+    );
+
+    let new_ds = store
+        .commit_staged(Arc::new(ds.clone()), staged)
+        .await
+        .unwrap();
+    assert_eq!(new_ds.version().version, pre_version + 1);
+    assert_eq!(new_ds.count_rows(None).await.unwrap(), 0);
+    assert!(
+        arrow_schema::Schema::from(new_ds.schema())
+            .field_with_name("nickname")
+            .is_ok(),
+        "empty overwrite must commit the replacement batch schema"
+    );
+}
+
 /// `stage_create_btree_index` writes index segments to object storage
 /// but does NOT advance Lance HEAD until `commit_staged`. After commit,
 /// the index is queryable.
@@ -581,7 +780,7 @@ async fn stage_overwrite_replaces_all_fragments() {
 async fn stage_create_btree_index_does_not_advance_head_until_commit() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
-    let store = TableStore::new(dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
 
     let ds = TableStore::write_dataset(
         &uri,
@@ -613,7 +812,7 @@ async fn stage_create_btree_index_does_not_advance_head_until_commit() {
     );
 
     let new_ds = store
-        .commit_staged(Arc::new(ds.clone()), staged.transaction)
+        .commit_staged(Arc::new(ds.clone()), staged)
         .await
         .unwrap();
     assert!(new_ds.version().version > pre_version);
@@ -628,7 +827,7 @@ async fn stage_create_btree_index_does_not_advance_head_until_commit() {
 async fn stage_create_inverted_index_does_not_advance_head_until_commit() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
-    let store = TableStore::new(dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
 
     let ds = TableStore::write_dataset(
         &uri,
@@ -638,10 +837,7 @@ async fn stage_create_inverted_index_does_not_advance_head_until_commit() {
     .unwrap();
     let pre_version = ds.version().version;
 
-    let staged = store
-        .stage_create_inverted_index(&ds, "id")
-        .await
-        .unwrap();
+    let staged = store.stage_create_inverted_index(&ds, "id").await.unwrap();
     assert_eq!(
         ds.version().version,
         pre_version,
@@ -650,7 +846,7 @@ async fn stage_create_inverted_index_does_not_advance_head_until_commit() {
     assert!(!store.has_fts_index(&ds, "id").await.unwrap());
 
     let new_ds = store
-        .commit_staged(Arc::new(ds.clone()), staged.transaction)
+        .commit_staged(Arc::new(ds.clone()), staged)
         .await
         .unwrap();
     assert!(new_ds.version().version > pre_version);
@@ -660,24 +856,21 @@ async fn stage_create_inverted_index_does_not_advance_head_until_commit() {
     );
 }
 
-/// Pin the inline-commit behavior of `delete_where`. Lance 4.0.0 does
-/// NOT expose a public `DeleteJob::execute_uncommitted`
-/// (`pub(crate)` — see lance-format/lance#6658). The trait deliberately
-/// does NOT introduce a `stage_delete` wrapper that would secretly
-/// inline-commit (a side-channel between the staged and inline write
-/// paths). Instead, the trait keeps `delete_where` as the only delete
-/// entry point, named honestly.
-///
-/// **When Lance #6658 lands**: this test will need to flip — replace
-/// the assertion with a `stage_delete` + `commit_staged` round-trip
-/// and remove the residual line in `docs/runs.md`.
+/// Staged delete (Lance 7.0 `DeleteBuilder::execute_uncommitted`, lance#6658):
+/// `stage_delete` does NOT advance Lance HEAD (two-phase); an in-query
+/// `scan_with_staged` sees the deletion via the staged deletion-vector
+/// fragments (read-your-writes — proves `Scanner::with_fragments` applies the
+/// staged deletion files); `commit_staged` then advances HEAD and persists it;
+/// and a 0-row delete is a true no-op (`None`, no version, no fragments).
+/// Flipped from the old `delete_where_advances_head_inline_documents_residual`
+/// once the two-phase delete landed.
 #[tokio::test]
-async fn delete_where_advances_head_inline_documents_residual() {
+async fn stage_delete_does_not_advance_head_and_reads_through_staged() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
-    let store = TableStore::new(dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
 
-    let mut ds = TableStore::write_dataset(
+    let ds = TableStore::write_dataset(
         &uri,
         person_batch(&[("alice", Some(30)), ("bob", Some(25))]),
     )
@@ -685,28 +878,82 @@ async fn delete_where_advances_head_inline_documents_residual() {
     .unwrap();
     let pre_version = ds.version().version;
 
-    let result = store
-        .delete_where(&uri, &mut ds, "id = 'alice'")
+    // Stage a delete of alice — writes the deletion file (Phase A) but does
+    // NOT advance HEAD.
+    let staged = store
+        .stage_delete(&ds, "id = 'alice'")
+        .await
+        .unwrap()
+        .expect("alice matches → Some(StagedWrite)");
+    assert_eq!(
+        ds.version().version,
+        pre_version,
+        "stage_delete must NOT advance Lance HEAD (two-phase)"
+    );
+
+    // Read-your-writes: a scan over the staged delete sees the deletion vector
+    // — alice is gone, bob remains.
+    let batches = store
+        .scan_with_staged(&ds, std::slice::from_ref(&staged), None, None)
         .await
         .unwrap();
-    assert_eq!(result.deleted_rows, 1);
-    assert!(
-        result.version > pre_version,
-        "delete_where ADVANCES Lance HEAD inline (the residual). When \
-         lance-format/lance#6658 ships and we migrate to stage_delete + \
-         commit_staged, flip this assertion to assert that staging does \
-         NOT advance HEAD."
+    assert_eq!(
+        collect_ids(&batches),
+        vec!["bob"],
+        "the staged deletion must be visible to an in-query read (deletion-vector RYW)"
     );
+
+    // Commit advances HEAD and persists the deletion.
+    let committed = store
+        .commit_staged(std::sync::Arc::new(ds.clone()), staged)
+        .await
+        .unwrap();
+    assert!(committed.version().version > pre_version);
+    assert_eq!(committed.count_rows(None).await.unwrap(), 1);
+
+    // A 0-row delete is a true no-op: None, no version, no fragments.
+    let none = store
+        .stage_delete(&committed, "id = 'nobody'")
+        .await
+        .unwrap();
+    assert!(none.is_none(), "a 0-row delete must stage nothing");
 }
 
-/// Companion to `delete_where_*`: pin the inline-commit behavior of
-/// `create_vector_index`. Lance 4.0.0 vector indices take the
-/// "segment commit path" which calls `build_index_metadata_from_segments`
-/// (`pub(crate)` in lance-4.0.0 `src/index.rs:111`). Until upstream
-/// exposes that helper (companion ticket to lance-format/lance#6658),
-/// the trait surface deliberately does NOT include
-/// `stage_create_vector_index` — same rationale as `stage_delete`'s
-/// absence (no side-channel between staged and inline write paths).
+#[tokio::test]
+async fn stage_delete_commit_rebases_over_disjoint_committed_delete() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
+
+    let ds = TableStore::write_dataset(&uri, numbered_person_batch(0..100))
+        .await
+        .unwrap();
+    let staged = store
+        .stage_delete(&ds, "age < 10")
+        .await
+        .unwrap()
+        .expect("delete should match rows");
+
+    DeleteBuilder::new(Arc::new(ds.clone()), "age >= 10 AND age < 20")
+        .execute()
+        .await
+        .unwrap();
+
+    let committed = store
+        .commit_staged(Arc::new(ds.clone()), staged)
+        .await
+        .unwrap();
+    assert_eq!(committed.count_rows(None).await.unwrap(), 80);
+}
+
+/// Pin the inline-commit behavior of `create_vector_index` — the SOLE
+/// remaining inline residual now that `delete` has migrated to `stage_delete`
+/// (MR-A). Vector indices take Lance's "segment commit path" which calls
+/// `build_index_metadata_from_segments` (`pub(crate)` in Lance 7.0.0). Until
+/// upstream exposes that helper (lance-format/lance#6666), the trait surface
+/// deliberately does NOT include `stage_create_vector_index` — keeping the
+/// inline coupling off `TableStorage` so no side-channel exists between the
+/// staged and inline write paths.
 #[tokio::test]
 async fn create_vector_index_advances_head_inline_documents_residual() {
     use arrow_array::FixedSizeListArray;
@@ -714,7 +961,7 @@ async fn create_vector_index_advances_head_inline_documents_residual() {
 
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/vec.lance", dir.path().to_str().unwrap());
-    let store = TableStore::new(dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
 
     // Build a small dataset with a fixed-size vector column. Vector index
     // training requires multiple rows; provide enough.
@@ -733,20 +980,17 @@ async fn create_vector_index_advances_head_inline_documents_residual() {
     let id_arr = StringArray::from(ids);
     let flat: Vec<f32> = (0..(n_rows * dim)).map(|i| i as f32).collect();
     let values = arrow_array::Float32Array::from(flat);
-    let vec_arr =
-        FixedSizeListArray::new(item_field, dim as i32, Arc::new(values), None);
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![Arc::new(id_arr), Arc::new(vec_arr)],
-    )
-    .unwrap();
+    let vec_arr = FixedSizeListArray::new(item_field, dim as i32, Arc::new(values), None);
+    let batch =
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(id_arr), Arc::new(vec_arr)]).unwrap();
 
     let mut ds = TableStore::write_dataset(&uri, batch).await.unwrap();
     let pre_version = ds.version().version;
     assert!(!store.has_vector_index(&ds, "embedding").await.unwrap());
 
-    store
-        .create_vector_index(&mut ds, "embedding")
+    let params = lance::index::vector::VectorIndexParams::ivf_flat(1, MetricType::L2);
+    ds.create_index_builder(&["embedding"], IndexType::Vector, &params)
+        .replace(true)
         .await
         .unwrap();
     assert!(
@@ -769,7 +1013,7 @@ async fn create_vector_index_advances_head_inline_documents_residual() {
 /// The Lance source confirms this — `restore()` (no args) takes the
 /// currently-checked-out version's content and applies it via
 /// `apply_commit` against the latest manifest, advancing HEAD by one.
-/// See lance-4.0.0 `src/dataset.rs:1106` and the transaction-spec
+/// See lance-6.0.1 `src/dataset.rs:1106` and the transaction-spec
 /// example at https://lance.org/format/table/transaction/.
 ///
 /// If the lance bump (4.0.0 → 4.x) ever changes this delta or the call
@@ -780,7 +1024,6 @@ async fn create_vector_index_advances_head_inline_documents_residual() {
 async fn lance_restore_appends_one_commit_with_checked_out_content() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
-    let store = TableStore::new(dir.path().to_str().unwrap());
 
     // Build version history: v1 = {alice}, v2 = {alice, bob}, v3 = {alice, bob, carol}.
     let mut ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
@@ -788,16 +1031,10 @@ async fn lance_restore_appends_one_commit_with_checked_out_content() {
         .unwrap();
     assert_eq!(ds.version().version, 1);
 
-    store
-        .append_batch(&uri, &mut ds, person_batch(&[("bob", Some(25))]))
-        .await
-        .unwrap();
+    lance_append_inline_local(&mut ds, person_batch(&[("bob", Some(25))])).await;
     assert_eq!(ds.version().version, 2);
 
-    store
-        .append_batch(&uri, &mut ds, person_batch(&[("carol", Some(40))]))
-        .await
-        .unwrap();
+    lance_append_inline_local(&mut ds, person_batch(&[("carol", Some(40))])).await;
     assert_eq!(ds.version().version, 3);
 
     let head_before = ds.version().version;
@@ -843,7 +1080,7 @@ async fn lance_restore_appends_one_commit_with_checked_out_content() {
 /// and any future continuous-recovery reconciler's queue-acquisition
 /// requirement.
 ///
-/// `Dataset::restore`'s `check_restore_txn` (lance-4.0.0
+/// `Dataset::restore`'s `check_restore_txn` (lance-6.0.1
 /// `src/io/commit/conflict_resolver.rs:986`) returns `Ok(())` against
 /// almost every other op (Append, Update, Delete, CreateIndex, Merge, …),
 /// so a Restore commits successfully even with concurrent commits in
@@ -860,13 +1097,19 @@ async fn lance_restore_appends_one_commit_with_checked_out_content() {
 /// tables before invoking restore — otherwise this hazard becomes
 /// reachable during in-flight tenant traffic.
 ///
+/// MR-686 introduces those per-(table_key, branch) writer queues as the
+/// application-layer mechanism that closes this hazard once continuous
+/// in-process recovery (MR-870) lands. Until MR-686's queue is wired into
+/// the recovery path, the open-time-only invocation strategy is the
+/// only thing keeping this hazard out of production. See
+/// `docs/invariants.md` §VI.30, §VI.32, §VI.33.
+///
 /// This test is the load-bearing constraint any future reconciler must
 /// honor.
 #[tokio::test]
 async fn lance_restore_loses_to_concurrent_append_via_orphaning() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
-    let store = TableStore::new(dir.path().to_str().unwrap());
 
     // v1: seed with alice.
     let _ = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
@@ -883,10 +1126,7 @@ async fn lance_restore_loses_to_concurrent_append_via_orphaning() {
     // This simulates a per-table-queue model where another tenant wrote
     // between recovery's open and recovery's restore call.
     let mut writer_handle = Dataset::open(&uri).await.unwrap();
-    store
-        .append_batch(&uri, &mut writer_handle, person_batch(&[("bob", Some(25))]))
-        .await
-        .unwrap();
+    lance_append_inline_local(&mut writer_handle, person_batch(&[("bob", Some(25))])).await;
     assert_eq!(writer_handle.version().version, 2);
 
     // Recovery now restores. Because restore's `check_restore_txn` returns
@@ -945,4 +1185,58 @@ async fn lance_restore_loses_to_concurrent_append_via_orphaning() {
         .unwrap();
     let v2_ids = collect_ids(&v2_batches);
     assert_eq!(v2_ids, vec!["alice".to_string(), "bob".to_string()]);
+}
+
+/// Regression for PR #229: `commit_staged` must skip Lance's per-commit
+/// auto-cleanup hook. A graph created BEFORE the v7 bump (6.0.1 defaulted
+/// `WriteParams::auto_cleanup` ON) carries `lance.auto_cleanup.*` config on its
+/// datasets that `auto_cleanup = None` on new writes cannot retroactively clear;
+/// Lance's hook fires off that *stored* config at commit time. Without the skip,
+/// the engine's own writes would GC the versions `__manifest` pins for
+/// snapshots/time-travel. (The substrate negative control — that the config
+/// really does GC without the skip — lives in
+/// `lance_surface_guards.rs::skip_auto_cleanup_suppresses_version_gc`.)
+#[tokio::test]
+async fn commit_staged_skips_auto_cleanup_so_pinned_versions_survive() {
+    use std::collections::HashMap;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
+
+    let mut ds = TableStore::write_dataset(&uri, person_batch(&[("seed", Some(0))]))
+        .await
+        .unwrap();
+    let v1 = ds.version().version;
+
+    // Simulate a pre-bump dataset: aggressive legacy auto_cleanup config (fire on
+    // every commit, delete anything older than now).
+    let mut cfg = HashMap::new();
+    cfg.insert("lance.auto_cleanup.interval".to_string(), "1".to_string());
+    cfg.insert(
+        "lance.auto_cleanup.older_than".to_string(),
+        "0ms".to_string(),
+    );
+    ds.update_config(cfg).await.unwrap();
+
+    // Several writes through the engine's staged commit path.
+    for i in 0..5i32 {
+        let name = format!("p{i}");
+        let staged = store
+            .stage_append(&ds, person_batch(&[(name.as_str(), Some(i))]), &[])
+            .await
+            .unwrap();
+        ds = store
+            .commit_staged(Arc::new(ds.clone()), staged)
+            .await
+            .unwrap();
+    }
+
+    // `commit_staged` sets `with_skip_auto_cleanup(true)`, so the legacy config
+    // must NOT have GC'd the `__manifest`-pinned create version.
+    assert!(
+        ds.checkout_version(v1).await.is_ok(),
+        "commit_staged must skip Lance auto-cleanup so a pre-bump graph's pinned \
+         v{v1} survives; it was GC'd"
+    );
 }

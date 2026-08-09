@@ -1,9 +1,24 @@
 pub mod api;
+mod handlers;
+mod settings;
+use handlers::*;
+use settings::*;
+pub use settings::{ServerRuntimeState, classify_server_runtime_state, load_server_settings};
 pub mod auth;
-pub mod config;
+pub mod graph_id;
+pub mod identity;
 pub mod policy;
+pub mod queries;
+pub mod registry;
+pub mod workload;
 
-use std::collections::{HashMap, HashSet};
+pub use graph_id::GraphId;
+pub use identity::{AuthSource, GraphKey, ResolvedActor, Scope, TenantId};
+pub use registry::{GraphHandle, GraphRegistry, InsertError, RegistryLookup, RegistrySnapshot};
+
+use crate::queries::{QueryRegistry, check, format_check_breakages};
+
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::io::Write;
@@ -13,45 +28,47 @@ use std::sync::Arc;
 use api::{
     BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
     BranchMergeOutput, BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput,
-    CommitListQuery, ErrorCode, ErrorOutput, ExportRequest, HealthOutput, IngestOutput,
-    IngestRequest, ReadOutput, ReadRequest, SchemaApplyOutput, SchemaApplyRequest, SchemaOutput,
-    SnapshotQuery, ingest_output, schema_apply_output, snapshot_payload,
+    CommitListQuery, ErrorCode, ErrorOutput, ExportRequest, GraphInfo, GraphListResponse,
+    HealthOutput, IngestOutput, IngestRequest, InvokeStoredQueryRequest, InvokeStoredQueryResponse,
+    QueriesCatalogOutput, QueryRequest, ReadOutput, ReadRequest, SchemaApplyOutput,
+    SchemaApplyRequest, SchemaOutput, SnapshotQuery, ingest_output, schema_apply_output,
+    snapshot_payload,
 };
+pub use auth::{AWS_SECRET_ENV, EnvOrFileTokenSource, TokenSource, resolve_token_source};
 use axum::body::{Body, Bytes};
 use axum::extract::DefaultBodyLimit;
-use axum::extract::{Extension, Path, Query, Request, State};
+use axum::extract::{Extension, OriginalUri, Path, Query, Request, State};
 use axum::http::StatusCode;
-use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
+use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, HeaderName, HeaderValue};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
-use color_eyre::eyre::{Result, WrapErr, bail};
-pub use config::{
-    AliasCommand, AliasConfig, CliDefaults, DEFAULT_CONFIG_FILE, OmnigraphConfig, PolicySettings,
-    ProjectConfig, QueryDefaults, ReadOutputFormat, ServerDefaults, TableCellLayout, TargetConfig,
-    load_config,
-};
+use color_eyre::eyre::{Result, WrapErr, bail, eyre};
 use futures::stream;
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::{ManifestConflictDetails, ManifestErrorKind, OmniError};
+use omnigraph::storage::normalize_root_uri;
+use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::json_params_to_param_map;
 use omnigraph_compiler::query::parser::parse_query;
 use omnigraph_compiler::{JsonParamMode, ParamMap};
-pub use auth::{AWS_SECRET_ENV, EnvOrFileTokenSource, TokenSource, resolve_token_source};
 pub use policy::{
     PolicyAction, PolicyCompiler, PolicyConfig, PolicyDecision, PolicyEngine, PolicyExpectation,
-    PolicyRequest, PolicyTestConfig,
+    PolicyRequest, PolicyResourceKind, PolicyTestConfig,
 };
+use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::mpsc;
 use tower_http::trace::TraceLayer;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use utoipa::OpenApi;
+use utoipa::openapi::path::{Parameter, ParameterIn};
+use utoipa::openapi::schema::{Object, Type};
 use utoipa::openapi::security::{Http, HttpAuthScheme, SecurityScheme};
 
 type BearerTokenHash = [u8; 32];
@@ -70,24 +87,48 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         description = "HTTP API for the Omnigraph graph database",
     ),
     paths(
-        server_health,
-        server_snapshot,
-        server_read,
-        server_export,
-        server_change,
-        server_schema_apply,
-        server_schema_get,
-        server_ingest,
-        server_branch_list,
-        server_branch_create,
-        server_branch_delete,
-        server_branch_merge,
-        server_commit_list,
-        server_commit_show,
+        handlers::server_health,
+        handlers::server_graphs_list,
+        handlers::server_snapshot,
+        // deprecated; the #[deprecated] attribute on the handler
+        // surfaces as `deprecated: true` on the OpenAPI operation.
+        #[allow(deprecated)] handlers::server_read,
+        handlers::server_query,
+        handlers::server_export,
+        #[allow(deprecated)] handlers::server_change,
+        handlers::server_mutate,
+        handlers::server_list_queries,
+        handlers::server_invoke_query,
+        handlers::server_schema_apply,
+        handlers::server_schema_get,
+        handlers::server_load,
+        // deprecated; the #[deprecated] attribute on the handler surfaces as
+        // `deprecated: true` on the OpenAPI operation.
+        #[allow(deprecated)] handlers::server_ingest,
+        handlers::server_branch_list,
+        handlers::server_branch_create,
+        handlers::server_branch_delete,
+        handlers::server_branch_merge,
+        handlers::server_commit_list,
+        handlers::server_commit_show,
     ),
     modifiers(&SecurityAddon),
 )]
 pub struct ApiDoc;
+
+/// The canonical served OpenAPI shape (RFC-011 cluster-only): the static
+/// `ApiDoc` with every protected path nested under `/graphs/{graph_id}/…`
+/// and `cluster_`-prefixed operation ids. `/healthz` and `/graphs` stay
+/// flat. This is the single source of nesting — both the runtime
+/// `server_openapi` handler and the committed `openapi.json` derive from
+/// it, so the published spec can never describe routes the server does
+/// not serve. The handler additionally strips security in open mode; the
+/// committed spec retains it.
+pub fn served_openapi() -> utoipa::openapi::OpenApi {
+    let mut doc = ApiDoc::openapi();
+    handlers::nest_paths_under_cluster_prefix(&mut doc);
+    doc
+}
 
 struct SecurityAddon;
 
@@ -107,24 +148,123 @@ const DEFAULT_REQUEST_BODY_LIMIT_BYTES: usize = 1_048_576;
 const INGEST_REQUEST_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const SERVER_SOURCE_VERSION: Option<&str> = option_env!("OMNIGRAPH_SOURCE_VERSION");
+/// The internal-schema (storage-format) version this binary writes and reads.
+const SERVER_INTERNAL_SCHEMA_VERSION: u32 =
+    omnigraph::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION;
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
-    pub uri: String,
+    /// Server topology + the graphs to open at startup. RFC-011
+    /// cluster-only: the server always boots from a cluster
+    /// (`--cluster <dir | s3://…>`) and serves N graphs under cluster
+    /// routes.
+    pub mode: ServerConfigMode,
     pub bind: String,
-    pub policy_file: Option<PathBuf>,
+    /// Operator opt-in for fully-unauthenticated dev mode (MR-723).
+    /// When neither bearer tokens nor a policy file are configured,
+    /// `serve()` refuses to start unless this is true (set via
+    /// `--unauthenticated` or `OMNIGRAPH_UNAUTHENTICATED=1`). The
+    /// motivation is that "no tokens + no policy" looks like protection
+    /// (no Cedar errors at boot) but is actually fully open — operators
+    /// who set up auth and forgot the policy file would otherwise ship
+    /// the illusion of protection.
+    pub allow_unauthenticated: bool,
+    /// Operator opt-in for fail-fast cluster boot. By default, graph-local
+    /// startup failures quarantine that graph and healthy graphs still serve.
+    /// When true, any quarantined or failed graph aborts startup.
+    pub require_all_graphs: bool,
+}
+
+/// What `load_server_settings` produces. RFC-011 cluster-only: the
+/// server always boots from a cluster's applied revision into a
+/// multi-graph deployment (N ≥ 1 graphs).
+#[derive(Debug, Clone)]
+pub enum ServerConfigMode {
+    /// Cluster boot — `--cluster <dir | s3://…>` resolves the applied
+    /// revision into per-graph startup configs plus an optional
+    /// server-level policy.
+    Multi {
+        /// Per-graph startup configs, sorted by graph id (BTreeMap
+        /// iteration order). The parallel-open loop iterates this.
+        graphs: Vec<GraphStartupConfig>,
+        /// The cluster boot source (config directory or storage root).
+        /// Kept on the mode so future runtime mutation (deferred — see
+        /// release notes) can locate the source of truth without
+        /// re-parsing CLI args.
+        config_path: PathBuf,
+        /// Server-level Cedar policy for the management endpoints
+        /// (`GET /graphs`). Wired into `GET /graphs` authorization.
+        server_policy: Option<PolicySource>,
+    },
+}
+
+/// Where a Cedar policy bundle comes from at startup. Cluster-local files are
+/// used during config application; inline digest-verified catalog content is
+/// used for serving, where the catalog may live on object storage and the
+/// server must not re-read mutable state after the snapshot.
+#[derive(Debug, Clone)]
+pub enum PolicySource {
+    File(PathBuf),
+    Inline(String),
+}
+
+/// One graph's startup-time configuration: id, opened URI, optional
+/// per-graph policy source. Constructed by `load_server_settings`
+/// in multi mode; consumed by `serve`'s parallel open loop.
+#[derive(Debug, Clone)]
+pub struct GraphStartupConfig {
+    pub graph_id: String,
+    pub uri: String,
+    pub policy: Option<PolicySource>,
+    /// Pre-resolved embedding config from an applied cluster provider profile.
+    /// Legacy config paths leave this unset and continue to use env resolution.
+    pub embedding: Option<omnigraph::embedding::EmbeddingConfig>,
+    /// Per-graph stored-query registry, loaded and identity-checked at
+    /// settings-build time; type-checked against the schema when this
+    /// graph's engine opens.
+    pub queries: QueryRegistry,
+}
+
+/// Runtime routing for the server (RFC-011 cluster-only). Every
+/// deployment serves cluster routes (`/graphs/{graph_id}/...`) backed by
+/// a registry of N graphs (N ≥ 1). The single-graph convenience
+/// constructors build a one-graph registry keyed by `default`; the
+/// cluster boot path builds an N-graph registry. There is no longer a
+/// flat-route mode.
+///
+/// `config_path` is the boot source (the cluster directory or storage
+/// root); preserved here so future runtime mutation (deferred) can find
+/// the source of truth without re-parsing CLI args. The server treats
+/// the source as operator-owned and never writes it.
+///
+/// All handler bodies are mode-agnostic — the routing middleware
+/// (`resolve_graph_handle`) injects `Arc<GraphHandle>` as a request
+/// extension by looking up the `{graph_id}` URL segment in the registry.
+#[derive(Clone)]
+pub struct GraphRouting {
+    pub registry: Arc<GraphRegistry>,
+    pub config_path: Option<PathBuf>,
 }
 
 #[derive(Clone)]
 pub struct AppState {
-    uri: String,
-    db: Arc<RwLock<Omnigraph>>,
+    /// Runtime routing — the single source of truth for where each
+    /// request's graph lives. Single mode holds the handle directly;
+    /// multi mode holds the registry + config path. Both arms are
+    /// the same shape from a handler's perspective: middleware
+    /// extracts an `Arc<GraphHandle>` and injects it as a request
+    /// extension.
+    routing: GraphRouting,
+    /// Per-actor admission control. Process-wide (not per-graph) —
+    /// see MR-668 decision Q6.
+    workload: Arc<workload::WorkloadController>,
     bearer_tokens: Arc<[(BearerTokenHash, Arc<str>)]>,
-    policy_engine: Option<Arc<PolicyEngine>>,
+    /// Server-level Cedar policy. Used by management endpoints (`GET
+    /// /graphs`) which act on the registry resource, not on a per-graph
+    /// resource. Loaded from the cluster-scoped policy binding when
+    /// configured. Per-graph policies live on each `GraphHandle.policy`.
+    server_policy: Option<Arc<PolicyEngine>>,
 }
-
-#[derive(Debug, Clone)]
-struct AuthenticatedActor(Arc<str>);
 
 struct ExportStreamWriter {
     sender: mpsc::UnboundedSender<std::result::Result<Bytes, io::Error>>,
@@ -143,12 +283,6 @@ impl Write for ExportStreamWriter {
     }
 }
 
-impl AuthenticatedActor {
-    fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
 #[derive(Debug)]
 pub struct ApiError {
     status: StatusCode,
@@ -159,8 +293,65 @@ pub struct ApiError {
 }
 
 impl AppState {
+    /// Canonical single-mode constructor. Every other `new_*` / `open_*`
+    /// helper is a thin convenience wrapper around this one. Builds the
+    /// engine + per-graph policy through `build_single_mode`, which
+    /// applies `Omnigraph::with_policy` so HTTP-layer and engine-layer
+    /// policy can never diverge — there is no "policy installed on HTTP
+    /// but not on engine" representable state (closes the prior
+    /// `with_policy_engine` footgun that reused the engine `Arc`
+    /// without re-applying `with_policy`).
+    pub fn new_single(
+        uri: String,
+        db: Omnigraph,
+        bearer_tokens: Vec<(String, String)>,
+        policy_engine: Option<PolicyEngine>,
+        workload: workload::WorkloadController,
+    ) -> Self {
+        let bearer_tokens = hash_bearer_tokens(bearer_tokens);
+        let per_graph_policy = policy_engine.map(Arc::new);
+        Self::build_single_mode(
+            uri,
+            db,
+            bearer_tokens,
+            per_graph_policy,
+            Arc::new(workload),
+            None,
+        )
+    }
+
+    /// Like `new_single`, but attaches a pre-validated stored-query
+    /// registry. Private — the production single-mode boot path
+    /// (`open_single_with_queries`) is the only caller; every public
+    /// `new_*` constructor builds with no stored queries.
+    fn new_single_with_queries(
+        uri: String,
+        db: Omnigraph,
+        bearer_tokens: Vec<(String, String)>,
+        policy_engine: Option<PolicyEngine>,
+        workload: workload::WorkloadController,
+        queries: Option<Arc<QueryRegistry>>,
+    ) -> Self {
+        let bearer_tokens = hash_bearer_tokens(bearer_tokens);
+        let per_graph_policy = policy_engine.map(Arc::new);
+        Self::build_single_mode(
+            uri,
+            db,
+            bearer_tokens,
+            per_graph_policy,
+            Arc::new(workload),
+            queries,
+        )
+    }
+
     pub fn new(uri: String, db: Omnigraph) -> Self {
-        Self::new_with_bearer_tokens(uri, db, Vec::new())
+        Self::new_single(
+            uri,
+            db,
+            Vec::new(),
+            None,
+            workload::WorkloadController::from_env(),
+        )
     }
 
     pub fn new_with_bearer_token(uri: String, db: Omnigraph, bearer_token: Option<String>) -> Self {
@@ -176,7 +367,13 @@ impl AppState {
         db: Omnigraph,
         bearer_tokens: Vec<(String, String)>,
     ) -> Self {
-        Self::new_with_bearer_tokens_and_policy(uri, db, bearer_tokens, None)
+        Self::new_single(
+            uri,
+            db,
+            bearer_tokens,
+            None,
+            workload::WorkloadController::from_env(),
+        )
     }
 
     pub fn new_with_bearer_tokens_and_policy(
@@ -185,16 +382,27 @@ impl AppState {
         bearer_tokens: Vec<(String, String)>,
         policy_engine: Option<PolicyEngine>,
     ) -> Self {
-        let bearer_tokens: Vec<(BearerTokenHash, Arc<str>)> = bearer_tokens
-            .into_iter()
-            .map(|(actor, token)| (hash_bearer_token(&token), Arc::<str>::from(actor)))
-            .collect();
-        Self {
+        Self::new_single(
             uri,
-            db: Arc::new(RwLock::new(db)),
-            bearer_tokens: Arc::from(bearer_tokens),
-            policy_engine: policy_engine.map(Arc::new),
-        }
+            db,
+            bearer_tokens,
+            policy_engine,
+            workload::WorkloadController::from_env(),
+        )
+    }
+
+    /// Construct with a caller-provided [`workload::WorkloadController`].
+    /// Tests and benches use this to override per-actor caps without
+    /// mutating global env vars (unsafe in Rust 2024 once the async
+    /// runtime is up — `setenv` isn't thread-safe). For tests that also
+    /// need a custom `PolicyEngine`, use [`new_single`] directly.
+    pub fn new_with_workload(
+        uri: String,
+        db: Omnigraph,
+        bearer_tokens: Vec<(String, String)>,
+        workload: workload::WorkloadController,
+    ) -> Self {
+        Self::new_single(uri, db, bearer_tokens, None, workload)
     }
 
     pub async fn open(uri: impl Into<String>) -> Result<Self> {
@@ -216,7 +424,7 @@ impl AppState {
         uri: impl Into<String>,
         bearer_tokens: Vec<(String, String)>,
     ) -> Result<Self> {
-        let uri = uri.into();
+        let uri = normalize_root_uri(&uri.into()).wrap_err("normalize graph URI")?;
         let db = Omnigraph::open(&uri).await?;
         Ok(Self::new_with_bearer_tokens(uri, db, bearer_tokens))
     }
@@ -226,32 +434,162 @@ impl AppState {
         bearer_tokens: Vec<(String, String)>,
         policy_file: Option<&PathBuf>,
     ) -> Result<Self> {
-        let uri = uri.into();
+        Self::open_single_with_queries(uri, bearer_tokens, policy_file, QueryRegistry::default())
+            .await
+    }
+
+    /// Single-mode boot with a stored-query registry: open the engine,
+    /// **type-check the registry against the live schema and refuse to
+    /// start on a breakage** (same posture as bad policy YAML), log
+    /// non-blocking warnings, then attach the registry to the handle.
+    /// With an empty registry the check is a no-op and no registry is
+    /// attached — that is the path `open_with_bearer_tokens_and_policy`
+    /// (no stored queries) takes.
+    pub async fn open_single_with_queries(
+        uri: impl Into<String>,
+        bearer_tokens: Vec<(String, String)>,
+        policy_file: Option<&PathBuf>,
+        queries: QueryRegistry,
+    ) -> Result<Self> {
+        Self::open_single_with_queries_for_graph_id(uri, bearer_tokens, policy_file, queries, None)
+            .await
+    }
+
+    async fn open_single_with_queries_for_graph_id(
+        uri: impl Into<String>,
+        bearer_tokens: Vec<(String, String)>,
+        policy_file: Option<&PathBuf>,
+        queries: QueryRegistry,
+        graph_id: Option<String>,
+    ) -> Result<Self> {
+        // The "policy requires tokens" invariant is enforced once by
+        // `classify_server_runtime_state` in `serve()`, before either
+        // single-mode or multi-mode construction is reached. By the
+        // time we get here, the (policy, no-tokens) combination has
+        // already been rejected — no second bail needed.
+        let uri = normalize_root_uri(&uri.into()).wrap_err("normalize graph URI")?;
+        let graph_id = graph_id.unwrap_or_else(|| uri.clone());
         let db = Omnigraph::open(&uri).await?;
+
+        // Validate the registry against the live schema and resolve it to
+        // an attachable handle (refuse boot on breakage).
+        let registry = validate_and_attach(queries, &db.catalog(), &graph_id)?;
+
         let policy_engine = match policy_file {
-            Some(path) => Some(PolicyEngine::load(path, &uri)?),
+            Some(path) => Some(PolicyEngine::load_graph(path, &graph_id)?),
             None => None,
         };
-        if policy_engine.is_some() && bearer_tokens.is_empty() {
-            bail!("policy requires at least one configured bearer token actor");
-        }
-        Ok(Self::new_with_bearer_tokens_and_policy(
+        Ok(Self::new_single_with_queries(
             uri,
             db,
             bearer_tokens,
             policy_engine,
+            workload::WorkloadController::from_env(),
+            registry,
         ))
     }
 
-    pub fn uri(&self) -> &str {
-        &self.uri
+    /// Single-graph convenience construction (RFC-011 cluster-only):
+    /// wraps the bare engine + per-graph policy in a `GraphHandle` keyed
+    /// by `default`, then builds a one-graph registry so the deployment
+    /// serves the same `/graphs/{graph_id}/...` cluster routes as any
+    /// other. Per-graph policy enforcement on the engine (MR-722) is
+    /// re-applied via `Omnigraph::with_policy` so HTTP and engine layers
+    /// can never diverge.
+    fn build_single_mode(
+        uri: String,
+        db: Omnigraph,
+        bearer_tokens: Arc<[(BearerTokenHash, Arc<str>)]>,
+        policy_engine: Option<Arc<PolicyEngine>>,
+        workload: Arc<workload::WorkloadController>,
+        queries: Option<Arc<QueryRegistry>>,
+    ) -> Self {
+        // Engine-layer policy gate (MR-722). With a per-graph policy
+        // installed, every `_as` writer on `Omnigraph` calls into the
+        // PolicyChecker. HTTP-layer `authorize_request` is the first
+        // gate; engine-layer is the redundant-but-correct backstop.
+        let db = if let Some(policy) = policy_engine.as_ref() {
+            let checker = Arc::clone(policy) as Arc<dyn omnigraph_policy::PolicyChecker>;
+            db.with_policy(checker)
+        } else {
+            db
+        };
+        // The convenience constructors address the single graph by the
+        // reserved id `default` — both the registry key and the URL
+        // segment (`/graphs/default/...`).
+        let uri = normalize_root_uri(&uri).unwrap_or(uri);
+        let graph_id = GraphId::try_from("default").expect("'default' is a valid GraphId");
+        let key = GraphKey::cluster(graph_id);
+        let handle = Arc::new(GraphHandle {
+            key,
+            uri,
+            engine: Arc::new(db),
+            policy: policy_engine,
+            queries,
+        });
+        let registry = Arc::new(
+            GraphRegistry::from_handles(vec![handle])
+                .expect("a single handle never collides on graph id"),
+        );
+        Self {
+            routing: GraphRouting {
+                registry,
+                config_path: None,
+            },
+            workload,
+            bearer_tokens,
+            server_policy: None,
+        }
+    }
+
+    /// Multi-mode constructor — used by the startup loop. Operators
+    /// reach this by invoking `omnigraph-server --cluster <dir|s3://...>`.
+    ///
+    /// Caller supplies the already-opened `GraphHandle`s and (optionally)
+    /// the path to the source cluster. `server_policy` is loaded from the
+    /// cluster-scoped policy binding if configured.
+    pub fn new_multi(
+        handles: Vec<Arc<GraphHandle>>,
+        bearer_tokens: Vec<(String, String)>,
+        server_policy: Option<PolicyEngine>,
+        workload: workload::WorkloadController,
+        config_path: Option<PathBuf>,
+    ) -> std::result::Result<Self, InsertError> {
+        let bearer_tokens = hash_bearer_tokens(bearer_tokens);
+        let registry = Arc::new(GraphRegistry::from_handles(handles)?);
+        Ok(Self {
+            routing: GraphRouting {
+                registry,
+                config_path,
+            },
+            workload: Arc::new(workload),
+            bearer_tokens,
+            server_policy: server_policy.map(Arc::new),
+        })
+    }
+
+    /// Runtime routing accessor. Handlers don't typically inspect this —
+    /// they extract `Arc<GraphHandle>` via the routing middleware — but
+    /// `server_graphs_list` reads the registry through it.
+    pub fn routing(&self) -> &GraphRouting {
+        &self.routing
     }
 
     fn requires_bearer_auth(&self) -> bool {
-        !self.bearer_tokens.is_empty() || self.policy_engine.is_some()
+        if !self.bearer_tokens.is_empty() {
+            return true;
+        }
+        if self.server_policy.is_some() {
+            return true;
+        }
+        // Any per-graph policy also requires auth — otherwise the
+        // policy gate would receive unauthenticated requests. Reading
+        // the cached `any_per_graph_policy` flag off the registry
+        // snapshot is O(1).
+        self.routing.registry.snapshot_ref().any_per_graph_policy
     }
 
-    fn authenticate_bearer_token(&self, provided_token: &str) -> Option<Arc<str>> {
+    fn authenticate_bearer_token(&self, provided_token: &str) -> Option<ResolvedActor> {
         // Hash the incoming token and compare against every stored digest in
         // constant time. Iterate all entries unconditionally so total work —
         // and therefore response timing — doesn't depend on which slot matches.
@@ -262,12 +600,16 @@ impl AppState {
                 matched = Some(Arc::clone(actor));
             }
         }
-        matched
+        matched.map(ResolvedActor::cluster_static)
     }
+}
 
-    fn policy_engine(&self) -> Option<&PolicyEngine> {
-        self.policy_engine.as_deref()
-    }
+fn hash_bearer_tokens(bearer_tokens: Vec<(String, String)>) -> Arc<[(BearerTokenHash, Arc<str>)]> {
+    let tokens: Vec<(BearerTokenHash, Arc<str>)> = bearer_tokens
+        .into_iter()
+        .map(|(actor, token)| (hash_bearer_token(&token), Arc::<str>::from(actor)))
+        .collect();
+    Arc::from(tokens)
 }
 
 impl ApiError {
@@ -311,6 +653,20 @@ impl ApiError {
         }
     }
 
+    /// HTTP 405 Method Not Allowed. Used when the route is mounted but
+    /// the active server mode doesn't serve it (`GET /graphs` in
+    /// single-graph mode returns this instead of 404 so clients can
+    /// distinguish "wrong context" from "no such resource").
+    pub fn method_not_allowed(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::METHOD_NOT_ALLOWED,
+            code: ErrorCode::MethodNotAllowed,
+            message: message.into(),
+            merge_conflicts: Vec::new(),
+            manifest_conflict: None,
+        }
+    }
+
     pub fn conflict(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::CONFLICT,
@@ -331,6 +687,31 @@ impl ApiError {
         }
     }
 
+    /// HTTP 429 Too Many Requests — actor exceeded their per-actor
+    /// admission cap (count or byte budget). Clients should respect the
+    /// `Retry-After` header. Mapped from `RejectReason::InFlightCountExceeded`
+    /// and `RejectReason::ByteBudgetExceeded`.
+    pub fn too_many_requests(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            code: ErrorCode::TooManyRequests,
+            message: message.into(),
+            merge_conflicts: Vec::new(),
+            manifest_conflict: None,
+        }
+    }
+
+    /// Convert a `WorkloadController` rejection into the matching
+    /// `ApiError` variant.
+    pub fn from_workload_reject(reject: workload::RejectReason) -> Self {
+        match reject {
+            workload::RejectReason::InFlightCountExceeded { .. }
+            | workload::RejectReason::ByteBudgetExceeded { .. } => {
+                Self::too_many_requests(reject.to_string())
+            }
+        }
+    }
+
     fn merge_conflict(conflicts: Vec<api::MergeConflictOutput>) -> Self {
         Self {
             status: StatusCode::CONFLICT,
@@ -341,10 +722,7 @@ impl ApiError {
         }
     }
 
-    fn manifest_version_conflict(
-        message: String,
-        details: api::ManifestConflictOutput,
-    ) -> Self {
+    fn manifest_version_conflict(message: String, details: api::ManifestConflictOutput) -> Self {
         Self {
             status: StatusCode::CONFLICT,
             code: ErrorCode::Conflict,
@@ -386,6 +764,19 @@ impl ApiError {
             ),
             OmniError::Lance(message) => Self::internal(format!("storage: {message}")),
             OmniError::Io(err) => Self::internal(format!("io: {err}")),
+            // Engine-layer policy enforcement (MR-722). All denials and
+            // evaluation failures surface here as 403. The HTTP-layer
+            // `authorize_request` already distinguishes 401 (missing
+            // bearer) from 403 (policy denial), so by the time the
+            // engine gate fires, the bearer is valid — any failure from
+            // the engine is a policy outcome, not an auth one.
+            OmniError::Policy(message) => Self::forbidden(message),
+            // `Omnigraph::init` against an existing graph URI in strict
+            // mode. Not currently HTTP-reachable (POST /graphs was
+            // pulled), but mapping is wired so the variant has a
+            // single canonical translation when a future runtime
+            // create endpoint lands.
+            err @ OmniError::AlreadyInitialized { .. } => Self::conflict(err.to_string()),
         }
     }
 }
@@ -418,10 +809,21 @@ fn summarize_merge_conflicts(conflicts: &[api::MergeConflictOutput]) -> String {
     format!("merge conflicts: {}{}", preview.join("; "), suffix)
 }
 
+/// Constant `Retry-After` value (seconds) emitted on 429 responses.
+const RETRY_AFTER_SECONDS: &str = "60";
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        let mut headers = axum::http::HeaderMap::new();
+        if matches!(self.code, ErrorCode::TooManyRequests) {
+            headers.insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static(RETRY_AFTER_SECONDS),
+            );
+        }
         (
             self.status,
+            headers,
             Json(ErrorOutput {
                 error: self.message,
                 code: Some(self.code),
@@ -438,36 +840,97 @@ pub fn init_tracing() {
     let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 }
 
-pub fn load_server_settings(
-    config_path: Option<&PathBuf>,
-    cli_uri: Option<String>,
-    cli_target: Option<String>,
-    cli_bind: Option<String>,
-) -> Result<ServerConfig> {
-    let config = load_config(config_path)?;
-    let uri =
-        config.resolve_target_uri(cli_uri, cli_target.as_deref(), config.server_graph_name())?;
-    let bind = cli_bind.unwrap_or_else(|| config.server_bind().to_string());
-    let policy_file = config.resolve_policy_file();
+/// Log each non-blocking advisory from a registry check report.
+fn log_registry_warnings(label: &str, report: &queries::CheckReport) {
+    for warning in &report.warnings {
+        warn!(graph = label, query = %warning.query, "stored query: {}", warning.message);
+    }
+}
 
-    Ok(ServerConfig {
-        uri,
-        bind,
-        policy_file,
+fn validate_registry_against_catalog(
+    registry: &QueryRegistry,
+    catalog: &Catalog,
+    label: &str,
+) -> omnigraph::error::Result<()> {
+    let report = check(registry, catalog);
+    if report.has_breakages() {
+        return Err(OmniError::manifest(format_check_breakages(label, &report)));
+    }
+    log_registry_warnings(label, &report);
+    Ok(())
+}
+
+/// Validate a loaded stored-query registry against the live schema and
+/// resolve it to an attachable handle. Refuses boot on any breakage
+/// (same posture as bad policy YAML), logs the non-blocking warnings,
+/// and collapses an empty registry to `None` (nothing attached). This is
+/// the single gate every open path funnels through, so no opener can
+/// attach a registry that has not been schema-checked. `label` names the
+/// graph in messages.
+fn validate_and_attach(
+    queries: QueryRegistry,
+    catalog: &Catalog,
+    label: &str,
+) -> Result<Option<Arc<QueryRegistry>>> {
+    validate_registry_against_catalog(&queries, catalog, label)
+        .map_err(|err| color_eyre::eyre::eyre!(err.to_string()))?;
+    Ok(if queries.is_empty() {
+        None
+    } else {
+        Some(Arc::new(queries))
     })
 }
 
 pub fn build_app(state: AppState) -> Router {
-    let protected = Router::new()
+    // The per-graph protected routes, identical in single + multi mode.
+    // Two middleware layers wrap them (outer first, inner last):
+    //   1. `require_bearer_auth` — extracts the bearer token and injects
+    //      `ResolvedActor` (or rejects 401).
+    //   2. `resolve_graph_handle` — injects `Arc<GraphHandle>` based on
+    //      the active mode (single: the only handle; multi: lookup by
+    //      `{graph_id}` in the URI path).
+    let per_graph_protected = Router::new()
         .route("/snapshot", get(server_snapshot))
         .route("/export", post(server_export))
-        .route("/read", post(server_read))
-        .route("/change", post(server_change))
+        // /read and /change are kept indefinitely for back-compat;
+        // their handlers carry #[deprecated] so the OpenAPI operation is
+        // flagged and their responses include RFC 9745 Deprecation +
+        // RFC 8288 Link headers. Suppress the call-site warning for the
+        // route registration itself.
+        .route(
+            "/read",
+            post({
+                #[allow(deprecated)]
+                server_read
+            }),
+        )
+        .route("/query", post(server_query))
+        .route(
+            "/change",
+            post({
+                #[allow(deprecated)]
+                server_change
+            }),
+        )
+        .route("/mutate", post(server_mutate))
+        .route("/queries", get(server_list_queries))
+        .route("/queries/{name}", post(server_invoke_query))
         .route("/schema", get(server_schema_get))
         .route("/schema/apply", post(server_schema_apply))
         .route(
+            "/load",
+            post(server_load).layer(DefaultBodyLimit::max(INGEST_REQUEST_BODY_LIMIT_BYTES)),
+        )
+        // /ingest is the deprecated alias of /load; its handler carries
+        // #[deprecated] (OpenAPI operation flagged) and emits RFC 9745
+        // Deprecation + RFC 8288 Link headers. Suppress the call-site warning.
+        .route(
             "/ingest",
-            post(server_ingest).layer(DefaultBodyLimit::max(INGEST_REQUEST_BODY_LIMIT_BYTES)),
+            post({
+                #[allow(deprecated)]
+                server_ingest
+            })
+            .layer(DefaultBodyLimit::max(INGEST_REQUEST_BODY_LIMIT_BYTES)),
         )
         .route(
             "/branches",
@@ -479,8 +942,31 @@ pub fn build_app(state: AppState) -> Router {
         .route("/commits/{commit_id}", get(server_commit_show))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
+            resolve_graph_handle,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
             require_bearer_auth,
         ));
+
+    // Management endpoints (`GET /graphs`) live alongside the per-graph
+    // router. They go through bearer auth but NOT through
+    // `resolve_graph_handle` — they operate on the registry directly.
+    //
+    // Runtime add/remove (`POST /graphs`, `DELETE /graphs/{id}`) is not
+    // exposed — operators run `cluster apply` and restart.
+    let management = Router::new()
+        .route("/graphs", get(server_graphs_list))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_bearer_auth,
+        ));
+
+    // RFC-011 cluster-only: per-graph routes always nest under
+    // `/graphs/{graph_id}/...`; there are no flat single-graph routes.
+    let protected: Router<AppState> = Router::new()
+        .nest("/graphs/{graph_id}", per_graph_protected)
+        .merge(management);
 
     Router::new()
         .route("/healthz", get(server_health))
@@ -494,18 +980,195 @@ pub fn build_app(state: AppState) -> Router {
 pub async fn serve(config: ServerConfig) -> Result<()> {
     let token_source = resolve_token_source().await?;
     info!(source = token_source.name(), "loaded bearer token source");
-    let state = AppState::open_with_bearer_tokens_and_policy(
-        config.uri.clone(),
-        token_source.load().await?,
-        config.policy_file.as_ref(),
-    )
-    .await?;
-    let listener = TcpListener::bind(&config.bind).await?;
-    info!(uri = %config.uri, bind = %config.bind, "serving omnigraph");
+    let tokens = token_source.load().await?;
+
+    // For runtime-state classification, "any policy configured" means
+    // either the top-level/single-mode policy file OR a server-level
+    // policy OR any per-graph policy file. Mirrors the
+    // `requires_bearer_auth` semantics on AppState.
+    let has_policy_configured = match &config.mode {
+        ServerConfigMode::Multi {
+            graphs,
+            server_policy,
+            ..
+        } => server_policy.is_some() || graphs.iter().any(|g| g.policy.is_some()),
+    };
+    let runtime_state = classify_server_runtime_state(
+        !tokens.is_empty(),
+        has_policy_configured,
+        config.allow_unauthenticated,
+    )?;
+    match runtime_state {
+        ServerRuntimeState::Open => warn!(
+            "running with --unauthenticated: no bearer tokens, no policy file, all \
+             requests permitted. This is for local dev only — do not expose to a \
+             network you don't fully trust."
+        ),
+        ServerRuntimeState::DefaultDeny => warn!(
+            "bearer tokens are configured but no policy file is set — running in \
+             default-deny mode (only `read` actions are permitted for authenticated \
+             actors). Configure a graph or cluster policy bundle in the cluster config, \
+             run `omnigraph cluster apply`, and restart to enable Cedar rules."
+        ),
+        ServerRuntimeState::PolicyEnabled => {}
+    }
+
+    let bind = config.bind.clone();
+    let state = match config.mode {
+        ServerConfigMode::Multi {
+            graphs,
+            config_path,
+            server_policy,
+        } => {
+            info!(
+                bind = %bind,
+                mode = "cluster",
+                graph_count = graphs.len(),
+                config = %config_path.display(),
+                "serving omnigraph"
+            );
+            open_multi_graph_state(
+                graphs,
+                tokens,
+                server_policy.as_ref(),
+                config_path,
+                config.require_all_graphs,
+            )
+            .await?
+        }
+    };
+
+    let listener = TcpListener::bind(&bind).await?;
     axum::serve(listener, build_app(state))
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())
+}
+
+/// Load a graph-scoped policy bundle from either source kind.
+fn load_graph_policy(source: &PolicySource, graph_id: &str) -> Result<PolicyEngine> {
+    match source {
+        PolicySource::File(path) => Ok(PolicyEngine::load_graph(path, graph_id)?),
+        PolicySource::Inline(text) => Ok(PolicyEngine::load_graph_from_source(text, graph_id)?),
+    }
+}
+
+/// Parallel open of every graph in the startup config, with bounded
+/// concurrency (`buffer_unordered(4)`). Graph-specific open failures
+/// quarantine that graph; startup succeeds as long as at least one graph
+/// opens.
+///
+/// The bound 4 is a rule-of-thumb for I/O-bound work. At N ≤ 10 this
+/// trades startup latency for a small amount of concurrent S3 / Lance
+/// open pressure.
+pub async fn open_multi_graph_state(
+    graphs: Vec<GraphStartupConfig>,
+    tokens: Vec<(String, String)>,
+    server_policy_source: Option<&PolicySource>,
+    config_path: PathBuf,
+    require_all_graphs: bool,
+) -> Result<AppState> {
+    use futures::StreamExt;
+
+    if graphs.is_empty() {
+        bail!("multi-graph mode requires at least one graph in the `graphs:` map");
+    }
+
+    // Server-level policy (loaded once, applies to management endpoints).
+    // The placeholder graph_id `"server"` is the sentinel the Cedar
+    // resource-model refactor maps to the singleton
+    // `Omnigraph::Server::"root"` entity at evaluation time.
+    let server_policy = match server_policy_source {
+        Some(PolicySource::File(path)) => Some(PolicyEngine::load_server(path)?),
+        Some(PolicySource::Inline(source)) => Some(PolicyEngine::load_server_from_source(source)?),
+        None => None,
+    };
+
+    let configured_graphs = graphs.len();
+    let results = futures::stream::iter(graphs.into_iter())
+        .map(|cfg| async move {
+            let graph_id = cfg.graph_id.clone();
+            open_single_graph(cfg).await.map_err(|err| (graph_id, err))
+        })
+        .buffer_unordered(4)
+        .collect::<Vec<_>>()
+        .await;
+    let mut handles = Vec::new();
+    let mut failed = 0usize;
+    for result in results {
+        match result {
+            Ok(handle) => handles.push(handle),
+            Err((graph_id, err)) => {
+                failed += 1;
+                warn!(
+                    graph_id = %graph_id,
+                    error = %err,
+                    "graph quarantined during startup"
+                );
+            }
+        }
+    }
+    if require_all_graphs && failed > 0 {
+        bail!(
+            "strict multi-graph startup requires every graph to open ({} configured, {} failed)",
+            configured_graphs,
+            failed
+        );
+    }
+    if handles.is_empty() {
+        bail!(
+            "no healthy graphs opened from multi-graph startup config ({} configured, {} failed)",
+            configured_graphs,
+            failed
+        );
+    }
+
+    let workload = workload::WorkloadController::from_env();
+    let state = AppState::new_multi(handles, tokens, server_policy, workload, Some(config_path))
+        .map_err(|err| color_eyre::eyre::eyre!("multi-graph registry: {err}"))?;
+    Ok(state)
+}
+
+/// Open one graph and wrap it in a `GraphHandle`. Used at startup by
+/// `open_multi_graph_state`.
+async fn open_single_graph(cfg: GraphStartupConfig) -> Result<Arc<GraphHandle>> {
+    let graph_id = GraphId::try_from(cfg.graph_id.clone())
+        .map_err(|err| color_eyre::eyre::eyre!("graph id '{}': {err}", cfg.graph_id))?;
+    let uri = normalize_root_uri(&cfg.uri)
+        .wrap_err_with(|| format!("normalize URI for graph '{}'", cfg.graph_id))?;
+
+    let db = Omnigraph::open(&uri)
+        .await
+        .map_err(|err| color_eyre::eyre::eyre!("open graph '{}' at {}: {err}", graph_id, uri))?;
+    let db = if let Some(embedding) = cfg.embedding {
+        db.with_embedding_config(Arc::new(embedding))
+    } else {
+        db
+    };
+
+    // Validate this graph's stored queries against the live schema and
+    // resolve them to an attachable handle (refuse boot on breakage).
+    // Done before the policy match rebinds `db`; the catalog handle is an
+    // owned `Arc`, so no borrow of `db` survives into the match.
+    let queries = validate_and_attach(cfg.queries, &db.catalog(), graph_id.as_str())?;
+
+    let (policy_arc, db) = match &cfg.policy {
+        Some(source) => {
+            let policy = load_graph_policy(source, graph_id.as_str())?;
+            let policy_arc: Arc<PolicyEngine> = Arc::new(policy);
+            let checker = Arc::clone(&policy_arc) as Arc<dyn omnigraph_policy::PolicyChecker>;
+            (Some(policy_arc), db.with_policy(checker))
+        }
+        None => (None, db),
+    };
+
+    Ok(Arc::new(GraphHandle {
+        key: GraphKey::cluster(graph_id),
+        uri,
+        engine: Arc::new(db),
+        policy: policy_arc,
+        queries,
+    }))
 }
 
 async fn shutdown_signal() {
@@ -514,1139 +1177,4 @@ async fn shutdown_signal() {
         return;
     }
     info!("shutdown signal received");
-}
-
-#[utoipa::path(
-    get,
-    path = "/healthz",
-    tag = "health",
-    operation_id = "health",
-    responses(
-        (status = 200, description = "Server is healthy", body = HealthOutput),
-    ),
-)]
-/// Liveness probe.
-///
-/// Returns server status and version. Unauthenticated; safe to call from any
-/// caller. Use this to confirm the server is reachable before invoking other
-/// endpoints.
-async fn server_health() -> Json<HealthOutput> {
-    Json(HealthOutput {
-        status: "ok".to_string(),
-        version: SERVER_VERSION.to_string(),
-        source_version: SERVER_SOURCE_VERSION.map(str::to_string),
-    })
-}
-
-async fn server_openapi(State(state): State<AppState>) -> Json<utoipa::openapi::OpenApi> {
-    let mut doc = ApiDoc::openapi();
-    if !state.requires_bearer_auth() {
-        strip_security(&mut doc);
-    }
-    Json(doc)
-}
-
-fn strip_security(doc: &mut utoipa::openapi::OpenApi) {
-    if let Some(components) = doc.components.as_mut() {
-        components.security_schemes.clear();
-    }
-    for path_item in doc.paths.paths.values_mut() {
-        for op in [
-            path_item.get.as_mut(),
-            path_item.post.as_mut(),
-            path_item.put.as_mut(),
-            path_item.delete.as_mut(),
-            path_item.options.as_mut(),
-            path_item.head.as_mut(),
-            path_item.patch.as_mut(),
-            path_item.trace.as_mut(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            op.security = None;
-        }
-    }
-}
-
-async fn require_bearer_auth(
-    State(state): State<AppState>,
-    mut request: Request,
-    next: Next,
-) -> std::result::Result<Response, ApiError> {
-    if !state.requires_bearer_auth() {
-        return Ok(next.run(request).await);
-    }
-
-    let Some(header) = request
-        .headers()
-        .get(AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-    else {
-        return Err(ApiError::unauthorized("missing bearer token"));
-    };
-
-    let Some(provided_token) = header.strip_prefix("Bearer ") else {
-        return Err(ApiError::unauthorized("missing bearer token"));
-    };
-
-    let Some(actor) = state.authenticate_bearer_token(provided_token) else {
-        return Err(ApiError::unauthorized("invalid bearer token"));
-    };
-    request.extensions_mut().insert(AuthenticatedActor(actor));
-
-    Ok(next.run(request).await)
-}
-
-fn log_policy_decision(actor_id: &str, request: &PolicyRequest, decision: &PolicyDecision) {
-    info!(
-        actor_id = actor_id,
-        action = %request.action,
-        branch = request.branch.as_deref().unwrap_or(""),
-        target_branch = request.target_branch.as_deref().unwrap_or(""),
-        allowed = decision.allowed,
-        matched_rule_id = decision.matched_rule_id.as_deref().unwrap_or(""),
-        "policy decision"
-    );
-}
-
-fn authorize_request(
-    state: &AppState,
-    actor: Option<&AuthenticatedActor>,
-    mut request: PolicyRequest,
-) -> std::result::Result<(), ApiError> {
-    let Some(engine) = state.policy_engine() else {
-        return Ok(());
-    };
-    let Some(actor) = actor else {
-        return Err(ApiError::unauthorized("missing bearer token"));
-    };
-    // Authoritative actor_id is the authenticated session, not whatever the
-    // handler put in the request. Prevents an empty-string default at any
-    // call site from ever reaching the engine as a policy subject.
-    request.actor_id = actor.as_str().to_string();
-    let decision = engine
-        .authorize(&request)
-        .map_err(|err| ApiError::internal(format!("policy: {err}")))?;
-    log_policy_decision(actor.as_str(), &request, &decision);
-    if decision.allowed {
-        Ok(())
-    } else {
-        Err(ApiError::forbidden(decision.message))
-    }
-}
-
-#[utoipa::path(
-    get,
-    path = "/snapshot",
-    tag = "snapshots",
-    operation_id = "getSnapshot",
-    params(SnapshotQuery),
-    responses(
-        (status = 200, description = "Database snapshot", body = api::SnapshotOutput),
-        (status = 401, description = "Unauthorized", body = ErrorOutput),
-        (status = 403, description = "Forbidden", body = ErrorOutput),
-    ),
-    security(("bearer_token" = [])),
-)]
-/// Read the current snapshot of a branch.
-///
-/// Returns the manifest version plus per-table metadata (path, version, row
-/// count) for every table on the branch. Defaults to `main` when `branch` is
-/// omitted. Read-only.
-async fn server_snapshot(
-    State(state): State<AppState>,
-    actor: Option<Extension<AuthenticatedActor>>,
-    Query(query): Query<SnapshotQuery>,
-) -> std::result::Result<Json<api::SnapshotOutput>, ApiError> {
-    let branch = query.branch.unwrap_or_else(|| "main".to_string());
-    authorize_request(
-        &state,
-        actor.as_ref().map(|Extension(actor)| actor),
-        PolicyRequest {
-            actor_id: actor
-                .as_ref()
-                .map(|Extension(actor)| actor.as_str().to_string())
-                .unwrap_or_default(),
-            action: PolicyAction::Read,
-            branch: Some(branch.clone()),
-            target_branch: None,
-        },
-    )?;
-    let snapshot = {
-        let db = Arc::clone(&state.db).read_owned().await;
-        db.snapshot_of(ReadTarget::branch(branch.as_str()))
-            .await
-            .map_err(ApiError::from_omni)?
-    };
-    Ok(Json(snapshot_payload(&branch, &snapshot)))
-}
-
-#[utoipa::path(
-    post,
-    path = "/read",
-    tag = "queries",
-    operation_id = "read",
-    request_body = ReadRequest,
-    responses(
-        (status = 200, description = "Query results", body = ReadOutput),
-        (status = 400, description = "Bad request", body = ErrorOutput),
-        (status = 401, description = "Unauthorized", body = ErrorOutput),
-        (status = 403, description = "Forbidden", body = ErrorOutput),
-    ),
-    security(("bearer_token" = [])),
-)]
-/// Execute a GQ read query.
-///
-/// Runs the query in `query_source` against either a branch or a frozen
-/// snapshot (mutually exclusive). When `query_source` defines multiple named
-/// queries, pick one with `query_name`. `params` is a JSON object whose keys
-/// match the parameters declared by the query. Returns rows as a JSON array
-/// plus a `columns` list. Read-only.
-async fn server_read(
-    State(state): State<AppState>,
-    actor: Option<Extension<AuthenticatedActor>>,
-    Json(request): Json<ReadRequest>,
-) -> std::result::Result<Json<ReadOutput>, ApiError> {
-    if request.branch.is_some() && request.snapshot.is_some() {
-        return Err(ApiError::bad_request(
-            "read request may specify branch or snapshot, not both",
-        ));
-    }
-
-    let target = read_target_from_request(request.branch, request.snapshot);
-    let policy_branch = match &target {
-        ReadTarget::Branch(branch) => Some(branch.clone()),
-        ReadTarget::Snapshot(_) if state.policy_engine().is_some() && actor.is_some() => {
-            let db = Arc::clone(&state.db).read_owned().await;
-            db.resolved_branch_of(target.clone())
-                .await
-                .map(|branch| branch.or_else(|| Some("main".to_string())))
-                .map_err(ApiError::from_omni)?
-        }
-        ReadTarget::Snapshot(_) => None,
-    };
-    authorize_request(
-        &state,
-        actor.as_ref().map(|Extension(actor)| actor),
-        PolicyRequest {
-            actor_id: actor
-                .as_ref()
-                .map(|Extension(actor)| actor.as_str().to_string())
-                .unwrap_or_default(),
-            action: PolicyAction::Read,
-            branch: policy_branch,
-            target_branch: None,
-        },
-    )?;
-    let (selected_name, query_params) =
-        select_named_query(&request.query_source, request.query_name.as_deref())
-            .map_err(|err| ApiError::bad_request(err.to_string()))?;
-    let params = query_params_from_json(&query_params, request.params.as_ref())
-        .map_err(|err| ApiError::bad_request(err.to_string()))?;
-
-    let result = {
-        let db = Arc::clone(&state.db).read_owned().await;
-        db.query(
-            target.clone(),
-            &request.query_source,
-            &selected_name,
-            &params,
-        )
-        .await
-        .map_err(ApiError::from_omni)?
-    };
-    Ok(Json(api::read_output(selected_name, &target, result)))
-}
-
-#[utoipa::path(
-    post,
-    path = "/export",
-    tag = "queries",
-    operation_id = "export",
-    request_body = ExportRequest,
-    responses(
-        (status = 200, description = "Exported data as NDJSON", content_type = "application/x-ndjson"),
-        (status = 400, description = "Bad request", body = ErrorOutput),
-        (status = 401, description = "Unauthorized", body = ErrorOutput),
-        (status = 403, description = "Forbidden", body = ErrorOutput),
-    ),
-    security(("bearer_token" = [])),
-)]
-/// Stream the contents of a branch as NDJSON.
-///
-/// Emits one JSON object per line (`application/x-ndjson`). Filter with
-/// `type_names` (node/edge type names) and/or `table_keys`; both empty
-/// streams the entire branch. Suitable for large exports — the response is
-/// streamed, not buffered. Read-only.
-async fn server_export(
-    State(state): State<AppState>,
-    actor: Option<Extension<AuthenticatedActor>>,
-    Json(request): Json<ExportRequest>,
-) -> std::result::Result<Response, ApiError> {
-    let branch = request.branch.unwrap_or_else(|| "main".to_string());
-    authorize_request(
-        &state,
-        actor.as_ref().map(|Extension(actor)| actor),
-        PolicyRequest {
-            actor_id: actor
-                .as_ref()
-                .map(|Extension(actor)| actor.as_str().to_string())
-                .unwrap_or_default(),
-            action: PolicyAction::Export,
-            branch: Some(branch.clone()),
-            target_branch: None,
-        },
-    )?;
-    let db = Arc::clone(&state.db);
-    let type_names = request.type_names.clone();
-    let table_keys = request.table_keys.clone();
-    let (tx, rx) = mpsc::unbounded_channel::<std::result::Result<Bytes, io::Error>>();
-    tokio::spawn(async move {
-        let result = {
-            let db = db.read().await;
-            let mut writer = ExportStreamWriter { sender: tx.clone() };
-            db.export_jsonl_to_writer(&branch, &type_names, &table_keys, &mut writer)
-                .await
-        };
-        if let Err(err) = result {
-            let _ = tx.send(Err(io::Error::other(err.to_string())));
-        }
-    });
-    let body = Body::from_stream(stream::unfold(rx, |mut rx| async move {
-        rx.recv().await.map(|item| (item, rx))
-    }));
-    Ok((
-        StatusCode::OK,
-        [(CONTENT_TYPE, "application/x-ndjson; charset=utf-8")],
-        body,
-    )
-        .into_response())
-}
-
-#[utoipa::path(
-    post,
-    path = "/change",
-    tag = "mutations",
-    operation_id = "change",
-    request_body = ChangeRequest,
-    responses(
-        (status = 200, description = "Mutation results", body = ChangeOutput),
-        (status = 400, description = "Bad request", body = ErrorOutput),
-        (status = 401, description = "Unauthorized", body = ErrorOutput),
-        (status = 403, description = "Forbidden", body = ErrorOutput),
-        (status = 409, description = "Merge conflict", body = ErrorOutput),
-    ),
-    security(("bearer_token" = [])),
-)]
-/// Apply a GQ mutation to a branch.
-///
-/// Writes to the named `branch` (defaults to `main`). Mutations are atomic
-/// per call and produce a new commit. Returns counts of nodes and edges
-/// affected. **Destructive**: on success the branch is updated; rejected
-/// mutations may still acquire locks briefly. Returns 409 on merge conflict.
-async fn server_change(
-    State(state): State<AppState>,
-    actor: Option<Extension<AuthenticatedActor>>,
-    Json(request): Json<ChangeRequest>,
-) -> std::result::Result<Json<ChangeOutput>, ApiError> {
-    let branch = request.branch.unwrap_or_else(|| "main".to_string());
-    let actor_id = actor.as_ref().map(|Extension(actor)| actor.as_str());
-    authorize_request(
-        &state,
-        actor.as_ref().map(|Extension(actor)| actor),
-        PolicyRequest {
-            actor_id: actor_id.map(str::to_string).unwrap_or_default(),
-            action: PolicyAction::Change,
-            branch: Some(branch.clone()),
-            target_branch: None,
-        },
-    )?;
-    let (selected_name, query_params) =
-        select_named_query(&request.query_source, request.query_name.as_deref())
-            .map_err(|err| ApiError::bad_request(err.to_string()))?;
-    let params = query_params_from_json(&query_params, request.params.as_ref())
-        .map_err(|err| ApiError::bad_request(err.to_string()))?;
-
-    let result = {
-        let mut db = Arc::clone(&state.db).write_owned().await;
-        db.mutate_as(
-            &branch,
-            &request.query_source,
-            &selected_name,
-            &params,
-            actor_id,
-        )
-        .await
-        .map_err(ApiError::from_omni)?
-    };
-    Ok(Json(ChangeOutput {
-        branch,
-        query_name: selected_name,
-        affected_nodes: result.affected_nodes,
-        affected_edges: result.affected_edges,
-        actor_id: actor_id.map(str::to_string),
-    }))
-}
-
-#[utoipa::path(
-    get,
-    path = "/schema",
-    tag = "schema",
-    operation_id = "getSchema",
-    responses(
-        (status = 200, description = "Current schema source", body = SchemaOutput),
-        (status = 401, description = "Unauthorized", body = ErrorOutput),
-        (status = 403, description = "Forbidden", body = ErrorOutput),
-    ),
-    security(("bearer_token" = [])),
-)]
-/// Read the current schema source.
-///
-/// Returns the project's schema as a single string in `.pg` source form.
-/// Useful for clients that want to introspect available types and tables
-/// before constructing GQ queries. Read-only.
-async fn server_schema_get(
-    State(state): State<AppState>,
-    actor: Option<Extension<AuthenticatedActor>>,
-) -> std::result::Result<Json<SchemaOutput>, ApiError> {
-    authorize_request(
-        &state,
-        actor.as_ref().map(|Extension(actor)| actor),
-        PolicyRequest {
-            actor_id: actor
-                .as_ref()
-                .map(|Extension(actor)| actor.as_str().to_string())
-                .unwrap_or_default(),
-            action: PolicyAction::Read,
-            branch: None,
-            target_branch: None,
-        },
-    )?;
-    let schema_source = {
-        let db = Arc::clone(&state.db).read_owned().await;
-        db.schema_source().to_string()
-    };
-    Ok(Json(SchemaOutput { schema_source }))
-}
-
-#[utoipa::path(
-    post,
-    path = "/schema/apply",
-    tag = "mutations",
-    operation_id = "applySchema",
-    request_body = SchemaApplyRequest,
-    responses(
-        (status = 200, description = "Schema apply results", body = SchemaApplyOutput),
-        (status = 400, description = "Bad request", body = ErrorOutput),
-        (status = 401, description = "Unauthorized", body = ErrorOutput),
-        (status = 403, description = "Forbidden", body = ErrorOutput),
-    ),
-    security(("bearer_token" = [])),
-)]
-/// Apply a schema migration.
-///
-/// Diffs `schema_source` against the current schema and applies the resulting
-/// migration steps (add/drop type, add/drop column, etc.). **Destructive**:
-/// some steps drop data. Returns the list of steps applied; if `applied` is
-/// false the diff was unsupported and no changes were made.
-async fn server_schema_apply(
-    State(state): State<AppState>,
-    actor: Option<Extension<AuthenticatedActor>>,
-    Json(request): Json<SchemaApplyRequest>,
-) -> std::result::Result<Json<SchemaApplyOutput>, ApiError> {
-    let actor_id = actor.as_ref().map(|Extension(actor)| actor.as_str());
-    authorize_request(
-        &state,
-        actor.as_ref().map(|Extension(actor)| actor),
-        PolicyRequest {
-            actor_id: actor_id.map(str::to_string).unwrap_or_default(),
-            action: PolicyAction::SchemaApply,
-            branch: None,
-            target_branch: Some("main".to_string()),
-        },
-    )?;
-    let result = {
-        let mut db = Arc::clone(&state.db).write_owned().await;
-        db.apply_schema(&request.schema_source)
-            .await
-            .map_err(ApiError::from_omni)?
-    };
-    Ok(Json(schema_apply_output(state.uri(), result)))
-}
-
-#[utoipa::path(
-    post,
-    path = "/ingest",
-    tag = "mutations",
-    operation_id = "ingest",
-    request_body = IngestRequest,
-    responses(
-        (status = 200, description = "Ingest results", body = IngestOutput),
-        (status = 400, description = "Bad request", body = ErrorOutput),
-        (status = 401, description = "Unauthorized", body = ErrorOutput),
-        (status = 403, description = "Forbidden", body = ErrorOutput),
-    ),
-    security(("bearer_token" = [])),
-)]
-/// Bulk-ingest NDJSON data into a branch.
-///
-/// `data` is NDJSON with one record per line. `mode` controls behavior on
-/// existing rows: `merge` upserts by id (default), `append` blindly inserts,
-/// `overwrite` replaces table contents. If `branch` does not exist it is
-/// created from `from` (defaults to `main`). **Destructive** when `mode` is
-/// `overwrite` or when ingest produces conflicting writes.
-async fn server_ingest(
-    State(state): State<AppState>,
-    actor: Option<Extension<AuthenticatedActor>>,
-    Json(request): Json<IngestRequest>,
-) -> std::result::Result<Json<IngestOutput>, ApiError> {
-    let branch = request.branch.unwrap_or_else(|| "main".to_string());
-    let from = request.from.unwrap_or_else(|| "main".to_string());
-    let mode = request.mode.unwrap_or(omnigraph::loader::LoadMode::Merge);
-    let actor_id = actor.as_ref().map(|Extension(actor)| actor.as_str());
-
-    let branch_exists = {
-        let db = Arc::clone(&state.db).read_owned().await;
-        db.branch_list()
-            .await
-            .map_err(ApiError::from_omni)?
-            .into_iter()
-            .any(|name| name == branch)
-    };
-
-    if !branch_exists {
-        authorize_request(
-            &state,
-            actor.as_ref().map(|Extension(actor)| actor),
-            PolicyRequest {
-                actor_id: actor_id.map(str::to_string).unwrap_or_default(),
-                action: PolicyAction::BranchCreate,
-                branch: Some(from.clone()),
-                target_branch: Some(branch.clone()),
-            },
-        )?;
-    }
-    authorize_request(
-        &state,
-        actor.as_ref().map(|Extension(actor)| actor),
-        PolicyRequest {
-            actor_id: actor_id.map(str::to_string).unwrap_or_default(),
-            action: PolicyAction::Change,
-            branch: Some(branch.clone()),
-            target_branch: None,
-        },
-    )?;
-
-    let result = {
-        let mut db = Arc::clone(&state.db).write_owned().await;
-        db.ingest_as(&branch, Some(&from), &request.data, mode, actor_id)
-            .await
-            .map_err(ApiError::from_omni)?
-    };
-
-    Ok(Json(ingest_output(
-        state.uri(),
-        &result,
-        actor_id.map(str::to_string),
-    )))
-}
-
-#[utoipa::path(
-    get,
-    path = "/branches",
-    tag = "branches",
-    operation_id = "listBranches",
-    responses(
-        (status = 200, description = "List of branches", body = BranchListOutput),
-        (status = 401, description = "Unauthorized", body = ErrorOutput),
-        (status = 403, description = "Forbidden", body = ErrorOutput),
-    ),
-    security(("bearer_token" = [])),
-)]
-/// List all branches.
-///
-/// Returns branch names sorted alphabetically. Read-only.
-async fn server_branch_list(
-    State(state): State<AppState>,
-    actor: Option<Extension<AuthenticatedActor>>,
-) -> std::result::Result<Json<BranchListOutput>, ApiError> {
-    authorize_request(
-        &state,
-        actor.as_ref().map(|Extension(actor)| actor),
-        PolicyRequest {
-            actor_id: actor
-                .as_ref()
-                .map(|Extension(actor)| actor.as_str().to_string())
-                .unwrap_or_default(),
-            action: PolicyAction::Read,
-            branch: None,
-            target_branch: None,
-        },
-    )?;
-    let mut branches = {
-        let db = Arc::clone(&state.db).read_owned().await;
-        db.branch_list().await.map_err(ApiError::from_omni)?
-    };
-    branches.sort();
-    Ok(Json(BranchListOutput { branches }))
-}
-
-#[utoipa::path(
-    post,
-    path = "/branches",
-    tag = "branches",
-    operation_id = "createBranch",
-    request_body = BranchCreateRequest,
-    responses(
-        (status = 200, description = "Branch created", body = BranchCreateOutput),
-        (status = 400, description = "Bad request", body = ErrorOutput),
-        (status = 401, description = "Unauthorized", body = ErrorOutput),
-        (status = 403, description = "Forbidden", body = ErrorOutput),
-        (status = 409, description = "Branch already exists", body = ErrorOutput),
-    ),
-    security(("bearer_token" = [])),
-)]
-/// Create a new branch.
-///
-/// Forks `name` off of `from` (defaults to `main`). The new branch shares
-/// table data with its parent until it is mutated. Returns 409 if `name`
-/// already exists.
-async fn server_branch_create(
-    State(state): State<AppState>,
-    actor: Option<Extension<AuthenticatedActor>>,
-    Json(request): Json<BranchCreateRequest>,
-) -> std::result::Result<Json<BranchCreateOutput>, ApiError> {
-    let from = request.from.unwrap_or_else(|| "main".to_string());
-    authorize_request(
-        &state,
-        actor.as_ref().map(|Extension(actor)| actor),
-        PolicyRequest {
-            actor_id: actor
-                .as_ref()
-                .map(|Extension(actor)| actor.as_str().to_string())
-                .unwrap_or_default(),
-            action: PolicyAction::BranchCreate,
-            branch: Some(from.clone()),
-            target_branch: Some(request.name.clone()),
-        },
-    )?;
-    {
-        let mut db = Arc::clone(&state.db).write_owned().await;
-        db.branch_create_from(ReadTarget::branch(&from), &request.name)
-            .await
-            .map_err(ApiError::from_omni)?;
-    }
-    Ok(Json(BranchCreateOutput {
-        uri: state.uri().to_string(),
-        from,
-        name: request.name,
-        actor_id: actor.map(|Extension(actor)| actor.as_str().to_string()),
-    }))
-}
-
-#[utoipa::path(
-    delete,
-    path = "/branches/{branch}",
-    tag = "branches",
-    operation_id = "deleteBranch",
-    params(
-        ("branch" = String, Path, description = "Branch name to delete"),
-    ),
-    responses(
-        (status = 200, description = "Branch deleted", body = BranchDeleteOutput),
-        (status = 401, description = "Unauthorized", body = ErrorOutput),
-        (status = 403, description = "Forbidden", body = ErrorOutput),
-        (status = 404, description = "Branch not found", body = ErrorOutput),
-    ),
-    security(("bearer_token" = [])),
-)]
-/// Delete a branch.
-///
-/// **Irreversible.** Removes the branch pointer; commits remain reachable
-/// only if referenced by another branch. Returns 404 if the branch does not
-/// exist.
-async fn server_branch_delete(
-    State(state): State<AppState>,
-    actor: Option<Extension<AuthenticatedActor>>,
-    Path(branch): Path<String>,
-) -> std::result::Result<Json<BranchDeleteOutput>, ApiError> {
-    let actor_id = actor.as_ref().map(|Extension(actor)| actor.as_str());
-    authorize_request(
-        &state,
-        actor.as_ref().map(|Extension(actor)| actor),
-        PolicyRequest {
-            actor_id: actor_id.map(str::to_string).unwrap_or_default(),
-            action: PolicyAction::BranchDelete,
-            branch: None,
-            target_branch: Some(branch.clone()),
-        },
-    )?;
-    {
-        let mut db = Arc::clone(&state.db).write_owned().await;
-        db.branch_delete(&branch)
-            .await
-            .map_err(ApiError::from_omni)?;
-    }
-    Ok(Json(BranchDeleteOutput {
-        uri: state.uri().to_string(),
-        name: branch,
-        actor_id: actor_id.map(str::to_string),
-    }))
-}
-
-#[utoipa::path(
-    post,
-    path = "/branches/merge",
-    tag = "branches",
-    operation_id = "mergeBranches",
-    request_body = BranchMergeRequest,
-    responses(
-        (status = 200, description = "Branches merged", body = BranchMergeOutput),
-        (status = 400, description = "Bad request", body = ErrorOutput),
-        (status = 401, description = "Unauthorized", body = ErrorOutput),
-        (status = 403, description = "Forbidden", body = ErrorOutput),
-        (status = 409, description = "Merge conflict", body = ErrorOutput),
-    ),
-    security(("bearer_token" = [])),
-)]
-/// Merge one branch into another.
-///
-/// Merges `source` into `target` (defaults to `main`). Outcome is one of
-/// `already_up_to_date`, `fast_forward`, or `merged`. Returns 409 with the
-/// list of conflicts if the merge cannot be completed; the target is left
-/// unchanged in that case. **Destructive** to `target` on success.
-async fn server_branch_merge(
-    State(state): State<AppState>,
-    actor: Option<Extension<AuthenticatedActor>>,
-    Json(request): Json<BranchMergeRequest>,
-) -> std::result::Result<Json<BranchMergeOutput>, ApiError> {
-    let target = request.target.unwrap_or_else(|| "main".to_string());
-    let actor_id = actor.as_ref().map(|Extension(actor)| actor.as_str());
-    authorize_request(
-        &state,
-        actor.as_ref().map(|Extension(actor)| actor),
-        PolicyRequest {
-            actor_id: actor_id.map(str::to_string).unwrap_or_default(),
-            action: PolicyAction::BranchMerge,
-            branch: Some(request.source.clone()),
-            target_branch: Some(target.clone()),
-        },
-    )?;
-    let outcome = {
-        let mut db = Arc::clone(&state.db).write_owned().await;
-        db.branch_merge_as(&request.source, &target, actor_id)
-            .await
-            .map_err(ApiError::from_omni)?
-    };
-    Ok(Json(BranchMergeOutput {
-        source: request.source,
-        target,
-        outcome: outcome.into(),
-        actor_id: actor_id.map(str::to_string),
-    }))
-}
-
-#[utoipa::path(
-    get,
-    path = "/commits",
-    tag = "commits",
-    operation_id = "listCommits",
-    params(CommitListQuery),
-    responses(
-        (status = 200, description = "List of commits", body = CommitListOutput),
-        (status = 401, description = "Unauthorized", body = ErrorOutput),
-        (status = 403, description = "Forbidden", body = ErrorOutput),
-    ),
-    security(("bearer_token" = [])),
-)]
-/// List commits.
-///
-/// Filter by `branch` to get the commits on a single branch (most recent
-/// first); omit to list across all branches. Read-only.
-async fn server_commit_list(
-    State(state): State<AppState>,
-    actor: Option<Extension<AuthenticatedActor>>,
-    Query(query): Query<CommitListQuery>,
-) -> std::result::Result<Json<CommitListOutput>, ApiError> {
-    authorize_request(
-        &state,
-        actor.as_ref().map(|Extension(actor)| actor),
-        PolicyRequest {
-            actor_id: actor
-                .as_ref()
-                .map(|Extension(actor)| actor.as_str().to_string())
-                .unwrap_or_default(),
-            action: PolicyAction::Read,
-            branch: query.branch.clone(),
-            target_branch: None,
-        },
-    )?;
-    let commits = {
-        let db = Arc::clone(&state.db).read_owned().await;
-        db.list_commits(query.branch.as_deref())
-            .await
-            .map_err(ApiError::from_omni)?
-    };
-    Ok(Json(CommitListOutput {
-        commits: commits.iter().map(api::commit_output).collect(),
-    }))
-}
-
-#[utoipa::path(
-    get,
-    path = "/commits/{commit_id}",
-    tag = "commits",
-    operation_id = "getCommit",
-    params(
-        ("commit_id" = String, Path, description = "Commit identifier"),
-    ),
-    responses(
-        (status = 200, description = "Commit details", body = api::CommitOutput),
-        (status = 401, description = "Unauthorized", body = ErrorOutput),
-        (status = 403, description = "Forbidden", body = ErrorOutput),
-        (status = 404, description = "Commit not found", body = ErrorOutput),
-    ),
-    security(("bearer_token" = [])),
-)]
-/// Get a single commit.
-///
-/// Returns the commit's manifest version, parent commit(s), and creation
-/// metadata. Read-only.
-async fn server_commit_show(
-    State(state): State<AppState>,
-    actor: Option<Extension<AuthenticatedActor>>,
-    Path(commit_id): Path<String>,
-) -> std::result::Result<Json<api::CommitOutput>, ApiError> {
-    authorize_request(
-        &state,
-        actor.as_ref().map(|Extension(actor)| actor),
-        PolicyRequest {
-            actor_id: actor
-                .as_ref()
-                .map(|Extension(actor)| actor.as_str().to_string())
-                .unwrap_or_default(),
-            action: PolicyAction::Read,
-            branch: None,
-            target_branch: None,
-        },
-    )?;
-    let commit = {
-        let db = Arc::clone(&state.db).read_owned().await;
-        db.get_commit(&commit_id)
-            .await
-            .map_err(ApiError::from_omni)?
-    };
-    Ok(Json(api::commit_output(&commit)))
-}
-
-fn read_target_from_request(branch: Option<String>, snapshot: Option<String>) -> ReadTarget {
-    if let Some(snapshot) = snapshot {
-        ReadTarget::snapshot(omnigraph::db::SnapshotId::new(snapshot))
-    } else {
-        ReadTarget::branch(branch.unwrap_or_else(|| "main".to_string()))
-    }
-}
-
-fn select_named_query(
-    query_source: &str,
-    requested_name: Option<&str>,
-) -> Result<(String, Vec<omnigraph_compiler::query::ast::Param>)> {
-    let parsed = parse_query(query_source)?;
-    let query = if let Some(name) = requested_name {
-        parsed
-            .queries
-            .into_iter()
-            .find(|query| query.name == name)
-            .ok_or_else(|| color_eyre::eyre::eyre!("query '{}' not found", name))?
-    } else if parsed.queries.len() == 1 {
-        parsed.queries.into_iter().next().unwrap()
-    } else {
-        bail!("query file contains multiple queries; pass --name");
-    };
-
-    Ok((query.name, query.params))
-}
-
-fn query_params_from_json(
-    query_params: &[omnigraph_compiler::query::ast::Param],
-    params_json: Option<&Value>,
-) -> Result<ParamMap> {
-    json_params_to_param_map(params_json, query_params, JsonParamMode::Standard)
-        .map_err(|err| color_eyre::eyre::eyre!(err.to_string()))
-}
-
-fn normalize_bearer_token(value: Option<String>) -> Option<String> {
-    value
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
-fn normalize_bearer_actor(value: String) -> Result<String> {
-    let value = value.trim().to_string();
-    if value.is_empty() {
-        bail!("bearer token actor names must not be blank");
-    }
-    Ok(value)
-}
-
-fn parse_bearer_tokens_json(value: &str) -> Result<Vec<(String, String)>> {
-    let entries: HashMap<String, String> = serde_json::from_str(value)
-        .wrap_err("OMNIGRAPH_SERVER_BEARER_TOKENS_JSON must be a JSON object of actor->token")?;
-    Ok(entries.into_iter().collect())
-}
-
-fn read_bearer_tokens_file(path: &str) -> Result<Vec<(String, String)>> {
-    let contents = fs::read_to_string(path)
-        .wrap_err_with(|| format!("failed to read bearer tokens file at {path}"))?;
-    parse_bearer_tokens_json(&contents)
-        .wrap_err_with(|| format!("failed to parse bearer tokens file at {path}"))
-}
-
-fn validate_bearer_tokens(entries: Vec<(String, String)>) -> Result<Vec<(String, String)>> {
-    let mut seen_actors = HashSet::new();
-    let mut seen_tokens = HashSet::new();
-    let mut normalized = Vec::with_capacity(entries.len());
-
-    for (actor, token) in entries {
-        let actor = normalize_bearer_actor(actor)?;
-        let Some(token) = normalize_bearer_token(Some(token)) else {
-            bail!("bearer token for actor '{actor}' must not be blank");
-        };
-        if !seen_actors.insert(actor.clone()) {
-            bail!("duplicate bearer token actor '{actor}'");
-        }
-        if !seen_tokens.insert(token.clone()) {
-            bail!("duplicate bearer token value configured");
-        }
-        normalized.push((actor, token));
-    }
-
-    normalized.sort_by(|(left, _), (right, _)| left.cmp(right));
-    Ok(normalized)
-}
-
-fn server_bearer_tokens_from_env() -> Result<Vec<(String, String)>> {
-    let mut entries = Vec::new();
-
-    if let Some(token) = normalize_bearer_token(std::env::var("OMNIGRAPH_SERVER_BEARER_TOKEN").ok())
-    {
-        entries.push(("default".to_string(), token));
-    }
-
-    if let Some(path) =
-        normalize_bearer_token(std::env::var("OMNIGRAPH_SERVER_BEARER_TOKENS_FILE").ok())
-    {
-        entries.extend(read_bearer_tokens_file(&path)?);
-    } else if let Some(json) =
-        normalize_bearer_token(std::env::var("OMNIGRAPH_SERVER_BEARER_TOKENS_JSON").ok())
-    {
-        entries.extend(parse_bearer_tokens_json(&json)?);
-    }
-
-    validate_bearer_tokens(entries)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        hash_bearer_token, load_server_settings, normalize_bearer_token, parse_bearer_tokens_json,
-        server_bearer_tokens_from_env,
-    };
-    use std::env;
-    use std::fs;
-    use tempfile::tempdir;
-
-    #[test]
-    fn hash_bearer_token_produces_32_byte_output() {
-        let hash = hash_bearer_token("any-token");
-        assert_eq!(hash.len(), 32);
-    }
-
-    #[test]
-    fn hash_bearer_token_is_deterministic() {
-        assert_eq!(
-            hash_bearer_token("stable-input"),
-            hash_bearer_token("stable-input"),
-        );
-    }
-
-    #[test]
-    fn hash_bearer_token_differs_for_different_inputs() {
-        assert_ne!(hash_bearer_token("token-a"), hash_bearer_token("token-b"));
-    }
-
-    #[test]
-    fn hash_bearer_token_matches_known_sha256_vector() {
-        // SHA-256("abc"). If this ever fails, the hash function was swapped.
-        let hash = hash_bearer_token("abc");
-        let hex: String = hash.iter().map(|b| format!("{:02x}", b)).collect();
-        assert_eq!(
-            hex,
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
-    }
-
-    #[test]
-    fn server_settings_load_from_yaml_config() {
-        let temp = tempdir().unwrap();
-        let config = temp.path().join("omnigraph.yaml");
-        fs::write(
-            &config,
-            r#"
-graphs:
-  local:
-    uri: /tmp/demo.omni
-server:
-  graph: local
-  bind: 0.0.0.0:9090
-"#,
-        )
-        .unwrap();
-
-        let settings = load_server_settings(Some(&config), None, None, None).unwrap();
-        assert_eq!(settings.uri, "/tmp/demo.omni");
-        assert_eq!(settings.bind, "0.0.0.0:9090");
-    }
-
-    #[test]
-    fn server_settings_cli_flags_override_yaml_config() {
-        let temp = tempdir().unwrap();
-        let config = temp.path().join("omnigraph.yaml");
-        fs::write(
-            &config,
-            r#"
-graphs:
-  local:
-    uri: /tmp/demo.omni
-server:
-  graph: local
-  bind: 127.0.0.1:8080
-"#,
-        )
-        .unwrap();
-
-        let settings = load_server_settings(
-            Some(&config),
-            Some("/tmp/override.omni".to_string()),
-            None,
-            Some("0.0.0.0:9999".to_string()),
-        )
-        .unwrap();
-        assert_eq!(settings.uri, "/tmp/override.omni");
-        assert_eq!(settings.bind, "0.0.0.0:9999");
-    }
-
-    #[test]
-    fn server_settings_can_resolve_named_target() {
-        let temp = tempdir().unwrap();
-        let config = temp.path().join("omnigraph.yaml");
-        fs::write(
-            &config,
-            r#"
-graphs:
-  local:
-    uri: ./demo.omni
-  dev:
-    uri: http://127.0.0.1:8080
-server:
-  graph: local
-  bind: 127.0.0.1:8080
-"#,
-        )
-        .unwrap();
-
-        let settings =
-            load_server_settings(Some(&config), None, Some("dev".to_string()), None).unwrap();
-        assert_eq!(settings.uri, "http://127.0.0.1:8080");
-    }
-
-    #[test]
-    fn server_settings_require_uri_from_cli_or_config() {
-        let error = load_server_settings(None, None, None, None).unwrap_err();
-        assert!(error.to_string().contains("URI must be provided"));
-    }
-
-    #[test]
-    fn normalize_bearer_token_trims_and_filters_blank_values() {
-        assert_eq!(normalize_bearer_token(None), None);
-        assert_eq!(normalize_bearer_token(Some("   ".to_string())), None);
-        assert_eq!(
-            normalize_bearer_token(Some(" demo-token ".to_string())).as_deref(),
-            Some("demo-token")
-        );
-    }
-
-    struct EnvGuard {
-        saved: Vec<(&'static str, Option<String>)>,
-    }
-
-    impl EnvGuard {
-        fn set(vars: &[(&'static str, Option<&str>)]) -> Self {
-            let saved = vars
-                .iter()
-                .map(|(name, _)| (*name, env::var(name).ok()))
-                .collect::<Vec<_>>();
-            for (name, value) in vars {
-                unsafe {
-                    match value {
-                        Some(value) => env::set_var(name, value),
-                        None => env::remove_var(name),
-                    }
-                }
-            }
-            Self { saved }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (name, value) in self.saved.drain(..) {
-                unsafe {
-                    match value {
-                        Some(value) => env::set_var(name, value),
-                        None => env::remove_var(name),
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn parse_bearer_tokens_json_reads_actor_token_map() {
-        let tokens = parse_bearer_tokens_json(r#"{"alice":" token-a ","bob":"token-b"}"#).unwrap();
-        assert_eq!(tokens.len(), 2);
-        assert!(tokens.contains(&("alice".to_string(), " token-a ".to_string())));
-        assert!(tokens.contains(&("bob".to_string(), "token-b".to_string())));
-    }
-
-    #[test]
-    fn server_bearer_tokens_from_env_reads_legacy_token_and_token_file() {
-        let temp = tempdir().unwrap();
-        let tokens_path = temp.path().join("tokens.json");
-        fs::write(
-            &tokens_path,
-            r#"{"team-01":"token-one","team-02":"token-two"}"#,
-        )
-        .unwrap();
-
-        let _guard = EnvGuard::set(&[
-            ("OMNIGRAPH_SERVER_BEARER_TOKEN", Some(" legacy-token ")),
-            (
-                "OMNIGRAPH_SERVER_BEARER_TOKENS_FILE",
-                Some(tokens_path.to_str().unwrap()),
-            ),
-            ("OMNIGRAPH_SERVER_BEARER_TOKENS_JSON", None),
-        ]);
-
-        let tokens = server_bearer_tokens_from_env().unwrap();
-        assert_eq!(
-            tokens,
-            vec![
-                ("default".to_string(), "legacy-token".to_string()),
-                ("team-01".to_string(), "token-one".to_string()),
-                ("team-02".to_string(), "token-two".to_string()),
-            ]
-        );
-    }
 }

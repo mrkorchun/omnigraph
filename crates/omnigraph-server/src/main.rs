@@ -8,14 +8,25 @@ use omnigraph_server::{ServerConfig, init_tracing, load_server_settings, serve};
 #[command(name = "omnigraph-server")]
 #[command(about = "HTTP server for the Omnigraph graph database")]
 struct Cli {
-    /// Repo URI
-    uri: Option<String>,
+    /// Boot from a cluster: either a config directory (storage resolved
+    /// through cluster.yaml) or a storage-root URI directly
+    /// (s3://bucket/prefix — config-free serving from the bucket).
+    /// The server's only boot source (RFC-011 cluster-only).
     #[arg(long)]
-    target: Option<String>,
-    #[arg(long)]
-    config: Option<PathBuf>,
+    cluster: Option<PathBuf>,
     #[arg(long)]
     bind: Option<String>,
+    /// Run without bearer tokens and without a policy file (MR-723).
+    /// Required when neither is configured — otherwise the server
+    /// refuses to start to prevent shipping the illusion of protection.
+    /// Equivalent to setting `OMNIGRAPH_UNAUTHENTICATED=1`.
+    #[arg(long)]
+    unauthenticated: bool,
+    /// Fail startup if any applied graph is quarantined or fails to open.
+    /// By default, graph-local failures are logged and healthy graphs still
+    /// serve. Equivalent to setting `OMNIGRAPH_REQUIRE_ALL_GRAPHS=1`.
+    #[arg(long)]
+    require_all_graphs: bool,
 }
 
 #[tokio::main]
@@ -24,7 +35,12 @@ async fn main() -> Result<()> {
     init_tracing();
 
     let cli = Cli::parse();
-    let settings: ServerConfig =
-        load_server_settings(cli.config.as_ref(), cli.uri, cli.target, cli.bind)?;
+    let settings: ServerConfig = load_server_settings(
+        cli.cluster.as_ref(),
+        cli.bind,
+        cli.unauthenticated,
+        cli.require_all_graphs,
+    )
+    .await?;
     serve(settings).await
 }

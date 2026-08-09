@@ -2,7 +2,9 @@ use std::collections::HashMap;
 
 use lance::Dataset;
 use lance_namespace::Error as LanceNamespaceError;
-use lance_namespace::models::{CreateTableVersionRequest, TableVersion};
+use lance_namespace::models::CreateTableVersionRequest;
+#[cfg(test)]
+use lance_namespace::models::TableVersion;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{OmniError, Result};
@@ -111,7 +113,6 @@ impl TableVersionMetadata {
         self.manifest_size
     }
 
-    #[cfg(test)]
     pub(crate) fn e_tag(&self) -> Option<&str> {
         self.e_tag.as_deref()
     }
@@ -138,10 +139,12 @@ impl TableVersionMetadata {
         request
     }
 
+    #[cfg(test)]
     pub(super) fn to_namespace_version(&self, version: u64) -> TableVersion {
         self.to_namespace_version_with_details(version, None, None)
     }
 
+    #[cfg(test)]
     pub(super) fn to_namespace_version_with_details(
         &self,
         version: u64,
@@ -226,9 +229,13 @@ pub(super) async fn table_version_metadata_for_state(
     version: u64,
 ) -> Result<TableVersionMetadata> {
     let full_path = format!("{}/{}", root_uri.trim_end_matches('/'), table_path);
-    let ds = Dataset::open(&full_path)
-        .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
+    let ds = crate::instrumentation::open_dataset(
+        &full_path,
+        crate::instrumentation::VersionResolution::Latest,
+        None,
+        crate::instrumentation::table_wrapper(),
+    )
+    .await?;
     let ds = match branch {
         Some(branch) => ds
             .checkout_branch(branch)

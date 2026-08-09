@@ -1,6 +1,6 @@
 [package]
 name = "omnigraph-compiler"
-version = "0.4.1"
+version = "0.8.1"
 edition = "2024"
 description = "Schema/query compiler for Omnigraph. Zero Lance dependency."
 license = "MIT"
@@ -20,10 +20,5 @@ pest_derive = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-reqwest = { workspace = true }
 ahash = { workspace = true }
-tokio = { workspace = true }
 sha2 = { workspace = true }
-
-[dev-dependencies]
-tokio = { workspace = true }

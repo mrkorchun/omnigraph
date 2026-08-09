@@ -18,20 +18,21 @@ use lance::Dataset;
 use omnigraph::db::Omnigraph;
 
 mod helpers;
+use helpers::test_session;
 use helpers::recovery::{RecoveryExpectation, TableExpectation, assert_post_recovery_invariants};
 
 const TEST_SCHEMA: &str = include_str!("fixtures/test.pg");
 
-fn write_sidecar_file(repo_root: &Path, operation_id: &str, json: &str) {
-    let dir = repo_root.join("__recovery");
+fn write_sidecar_file(graph_root: &Path, operation_id: &str, json: &str) {
+    let dir = graph_root.join("__recovery");
     if !dir.exists() {
         std::fs::create_dir(&dir).unwrap();
     }
     std::fs::write(dir.join(format!("{}.json", operation_id)), json).unwrap();
 }
 
-fn list_recovery_dir(repo_root: &Path) -> Vec<String> {
-    let dir = repo_root.join("__recovery");
+fn list_recovery_dir(graph_root: &Path) -> Vec<String> {
+    let dir = graph_root.join("__recovery");
     if !dir.exists() {
         return Vec::new();
     }
@@ -41,7 +42,7 @@ fn list_recovery_dir(repo_root: &Path) -> Vec<String> {
         .collect()
 }
 
-/// Full URI of a node-type Lance dataset under a fresh Omnigraph repo.
+/// Full URI of a node-type Lance dataset under a fresh Omnigraph graph.
 /// Mirrors the `nodes/{fnv1a64-hex(type_name)}` layout in `db/manifest/layout.rs`.
 fn node_table_uri(root: &str, type_name: &str) -> String {
     let h: u64 = fnv1a64(type_name.as_bytes());
@@ -104,8 +105,10 @@ async fn recovery_refuses_unknown_schema_version_on_open() {
     let _db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
     drop(_db);
 
-    // A sidecar from a hypothetical future writer; the older binary must
-    // refuse to interpret it (resolved-decisions §3 in the design doc).
+    // A sidecar from a hypothetical future writer (version NEWER than this
+    // binary's max); the reader must refuse to interpret it — it cannot guess
+    // semantics a newer writer baked in. (Older versions are accepted and
+    // interpreted with their original semantics; see `parse_sidecar`.)
     let sidecar_json = r#"{
         "schema_version": 99,
         "operation_id": "01H000000000000000000000ZZ",
@@ -120,11 +123,11 @@ async fn recovery_refuses_unknown_schema_version_on_open() {
     let err = Omnigraph::open(uri)
         .await
         .err()
-        .expect("expected open to fail because of unknown sidecar schema_version");
+        .expect("expected open to fail because of a future sidecar schema_version");
     let msg = err.to_string();
     assert!(
-        msg.contains("schema_version=99") && msg.contains("supports only schema_version=1"),
-        "expected SidecarSchemaError mentioning the version mismatch, got: {}",
+        msg.contains("schema_version=99") && msg.contains("newer than the maximum"),
+        "expected a future-version refusal, got: {}",
         msg,
     );
     // Sidecar must still be on disk — we don't auto-delete unparseable files.
@@ -132,6 +135,218 @@ async fn recovery_refuses_unknown_schema_version_on_open() {
         list_recovery_dir(dir.path()).contains(&"01H000000000000000000000ZZ.json".to_string()),
         "sidecar should remain on disk after refusal so an operator can inspect it"
     );
+}
+
+#[tokio::test]
+async fn recovery_refuses_corrupt_sidecar_on_open_and_write() {
+    use omnigraph::loader::{LoadMode, load_jsonl};
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+
+    // A truncated/garbage sidecar — e.g. a crashed writer or a partial
+    // local-FS write (S3 PutObject is atomic; local fs::write is not).
+    write_sidecar_file(dir.path(), "01H000000000000000000000CC", "{not json");
+
+    // A live handle's write-entry heal must surface the parse failure
+    // loudly instead of proceeding over a sidecar it cannot interpret.
+    let err = load_jsonl(
+        &mut db,
+        r#"{"type":"Person","data":{"name":"Alice","age":30}}
+"#,
+        LoadMode::Merge,
+    )
+    .await
+    .err()
+    .expect("expected the write to fail on the corrupt sidecar");
+    assert!(
+        err.to_string().contains("is not valid JSON"),
+        "expected the corrupt-sidecar parse error, got: {}",
+        err,
+    );
+
+    // A fresh ReadWrite open fails the same way.
+    drop(db);
+    let err = Omnigraph::open(uri)
+        .await
+        .err()
+        .expect("expected open to fail because of the corrupt sidecar");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("01H000000000000000000000CC") && msg.contains("is not valid JSON"),
+        "expected the corrupt-sidecar parse error naming the file, got: {}",
+        msg,
+    );
+    // The file must remain on disk for inspection — never auto-deleted.
+    assert!(
+        list_recovery_dir(dir.path()).contains(&"01H000000000000000000000CC.json".to_string()),
+        "corrupt sidecar should remain on disk after refusal"
+    );
+
+    // Read-only open still works — the sweep is skipped entirely.
+    let _db = Omnigraph::open_read_only(uri).await.unwrap();
+}
+
+/// The commit-time drift guard's advice must be branch-aware: a pending
+/// sidecar on ANOTHER branch does not cover this branch's drift. With a
+/// deferred feature-branch sidecar on disk and genuinely uncovered drift
+/// on main, the main write must still point at `omnigraph repair` — a
+/// read-write reopen recovers the sidecar but cannot repair main's
+/// uncovered drift.
+#[tokio::test]
+async fn drift_guard_advice_ignores_other_branch_sidecars() {
+    use omnigraph::loader::{LoadMode, load_jsonl};
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    load_jsonl(
+        &mut db,
+        "{\"type\":\"Person\",\"data\":{\"name\":\"Alice\",\"age\":30}}\n",
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    db.branch_create("feature").await.unwrap();
+    // A real feature write forks Person's Lance dataset onto the branch
+    // (the heal classifies a feature sidecar against the forked head).
+    db.mutate(
+        "feature",
+        helpers::MUTATION_QUERIES,
+        "insert_person",
+        &helpers::mixed_params(&[("$name", "eve")], &[("$age", 22)]),
+    )
+    .await
+    .unwrap();
+
+    // A sidecar pinning node:Person ON FEATURE, shaped so the write-entry
+    // heal defers it (head < expected_version classifies as an invariant
+    // violation; roll-forward-only mode leaves it for the next ReadWrite
+    // open) — it persists through the write attempt below.
+    let person_uri = node_table_uri(uri, "Person");
+    let sidecar_json = format!(
+        r#"{{
+        "schema_version": 1,
+        "operation_id": "01H000000000000000000000XB",
+        "started_at": "0",
+        "branch": "feature",
+        "actor_id": null,
+        "writer_kind": "Mutation",
+        "tables": [
+            {{
+                "table_key": "node:Person",
+                "table_path": "{person_uri}",
+                "expected_version": 999,
+                "post_commit_pin": 1000,
+                "table_branch": "feature"
+            }}
+        ]
+    }}"#
+    );
+    write_sidecar_file(dir.path(), "01H000000000000000000000XB", &sidecar_json);
+
+    // Genuinely uncovered drift on MAIN's Person (raw Lance write
+    // bypassing the manifest — the `omnigraph repair` class).
+    let mut ds = Dataset::open(&person_uri).await.unwrap();
+    let _ = helpers::lance_delete_inline(&mut ds, "1 = 2").await;
+
+    let err = load_jsonl(
+        &mut db,
+        "{\"type\":\"Person\",\"data\":{\"name\":\"Bob\",\"age\":25}}\n",
+        LoadMode::Merge,
+    )
+    .await
+    .err()
+    .expect("uncovered main drift must fail the write");
+    assert!(
+        err.to_string().contains("run `omnigraph repair`"),
+        "a feature-branch sidecar must not flip main's uncovered-drift \
+         advice to the reopen path; got: {err}"
+    );
+}
+
+/// A deferred sidecar pinned to a branch that is subsequently DELETED
+/// must not wedge the graph: the branch's tree and forks are reclaimed,
+/// so the pinned drift is unreachable and the sidecar is provably moot.
+/// Both the write-entry heal and the open-time sweep must classify it
+/// as orphaned (audit + discard) instead of failing to open the dead
+/// branch on every write and every ReadWrite open — a terminal state,
+/// since `repair` refuses while a sidecar is pending.
+#[tokio::test]
+async fn deleted_branch_sidecar_does_not_wedge_writes_or_open() {
+    use omnigraph::loader::{LoadMode, load_jsonl};
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let mut db = Omnigraph::init(&uri, TEST_SCHEMA).await.unwrap();
+    load_jsonl(
+        &mut db,
+        "{\"type\":\"Person\",\"data\":{\"name\":\"Alice\",\"age\":30}}\n",
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    db.branch_create("feature").await.unwrap();
+    db.mutate(
+        "feature",
+        helpers::MUTATION_QUERIES,
+        "insert_person",
+        &helpers::mixed_params(&[("$name", "eve")], &[("$age", 22)]),
+    )
+    .await
+    .unwrap();
+
+    // A rollback-eligible (deferred) sidecar pinned to feature — shaped
+    // so every roll-forward-only pass leaves it on disk.
+    let person_uri = node_table_uri(&uri, "Person");
+    let sidecar_json = format!(
+        r#"{{
+        "schema_version": 1,
+        "operation_id": "01H000000000000000000000DB",
+        "started_at": "0",
+        "branch": "feature",
+        "actor_id": null,
+        "writer_kind": "Mutation",
+        "tables": [
+            {{
+                "table_key": "node:Person",
+                "table_path": "{person_uri}",
+                "expected_version": 999,
+                "post_commit_pin": 1000,
+                "table_branch": "feature"
+            }}
+        ]
+    }}"#
+    );
+    write_sidecar_file(dir.path(), "01H000000000000000000000DB", &sidecar_json);
+
+    // Branch delete defers the rollback-eligible sidecar and proceeds —
+    // the sidecar now references a branch that no longer exists.
+    db.branch_delete("feature").await.unwrap();
+
+    // The next write's heal must classify the orphan and discard it,
+    // not fail opening the dead branch.
+    load_jsonl(
+        &mut db,
+        "{\"type\":\"Person\",\"data\":{\"name\":\"Bob\",\"age\":25}}\n",
+        LoadMode::Merge,
+    )
+    .await
+    .expect("a write after deleting a sidecar-pinned branch must succeed");
+    assert_eq!(
+        list_recovery_dir(dir.path()).len(),
+        0,
+        "the orphaned sidecar must be discarded (with an audit row), not left to wedge"
+    );
+
+    // And a fresh ReadWrite open must succeed too (the sweep shares the
+    // same classification).
+    drop(db);
+    let db = Omnigraph::open(&uri)
+        .await
+        .expect("ReadWrite open after deleting a sidecar-pinned branch must succeed");
+    assert_eq!(helpers::count_rows(&db, "node:Person").await, 2);
 }
 
 #[tokio::test]
@@ -175,7 +390,6 @@ async fn read_only_open_skips_recovery_sweep() {
 #[tokio::test]
 async fn recovery_rolls_back_synthetic_drift_on_open() {
     use omnigraph::loader::{LoadMode, load_jsonl};
-    use omnigraph::table_store::TableStore;
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
@@ -196,19 +410,16 @@ async fn recovery_rolls_back_synthetic_drift_on_open() {
     // leave (with no sidecar — the writer never wrote one because we're
     // simulating the residual class directly).
     //
-    // Use `delete_where` with a never-matching predicate: it inline-commits
+    // Use `lance_delete_inline` (a test helper that calls Lance directly) with
+    // a never-matching predicate: it inline-commits
     // a Lance transaction (advancing HEAD by one) without removing data
     // and without depending on the dataset's exact column set. The actual
     // residual the sweep recovers from is the manifest-vs-Lance-HEAD gap;
     // it's agnostic to *what* op caused the gap.
     let person_uri = node_table_uri(uri, "Person");
-    let store = TableStore::new(uri);
     let mut ds = Dataset::open(&person_uri).await.unwrap();
     let head_before_drift = ds.version().version;
-    let _ = store
-        .delete_where(&person_uri, &mut ds, "1 = 2")
-        .await
-        .unwrap();
+    let _ = helpers::lance_delete_inline(&mut ds, "1 = 2").await;
     let head_after_drift = ds.version().version;
     assert_eq!(
         head_after_drift,
@@ -247,7 +458,7 @@ async fn recovery_rolls_back_synthetic_drift_on_open() {
     // sidecar.post_commit_pin != observed head), decide RollBack, and call
     // restore_table_to_version(person_uri, head_before_drift). The
     // fragment-set short-circuit may make this a no-op if the synthetic
-    // drift produced no fragment changes (delete_where with a never-matching
+    // drift produced no fragment changes (lance_delete_inline with a never-matching
     // predicate is one such case — Lance bumps version but fragments are
     // unchanged). Either way the sweep must complete without error and
     // delete the sidecar; the actual rollback HEAD-advance behavior is
@@ -278,13 +489,99 @@ async fn recovery_rolls_back_synthetic_drift_on_open() {
     );
 }
 
+/// Regression: recovery roll-back must PUBLISH the restored version so
+/// `manifest == Lance HEAD` afterward (no residual "orphaned drift"). Before the
+/// fix, roll-back restored via `Dataset::restore` but left the manifest pin
+/// behind HEAD, so a subsequent strict write / schema apply failed its
+/// HEAD-vs-manifest precondition ("stale view … refresh and retry") — and a
+/// failed schema apply's own roll-back leaked +1 each retry (the original bug's
+/// loop). With convergence, one roll-back leaves `manifest == HEAD` and the
+/// follow-up succeeds.
+#[tokio::test]
+async fn recovery_rollback_converges_manifest_so_schema_apply_succeeds() {
+    use omnigraph::db::ReadTarget;
+    use omnigraph::loader::{LoadMode, load_jsonl};
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+
+    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    load_jsonl(
+        &mut db,
+        r#"{"type":"Person","data":{"name":"alice","age":30}}
+{"type":"Person","data":{"name":"bob","age":25}}
+"#,
+        LoadMode::Append,
+    )
+    .await
+    .unwrap();
+    drop(db);
+
+    // Forge a Phase-B residual: advance Person's Lance HEAD without publishing to
+    // the manifest (the manifest pin stays at the load's committed version).
+    let person_uri = node_table_uri(uri, "Person");
+    let mut ds = Dataset::open(&person_uri).await.unwrap();
+    let manifest_pin = ds.version().version;
+    let _ = helpers::lance_delete_inline(&mut ds, "1 = 2").await;
+    drop(ds);
+
+    // Roll-back-classified sidecar (post_commit_pin != observed head ⇒
+    // UnexpectedAtP1 ⇒ RollBack).
+    let sidecar_json = format!(
+        r#"{{
+            "schema_version": 1,
+            "operation_id": "01H0000000000000000000CVG",
+            "started_at": "0",
+            "branch": null,
+            "actor_id": "act-test",
+            "writer_kind": "Mutation",
+            "tables": [
+                {{
+                    "table_key": "node:Person",
+                    "table_path": "{}",
+                    "expected_version": {},
+                    "post_commit_pin": {}
+                }}
+            ]
+        }}"#,
+        person_uri, manifest_pin, manifest_pin
+    );
+    write_sidecar_file(dir.path(), "01H0000000000000000000CVG", &sidecar_json);
+
+    // Reopen runs the sweep: restore Person to manifest_pin, then PUBLISH so the
+    // manifest tracks the restored Lance HEAD.
+    let db = Omnigraph::open(uri).await.unwrap();
+
+    // Convergence: manifest pin == Lance HEAD. Fails before the fix — the
+    // manifest stays at manifest_pin while HEAD advanced past it.
+    let snap = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let entry = snap.entry("node:Person").unwrap();
+    let lance_head = Dataset::open(&person_uri).await.unwrap().version().version;
+    assert_eq!(
+        entry.table_version, lance_head,
+        "roll-back must publish so manifest pin ({}) == Lance HEAD ({})",
+        entry.table_version, lance_head,
+    );
+
+    // The +1-loop victim: an additive schema apply must now succeed (its
+    // HEAD-vs-manifest precondition is satisfied). Before the fix this failed
+    // with "stale view … refresh and retry".
+    let desired = TEST_SCHEMA.replace(
+        "    age: I32?\n}",
+        "    age: I32?\n    nickname: String?\n}",
+    );
+    db.apply_schema(&desired)
+        .await
+        .expect("schema apply after a converging roll-back must succeed");
+}
+
 // =====================================================================
 // Phase 4 — roll-forward path + audit row recording
 // =====================================================================
 
 /// Helper: count rows in `_graph_commit_recoveries.lance` at the given root.
-async fn count_recovery_audit_rows(repo_root: &Path) -> usize {
-    let recoveries_dir = repo_root.join("_graph_commit_recoveries.lance");
+async fn count_recovery_audit_rows(graph_root: &Path) -> usize {
+    let recoveries_dir = graph_root.join("_graph_commit_recoveries.lance");
     if !recoveries_dir.exists() {
         return 0;
     }
@@ -306,9 +603,9 @@ async fn count_recovery_audit_rows(repo_root: &Path) -> usize {
 /// Helper: read the most recent recovery audit row's `recovery_kind`,
 /// `recovery_for_actor`, and `operation_id`. Returns `None` if no rows.
 async fn read_latest_recovery_audit(
-    repo_root: &Path,
+    graph_root: &Path,
 ) -> Option<(String, Option<String>, String, String)> {
-    let recoveries_dir = repo_root.join("_graph_commit_recoveries.lance");
+    let recoveries_dir = graph_root.join("_graph_commit_recoveries.lance");
     if !recoveries_dir.exists() {
         return None;
     }
@@ -357,8 +654,8 @@ async fn read_latest_recovery_audit(
 /// storage order (multiple batches concatenated). Used by the
 /// multi-sidecar fresh-snapshot test as a diagnostic alongside the
 /// post-recovery Lance HEAD assertion.
-async fn list_recovery_audit_kinds(repo_root: &Path) -> Vec<String> {
-    let recoveries_dir = repo_root.join("_graph_commit_recoveries.lance");
+async fn list_recovery_audit_kinds(graph_root: &Path) -> Vec<String> {
+    let recoveries_dir = graph_root.join("_graph_commit_recoveries.lance");
     if !recoveries_dir.exists() {
         return Vec::new();
     }
@@ -390,44 +687,26 @@ async fn list_recovery_audit_kinds(repo_root: &Path) -> Vec<String> {
     out
 }
 
-/// Helper: count `_graph_commits.lance` rows tagged with the recovery actor.
-async fn count_recovery_actor_commits(repo_root: &Path) -> usize {
-    let actors_dir = repo_root.join("_graph_commit_actors.lance");
-    if !actors_dir.exists() {
-        return 0;
-    }
-    let ds = Dataset::open(actors_dir.to_str().unwrap()).await.unwrap();
-    use arrow_array::{Array, StringArray};
-    use futures::TryStreamExt;
-    let batches: Vec<arrow_array::RecordBatch> = ds
-        .scan()
-        .try_into_stream()
+/// Helper: count graph commits authored by the recovery actor. RFC-013 Phase 7
+/// records the recovery commit in `__manifest` (folded into the recovery publish
+/// CAS), not `_graph_commits.lance`, so this counts through the production
+/// commit-graph projection (`load_commits`), filtering on the inline actor.
+async fn count_recovery_actor_commits(graph_root: &Path) -> usize {
+    let commits = omnigraph::db::commit_graph::CommitGraph::open(graph_root.to_str().unwrap())
         .await
         .unwrap()
-        .try_collect()
+        .load_commits()
         .await
         .unwrap();
-    let mut count = 0;
-    for batch in &batches {
-        let actors = batch
-            .column_by_name("actor_id")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        for i in 0..actors.len() {
-            if actors.value(i) == "omnigraph:recovery" {
-                count += 1;
-            }
-        }
-    }
-    count
+    commits
+        .iter()
+        .filter(|c| c.actor_id.as_deref() == Some("omnigraph:recovery"))
+        .count()
 }
 
 #[tokio::test]
 async fn recovery_rolls_forward_after_phase_b_completes() {
     use omnigraph::loader::{LoadMode, load_jsonl};
-    use omnigraph::table_store::TableStore;
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
@@ -444,16 +723,12 @@ async fn recovery_rolls_forward_after_phase_b_completes() {
     drop(db);
 
     let person_uri = node_table_uri(uri, "Person");
-    let store = TableStore::new(uri);
     let mut ds = Dataset::open(&person_uri).await.unwrap();
     let head_before = ds.version().version;
 
     // Synthesize a successful Phase B: advance Lance HEAD by one
-    // (delete_where with no-match — no fragment changes, but version bumps).
-    let _ = store
-        .delete_where(&person_uri, &mut ds, "1 = 2")
-        .await
-        .unwrap();
+    // (lance_delete_inline with no-match — no fragment changes, but version bumps).
+    let _ = helpers::lance_delete_inline(&mut ds, "1 = 2").await;
     let head_after = ds.version().version;
     assert_eq!(head_after, head_before + 1);
 
@@ -637,7 +912,6 @@ async fn recovery_records_rolled_forward_for_stale_sidecar_after_successful_roll
 #[tokio::test]
 async fn recovery_rolls_back_records_audit_row_with_recovery_actor() {
     use omnigraph::loader::{LoadMode, load_jsonl};
-    use omnigraph::table_store::TableStore;
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
@@ -651,13 +925,9 @@ async fn recovery_rolls_back_records_audit_row_with_recovery_actor() {
     drop(db);
 
     let person_uri = node_table_uri(uri, "Person");
-    let store = TableStore::new(uri);
     let mut ds = Dataset::open(&person_uri).await.unwrap();
     let head_before = ds.version().version;
-    let _ = store
-        .delete_where(&person_uri, &mut ds, "1 = 2")
-        .await
-        .unwrap();
+    let _ = helpers::lance_delete_inline(&mut ds, "1 = 2").await;
     let head_after = ds.version().version;
     let _ = head_after;
 
@@ -704,7 +974,6 @@ async fn recovery_rolls_back_records_audit_row_with_recovery_actor() {
 #[tokio::test]
 async fn recovery_rolls_forward_with_null_actor() {
     use omnigraph::loader::{LoadMode, load_jsonl};
-    use omnigraph::table_store::TableStore;
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
@@ -718,13 +987,9 @@ async fn recovery_rolls_forward_with_null_actor() {
     drop(db);
 
     let person_uri = node_table_uri(uri, "Person");
-    let store = TableStore::new(uri);
     let mut ds = Dataset::open(&person_uri).await.unwrap();
     let head_before = ds.version().version;
-    let _ = store
-        .delete_where(&person_uri, &mut ds, "1 = 2")
-        .await
-        .unwrap();
+    let _ = helpers::lance_delete_inline(&mut ds, "1 = 2").await;
     let head_after = ds.version().version;
 
     // Sidecar with no actor_id (CLI-driven mutation; common case).
@@ -780,7 +1045,6 @@ async fn recovery_rolls_forward_with_null_actor() {
 #[tokio::test]
 async fn recovery_processes_multiple_sidecars_with_fresh_snapshot_per_iter() {
     use omnigraph::loader::{LoadMode, load_jsonl};
-    use omnigraph::table_store::TableStore;
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
@@ -798,21 +1062,14 @@ async fn recovery_processes_multiple_sidecars_with_fresh_snapshot_per_iter() {
     // Synthesize drift on both tables independently.
     let person_uri = node_table_uri(uri, "Person");
     let company_uri = node_table_uri(uri, "Company");
-    let store = TableStore::new(uri);
     let mut person_ds = Dataset::open(&person_uri).await.unwrap();
     let person_pre = person_ds.version().version;
-    let _ = store
-        .delete_where(&person_uri, &mut person_ds, "1 = 2")
-        .await
-        .unwrap();
+    let _ = helpers::lance_delete_inline(&mut person_ds, "1 = 2").await;
     let person_post = person_ds.version().version;
 
     let mut company_ds = Dataset::open(&company_uri).await.unwrap();
     let company_pre = company_ds.version().version;
-    let _ = store
-        .delete_where(&company_uri, &mut company_ds, "1 = 2")
-        .await
-        .unwrap();
+    let _ = helpers::lance_delete_inline(&mut company_ds, "1 = 2").await;
     let company_post = company_ds.version().version;
 
     // Drop two sidecars; ULID prefix ensures sort order is A then B.
@@ -908,7 +1165,7 @@ async fn recovery_ensure_indices_steady_state_no_sidecar() {
 /// ran) and rolls back any sibling table's legitimate index work.
 ///
 /// Integration verification: after a real init + ensure_indices on a
-/// repo where every table is empty, the recovery sweep must complete
+/// graph where every table is empty, the recovery sweep must complete
 /// cleanly (no leftover sidecar) AND the next ensure_indices must also
 /// leave no sidecar — proving the empty-table-scoping behavior lets
 /// steady-state runs incur zero sidecar I/O. The
@@ -930,7 +1187,7 @@ async fn recovery_ensure_indices_handles_empty_tables() {
     db.ensure_indices().await.unwrap();
     assert!(
         list_recovery_dir(dir.path()).is_empty(),
-        "ensure_indices on an all-empty repo must not leave a sidecar"
+        "ensure_indices on an all-empty graph must not leave a sidecar"
     );
     // Reopen + ensure_indices — still steady state, still no sidecar.
     drop(db);
@@ -938,7 +1195,7 @@ async fn recovery_ensure_indices_handles_empty_tables() {
     db.ensure_indices().await.unwrap();
     assert!(
         list_recovery_dir(dir.path()).is_empty(),
-        "second ensure_indices on an all-empty repo must also not leave a sidecar"
+        "second ensure_indices on an all-empty graph must also not leave a sidecar"
     );
 }
 
@@ -992,7 +1249,6 @@ async fn recovery_ensure_indices_handles_empty_tables() {
 #[tokio::test]
 async fn recovery_multi_sidecar_requires_fresh_snapshot_for_correctness() {
     use omnigraph::loader::{LoadMode, load_jsonl};
-    use omnigraph::table_store::TableStore;
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
@@ -1011,7 +1267,6 @@ async fn recovery_multi_sidecar_requires_fresh_snapshot_for_correctness() {
     drop(db);
 
     let person_uri = node_table_uri(uri, "Person");
-    let store = TableStore::new(uri);
     let mut ds = Dataset::open(&person_uri).await.unwrap();
     let v1 = ds.version().version;
 
@@ -1025,23 +1280,9 @@ async fn recovery_multi_sidecar_requires_fresh_snapshot_for_correctness() {
     // Bypassing __manifest is what `delete_where` and `append_batch`
     // both do (direct on Lance); using append_batch (instead of no-op
     // deletes) is what makes the fragment-set differ across versions.
-    store
-        .append_batch(
-            &person_uri,
-            &mut ds,
-            person_batch(&[("bob-id", "bob", Some(25))]),
-        )
-        .await
-        .unwrap();
+    helpers::lance_append_inline(&mut ds, person_batch(&[("bob-id", "bob", Some(25))])).await;
     let v2 = ds.version().version;
-    store
-        .append_batch(
-            &person_uri,
-            &mut ds,
-            person_batch(&[("carol-id", "carol", Some(40))]),
-        )
-        .await
-        .unwrap();
+    helpers::lance_append_inline(&mut ds, person_batch(&[("carol-id", "carol", Some(40))])).await;
     let v3 = ds.version().version;
     assert_eq!(v2, v1 + 1);
     assert_eq!(v3, v2 + 1);
@@ -1201,19 +1442,12 @@ async fn recovery_classifies_feature_branch_sidecar_against_feature_branch() {
     // Bypass the manifest: append directly to Person's Lance HEAD on the
     // feature branch ref to advance HEAD past v_pin.
     let person_uri = node_table_uri(uri, "Person");
-    let store = TableStore::new(uri);
+    let store = TableStore::new(uri, test_session());
     let mut ds = store
         .open_dataset_head(&person_uri, feature_branch_name.as_deref())
         .await
         .unwrap();
-    store
-        .append_batch(
-            &person_uri,
-            &mut ds,
-            person_batch(&[("carol-id", "carol", Some(40))]),
-        )
-        .await
-        .unwrap();
+    helpers::lance_append_inline(&mut ds, person_batch(&[("carol-id", "carol", Some(40))])).await;
     let v_head = ds.version().version;
     assert_eq!(v_head, v_pin + 1, "append must advance HEAD by 1");
 
@@ -1323,19 +1557,12 @@ async fn recovery_rolls_back_feature_branch_sidecar_against_feature_branch() {
     // Bypass the manifest: append on the feature ref to advance HEAD past
     // the manifest pin.
     let person_uri = node_table_uri(uri, "Person");
-    let store = TableStore::new(uri);
+    let store = TableStore::new(uri, test_session());
     let mut ds = store
         .open_dataset_head(&person_uri, feature_branch_name.as_deref())
         .await
         .unwrap();
-    store
-        .append_batch(
-            &person_uri,
-            &mut ds,
-            person_batch(&[("dave-id", "dave", Some(50))]),
-        )
-        .await
-        .unwrap();
+    helpers::lance_append_inline(&mut ds, person_batch(&[("dave-id", "dave", Some(50))])).await;
     let v_head = ds.version().version;
     assert_eq!(v_head, v_pin + 1);
 
