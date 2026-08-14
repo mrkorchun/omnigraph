@@ -18,8 +18,8 @@ use lance::Dataset;
 use omnigraph::db::Omnigraph;
 
 mod helpers;
-use helpers::test_session;
 use helpers::recovery::{RecoveryExpectation, TableExpectation, assert_post_recovery_invariants};
+use helpers::snapshot_main;
 
 const TEST_SCHEMA: &str = include_str!("fixtures/test.pg");
 
@@ -42,20 +42,39 @@ fn list_recovery_dir(graph_root: &Path) -> Vec<String> {
         .collect()
 }
 
-/// Full URI of a node-type Lance dataset under a fresh Omnigraph graph.
-/// Mirrors the `nodes/{fnv1a64-hex(type_name)}` layout in `db/manifest/layout.rs`.
-fn node_table_uri(root: &str, type_name: &str) -> String {
-    let h: u64 = fnv1a64(type_name.as_bytes());
-    format!("{}/nodes/{:016x}", root.trim_end_matches('/'), h)
-}
-
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in bytes {
-        hash ^= b as u64;
-        hash = hash.wrapping_mul(0x100_0000_01b3);
-    }
-    hash
+/// Resolve one live node table's identity-bound physical URI and serialize the
+/// explicit identity required by every recovery generation. The snapshot owns
+/// the path; the accepted bound catalog owns the same stable/incarnation pair.
+async fn node_table_fixture(db: &Omnigraph, type_name: &str) -> (String, serde_json::Value) {
+    let table_key = format!("node:{type_name}");
+    let snapshot = db
+        .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+        .await
+        .unwrap();
+    let table_path = &snapshot
+        .entry(&table_key)
+        .unwrap_or_else(|| panic!("live manifest has no registration for {table_key}"))
+        .table_path;
+    let catalog = db.catalog();
+    let stable_table_id = catalog
+        .type_id(type_name)
+        .unwrap_or_else(|| panic!("bound catalog has no stable id for {type_name}"))
+        .get();
+    let table_incarnation_id = catalog
+        .table_incarnation_id(type_name)
+        .unwrap_or_else(|| panic!("bound catalog has no incarnation id for {type_name}"))
+        .get();
+    (
+        format!(
+            "{}/{}",
+            db.uri().trim_end_matches('/'),
+            table_path.trim_start_matches('/')
+        ),
+        serde_json::json!({
+            "stable_table_id": stable_table_id,
+            "table_incarnation_id": table_incarnation_id,
+        }),
+    )
 }
 
 /// Build a Person RecordBatch matching the post-init Lance schema:
@@ -143,7 +162,7 @@ async fn recovery_refuses_corrupt_sidecar_on_open_and_write() {
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
 
     // A truncated/garbage sidecar — e.g. a crashed writer or a partial
     // local-FS write (S3 PutObject is atomic; local fs::write is not).
@@ -152,14 +171,13 @@ async fn recovery_refuses_corrupt_sidecar_on_open_and_write() {
     // A live handle's write-entry heal must surface the parse failure
     // loudly instead of proceeding over a sidecar it cannot interpret.
     let err = load_jsonl(
-        &mut db,
+        &db,
         r#"{"type":"Person","data":{"name":"Alice","age":30}}
 "#,
         LoadMode::Merge,
     )
     .await
-    .err()
-    .expect("expected the write to fail on the corrupt sidecar");
+    .expect_err("expected the write to fail on the corrupt sidecar");
     assert!(
         err.to_string().contains("is not valid JSON"),
         "expected the corrupt-sidecar parse error, got: {}",
@@ -200,9 +218,9 @@ async fn drift_guard_advice_ignores_other_branch_sidecars() {
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
     load_jsonl(
-        &mut db,
+        &db,
         "{\"type\":\"Person\",\"data\":{\"name\":\"Alice\",\"age\":30}}\n",
         LoadMode::Merge,
     )
@@ -224,7 +242,7 @@ async fn drift_guard_advice_ignores_other_branch_sidecars() {
     // heal defers it (head < expected_version classifies as an invariant
     // violation; roll-forward-only mode leaves it for the next ReadWrite
     // open) — it persists through the write attempt below.
-    let person_uri = node_table_uri(uri, "Person");
+    let (person_uri, person_identity) = node_table_fixture(&db, "Person").await;
     let sidecar_json = format!(
         r#"{{
         "schema_version": 1,
@@ -235,6 +253,7 @@ async fn drift_guard_advice_ignores_other_branch_sidecars() {
         "writer_kind": "Mutation",
         "tables": [
             {{
+                "identity": {person_identity},
                 "table_key": "node:Person",
                 "table_path": "{person_uri}",
                 "expected_version": 999,
@@ -252,13 +271,12 @@ async fn drift_guard_advice_ignores_other_branch_sidecars() {
     let _ = helpers::lance_delete_inline(&mut ds, "1 = 2").await;
 
     let err = load_jsonl(
-        &mut db,
+        &db,
         "{\"type\":\"Person\",\"data\":{\"name\":\"Bob\",\"age\":25}}\n",
         LoadMode::Merge,
     )
     .await
-    .err()
-    .expect("uncovered main drift must fail the write");
+    .expect_err("uncovered main drift must fail the write");
     assert!(
         err.to_string().contains("run `omnigraph repair`"),
         "a feature-branch sidecar must not flip main's uncovered-drift \
@@ -279,9 +297,9 @@ async fn deleted_branch_sidecar_does_not_wedge_writes_or_open() {
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
-    let mut db = Omnigraph::init(&uri, TEST_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(&uri, TEST_SCHEMA).await.unwrap();
     load_jsonl(
-        &mut db,
+        &db,
         "{\"type\":\"Person\",\"data\":{\"name\":\"Alice\",\"age\":30}}\n",
         LoadMode::Merge,
     )
@@ -299,7 +317,7 @@ async fn deleted_branch_sidecar_does_not_wedge_writes_or_open() {
 
     // A rollback-eligible (deferred) sidecar pinned to feature — shaped
     // so every roll-forward-only pass leaves it on disk.
-    let person_uri = node_table_uri(&uri, "Person");
+    let (person_uri, person_identity) = node_table_fixture(&db, "Person").await;
     let sidecar_json = format!(
         r#"{{
         "schema_version": 1,
@@ -310,6 +328,7 @@ async fn deleted_branch_sidecar_does_not_wedge_writes_or_open() {
         "writer_kind": "Mutation",
         "tables": [
             {{
+                "identity": {person_identity},
                 "table_key": "node:Person",
                 "table_path": "{person_uri}",
                 "expected_version": 999,
@@ -328,7 +347,7 @@ async fn deleted_branch_sidecar_does_not_wedge_writes_or_open() {
     // The next write's heal must classify the orphan and discard it,
     // not fail opening the dead branch.
     load_jsonl(
-        &mut db,
+        &db,
         "{\"type\":\"Person\",\"data\":{\"name\":\"Bob\",\"age\":25}}\n",
         LoadMode::Merge,
     )
@@ -353,13 +372,15 @@ async fn deleted_branch_sidecar_does_not_wedge_writes_or_open() {
 async fn read_only_open_skips_recovery_sweep() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let _db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-    drop(_db);
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let (_, person_identity) = node_table_fixture(&db, "Person").await;
+    drop(db);
 
     // Drop a syntactically-valid but invariant-violating sidecar (HEAD < pin
     // would error if classified). Read-only must NOT classify it — it must
     // skip the sweep entirely.
-    let sidecar_json = r#"{
+    let sidecar_json = format!(
+        r#"{{
         "schema_version": 1,
         "operation_id": "01H000000000000000000000RO",
         "started_at": "0",
@@ -367,15 +388,17 @@ async fn read_only_open_skips_recovery_sweep() {
         "actor_id": null,
         "writer_kind": "Mutation",
         "tables": [
-            {
+            {{
+                "identity": {person_identity},
                 "table_key": "node:Person",
                 "table_path": "/dev/null/nonexistent.lance",
                 "expected_version": 99,
                 "post_commit_pin": 100
-            }
+            }}
         ]
-    }"#;
-    write_sidecar_file(dir.path(), "01H000000000000000000000RO", sidecar_json);
+    }}"#
+    );
+    write_sidecar_file(dir.path(), "01H000000000000000000000RO", &sidecar_json);
 
     // ReadOnly open must succeed — the sweep is skipped, so the bogus
     // sidecar is never inspected.
@@ -388,6 +411,61 @@ async fn read_only_open_skips_recovery_sweep() {
 }
 
 #[tokio::test]
+async fn read_only_open_accepts_only_completed_coherent_v5_schema_apply_sidecar() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    drop(db);
+
+    let schema_state: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.path().join("__schema_state.json")).unwrap(),
+    )
+    .unwrap();
+    let live_hash = schema_state["schema_ir_hash"].as_str().unwrap();
+    let operation_id = "01H000000000000000000000V5";
+    let sidecar_json = |published: bool, target_hash: &str| {
+        format!(
+            r#"{{
+                "schema_version": 5,
+                "operation_id": "{operation_id}",
+                "started_at": "0",
+                "branch": null,
+                "actor_id": null,
+                "writer_kind": "SchemaApply",
+                "tables": [],
+                "schema_apply_manifest_published": {published},
+                "schema_apply_target_schema_ir_hash": "{target_hash}"
+            }}"#,
+        )
+    };
+
+    // v5 writes the marker only after its manifest publish. If the target
+    // identity is also live, only audit/delete cleanup remains and read-only
+    // open can prove that its manifest/catalog pair is coherent.
+    write_sidecar_file(dir.path(), operation_id, &sidecar_json(true, live_hash));
+    let read_only = Omnigraph::open_read_only(uri).await.unwrap();
+    drop(read_only);
+    assert!(
+        list_recovery_dir(dir.path()).contains(&format!("{operation_id}.json")),
+        "read-only open must not delete completed v5 residue"
+    );
+
+    // Without the published marker, even a matching target may be an active
+    // recovery that still needs its manifest delta; read-only must fail closed.
+    write_sidecar_file(dir.path(), operation_id, &sidecar_json(false, live_hash));
+    assert!(Omnigraph::open_read_only(uri).await.is_err());
+
+    // A published marker paired with a non-live target is the torn window and
+    // remains unavailable until read-write recovery completes promotion.
+    write_sidecar_file(
+        dir.path(),
+        operation_id,
+        &sidecar_json(true, "not-the-live-schema"),
+    );
+    assert!(Omnigraph::open_read_only(uri).await.is_err());
+}
+
+#[tokio::test]
 async fn recovery_rolls_back_synthetic_drift_on_open() {
     use omnigraph::loader::{LoadMode, load_jsonl};
 
@@ -396,13 +474,12 @@ async fn recovery_rolls_back_synthetic_drift_on_open() {
 
     // Bootstrap a real graph with a Person table so we have a Lance dataset
     // to advance synthetically.
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
     let test_data = r#"{"type":"Person","data":{"name":"alice","age":30}}
 {"type":"Person","data":{"name":"bob","age":25}}
 "#;
-    load_jsonl(&mut db, test_data, LoadMode::Append)
-        .await
-        .unwrap();
+    load_jsonl(&db, test_data, LoadMode::Append).await.unwrap();
+    let (person_uri, person_identity) = node_table_fixture(&db, "Person").await;
     drop(db);
 
     // Synthetic drift: advance Person's Lance HEAD WITHOUT updating the
@@ -416,7 +493,6 @@ async fn recovery_rolls_back_synthetic_drift_on_open() {
     // and without depending on the dataset's exact column set. The actual
     // residual the sweep recovers from is the manifest-vs-Lance-HEAD gap;
     // it's agnostic to *what* op caused the gap.
-    let person_uri = node_table_uri(uri, "Person");
     let mut ds = Dataset::open(&person_uri).await.unwrap();
     let head_before_drift = ds.version().version;
     let _ = helpers::lance_delete_inline(&mut ds, "1 = 2").await;
@@ -443,6 +519,7 @@ async fn recovery_rolls_back_synthetic_drift_on_open() {
             "writer_kind": "Mutation",
             "tables": [
                 {{
+                    "identity": {person_identity},
                     "table_key": "node:Person",
                     "table_path": "{}",
                     "expected_version": {},
@@ -505,9 +582,9 @@ async fn recovery_rollback_converges_manifest_so_schema_apply_succeeds() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
 
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
     load_jsonl(
-        &mut db,
+        &db,
         r#"{"type":"Person","data":{"name":"alice","age":30}}
 {"type":"Person","data":{"name":"bob","age":25}}
 "#,
@@ -515,11 +592,11 @@ async fn recovery_rollback_converges_manifest_so_schema_apply_succeeds() {
     )
     .await
     .unwrap();
+    let (person_uri, person_identity) = node_table_fixture(&db, "Person").await;
     drop(db);
 
     // Forge a Phase-B residual: advance Person's Lance HEAD without publishing to
     // the manifest (the manifest pin stays at the load's committed version).
-    let person_uri = node_table_uri(uri, "Person");
     let mut ds = Dataset::open(&person_uri).await.unwrap();
     let manifest_pin = ds.version().version;
     let _ = helpers::lance_delete_inline(&mut ds, "1 = 2").await;
@@ -537,6 +614,7 @@ async fn recovery_rollback_converges_manifest_so_schema_apply_succeeds() {
             "writer_kind": "Mutation",
             "tables": [
                 {{
+                    "identity": {person_identity},
                     "table_key": "node:Person",
                     "table_path": "{}",
                     "expected_version": {},
@@ -620,7 +698,7 @@ async fn read_latest_recovery_audit(
         .try_collect()
         .await
         .ok()?;
-    let last_batch = batches.iter().filter(|b| b.num_rows() > 0).last()?;
+    let last_batch = batches.iter().rfind(|b| b.num_rows() > 0)?;
     let row = last_batch.num_rows() - 1;
     let kinds = last_batch
         .column_by_name("recovery_kind")?
@@ -713,16 +791,14 @@ async fn recovery_rolls_forward_after_phase_b_completes() {
 
     // Bootstrap: init + load 2 rows. Manifest pin and Lance HEAD both
     // advance via the legitimate publisher path.
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
     let test_data = r#"{"type":"Person","data":{"name":"alice","age":30}}
 {"type":"Person","data":{"name":"bob","age":25}}
 "#;
-    load_jsonl(&mut db, test_data, LoadMode::Append)
-        .await
-        .unwrap();
+    load_jsonl(&db, test_data, LoadMode::Append).await.unwrap();
+    let (person_uri, person_identity) = node_table_fixture(&db, "Person").await;
     drop(db);
 
-    let person_uri = node_table_uri(uri, "Person");
     let mut ds = Dataset::open(&person_uri).await.unwrap();
     let head_before = ds.version().version;
 
@@ -745,6 +821,7 @@ async fn recovery_rolls_forward_after_phase_b_completes() {
             "writer_kind": "Mutation",
             "tables": [
                 {{
+                    "identity": {person_identity},
                     "table_key": "node:Person",
                     "table_path": "{}",
                     "expected_version": {},
@@ -800,13 +877,11 @@ async fn recovery_records_rolled_forward_for_stale_sidecar_after_successful_roll
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
 
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
     let test_data = r#"{"type":"Person","data":{"name":"alice","age":30}}
 {"type":"Person","data":{"name":"bob","age":25}}
 "#;
-    load_jsonl(&mut db, test_data, LoadMode::Append)
-        .await
-        .unwrap();
+    load_jsonl(&db, test_data, LoadMode::Append).await.unwrap();
 
     // Capture the current manifest pin and Lance HEAD — these match
     // because the load went through the publisher.
@@ -818,9 +893,9 @@ async fn recovery_records_rolled_forward_for_stale_sidecar_after_successful_roll
         .expect("Person entry exists post-load")
         .clone();
     let manifest_pin = person_entry.table_version;
+    let (person_uri, person_identity) = node_table_fixture(&db, "Person").await;
     drop(db);
 
-    let person_uri = node_table_uri(uri, "Person");
     let head_now = Dataset::open(&person_uri).await.unwrap().version().version;
     assert_eq!(
         head_now, manifest_pin,
@@ -841,6 +916,7 @@ async fn recovery_records_rolled_forward_for_stale_sidecar_after_successful_roll
             "writer_kind": "Mutation",
             "tables": [
                 {{
+                    "identity": {person_identity},
                     "table_key": "node:Person",
                     "table_path": "{}",
                     "expected_version": {},
@@ -891,7 +967,7 @@ async fn recovery_records_rolled_forward_for_stale_sidecar_after_successful_roll
         .try_collect()
         .await
         .unwrap();
-    let last = batches.iter().filter(|b| b.num_rows() > 0).last().unwrap();
+    let last = batches.iter().rfind(|b| b.num_rows() > 0).unwrap();
     let row = last.num_rows() - 1;
     let outcomes_json = last
         .column_by_name("per_table_outcomes_json")
@@ -916,15 +992,13 @@ async fn recovery_rolls_back_records_audit_row_with_recovery_actor() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
 
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
     let test_data = r#"{"type":"Person","data":{"name":"alice","age":30}}
 "#;
-    load_jsonl(&mut db, test_data, LoadMode::Append)
-        .await
-        .unwrap();
+    load_jsonl(&db, test_data, LoadMode::Append).await.unwrap();
+    let (person_uri, person_identity) = node_table_fixture(&db, "Person").await;
     drop(db);
 
-    let person_uri = node_table_uri(uri, "Person");
     let mut ds = Dataset::open(&person_uri).await.unwrap();
     let head_before = ds.version().version;
     let _ = helpers::lance_delete_inline(&mut ds, "1 = 2").await;
@@ -943,6 +1017,7 @@ async fn recovery_rolls_back_records_audit_row_with_recovery_actor() {
             "writer_kind": "Load",
             "tables": [
                 {{
+                    "identity": {person_identity},
                     "table_key": "node:Person",
                     "table_path": "{}",
                     "expected_version": {},
@@ -978,15 +1053,13 @@ async fn recovery_rolls_forward_with_null_actor() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
 
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
     let test_data = r#"{"type":"Person","data":{"name":"alice","age":30}}
 "#;
-    load_jsonl(&mut db, test_data, LoadMode::Append)
-        .await
-        .unwrap();
+    load_jsonl(&db, test_data, LoadMode::Append).await.unwrap();
+    let (person_uri, person_identity) = node_table_fixture(&db, "Person").await;
     drop(db);
 
-    let person_uri = node_table_uri(uri, "Person");
     let mut ds = Dataset::open(&person_uri).await.unwrap();
     let head_before = ds.version().version;
     let _ = helpers::lance_delete_inline(&mut ds, "1 = 2").await;
@@ -1003,6 +1076,7 @@ async fn recovery_rolls_forward_with_null_actor() {
             "writer_kind": "EnsureIndices",
             "tables": [
                 {{
+                    "identity": {person_identity},
                     "table_key": "node:Person",
                     "table_path": "{}",
                     "expected_version": {},
@@ -1050,18 +1124,16 @@ async fn recovery_processes_multiple_sidecars_with_fresh_snapshot_per_iter() {
     let uri = dir.path().to_str().unwrap();
 
     // Bootstrap: load Person and Company so both have committed datasets.
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
     let test_data = r#"{"type":"Person","data":{"name":"alice","age":30}}
 {"type":"Company","data":{"name":"acme"}}
 "#;
-    load_jsonl(&mut db, test_data, LoadMode::Append)
-        .await
-        .unwrap();
+    load_jsonl(&db, test_data, LoadMode::Append).await.unwrap();
+    let (person_uri, person_identity) = node_table_fixture(&db, "Person").await;
+    let (company_uri, company_identity) = node_table_fixture(&db, "Company").await;
     drop(db);
 
     // Synthesize drift on both tables independently.
-    let person_uri = node_table_uri(uri, "Person");
-    let company_uri = node_table_uri(uri, "Company");
     let mut person_ds = Dataset::open(&person_uri).await.unwrap();
     let person_pre = person_ds.version().version;
     let _ = helpers::lance_delete_inline(&mut person_ds, "1 = 2").await;
@@ -1082,7 +1154,7 @@ async fn recovery_processes_multiple_sidecars_with_fresh_snapshot_per_iter() {
             "actor_id": "act-a",
             "writer_kind": "EnsureIndices",
             "tables": [
-                {{"table_key":"node:Person","table_path":"{}","expected_version":{},"post_commit_pin":{}}}
+                {{"identity":{person_identity},"table_key":"node:Person","table_path":"{}","expected_version":{},"post_commit_pin":{}}}
             ]
         }}"#,
         person_uri, person_pre, person_post
@@ -1096,7 +1168,7 @@ async fn recovery_processes_multiple_sidecars_with_fresh_snapshot_per_iter() {
             "actor_id": "act-b",
             "writer_kind": "EnsureIndices",
             "tables": [
-                {{"table_key":"node:Company","table_path":"{}","expected_version":{},"post_commit_pin":{}}}
+                {{"identity":{company_identity},"table_key":"node:Company","table_path":"{}","expected_version":{},"post_commit_pin":{}}}
             ]
         }}"#,
         company_uri, company_pre, company_post
@@ -1140,18 +1212,25 @@ async fn recovery_ensure_indices_steady_state_no_sidecar() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
 
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
     let test_data = r#"{"type":"Person","data":{"name":"alice","age":30}}
 {"type":"Company","data":{"name":"acme"}}
 "#;
-    load_jsonl(&mut db, test_data, LoadMode::Append)
-        .await
-        .unwrap();
+    load_jsonl(&db, test_data, LoadMode::Append).await.unwrap();
     db.ensure_indices().await.unwrap();
     drop(db);
 
-    let mut db = Omnigraph::open(uri).await.unwrap();
+    let db = Omnigraph::open(uri).await.unwrap();
+    let before = snapshot_main(&db).await.unwrap();
     db.ensure_indices().await.unwrap();
+    let after = snapshot_main(&db).await.unwrap();
+    assert_eq!(after.version(), before.version());
+    for key in ["node:Person", "node:Company", "edge:Knows", "edge:WorksAt"] {
+        assert_eq!(
+            after.entry(key).unwrap().table_version,
+            before.entry(key).unwrap().table_version
+        );
+    }
     assert!(
         list_recovery_dir(dir.path()).is_empty(),
         "steady-state ensure_indices must not leave a sidecar (no tables need work)"
@@ -1172,27 +1251,43 @@ async fn recovery_ensure_indices_steady_state_no_sidecar() {
 /// `count_rows == 0 → return false` short-circuit in `needs_index_work_*`
 /// is what makes this work.
 ///
-/// A stronger assertion that captured the sidecar mid-flight and verified
-/// the persisted JSON omits empty tables would require bypassing
-/// `load_jsonl` (which auto-builds indices via
-/// `prepare_updates_for_commit`); pinning that with a unit test on the
-/// helpers directly would require bootstrapping an engine plus raw Lance
-/// writes — left as a follow-up.
+/// A stronger assertion that captured the sidecar after arming but before the
+/// first index effect could inspect the persisted pin set directly. That needs
+/// a dedicated pre-effect EnsureIndices rendezvous; the current failpoint is
+/// after its effects, so this remains an end-to-end behavioral assertion.
 #[tokio::test]
 async fn recovery_ensure_indices_handles_empty_tables() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
     // Don't load any data — every table is empty.
+    let before = snapshot_main(&db).await.unwrap();
     db.ensure_indices().await.unwrap();
+    let after = snapshot_main(&db).await.unwrap();
+    assert_eq!(after.version(), before.version());
+    for key in ["node:Person", "node:Company", "edge:Knows", "edge:WorksAt"] {
+        assert_eq!(
+            after.entry(key).unwrap().table_version,
+            before.entry(key).unwrap().table_version
+        );
+    }
     assert!(
         list_recovery_dir(dir.path()).is_empty(),
         "ensure_indices on an all-empty graph must not leave a sidecar"
     );
     // Reopen + ensure_indices — still steady state, still no sidecar.
     drop(db);
-    let mut db = Omnigraph::open(uri).await.unwrap();
+    let db = Omnigraph::open(uri).await.unwrap();
+    let before = snapshot_main(&db).await.unwrap();
     db.ensure_indices().await.unwrap();
+    let after = snapshot_main(&db).await.unwrap();
+    assert_eq!(after.version(), before.version());
+    for key in ["node:Person", "node:Company", "edge:Knows", "edge:WorksAt"] {
+        assert_eq!(
+            after.entry(key).unwrap().table_version,
+            before.entry(key).unwrap().table_version
+        );
+    }
     assert!(
         list_recovery_dir(dir.path()).is_empty(),
         "second ensure_indices on an all-empty graph must also not leave a sidecar"
@@ -1255,18 +1350,18 @@ async fn recovery_multi_sidecar_requires_fresh_snapshot_for_correctness() {
 
     // Bootstrap: load Person rows; manifest pin and Lance HEAD == some
     // baseline N.
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
     load_jsonl(
-        &mut db,
+        &db,
         r#"{"type":"Person","data":{"name":"alice","age":30}}
 "#,
         LoadMode::Append,
     )
     .await
     .unwrap();
+    let (person_uri, person_identity) = node_table_fixture(&db, "Person").await;
     drop(db);
 
-    let person_uri = node_table_uri(uri, "Person");
     let mut ds = Dataset::open(&person_uri).await.unwrap();
     let v1 = ds.version().version;
 
@@ -1299,7 +1394,7 @@ async fn recovery_multi_sidecar_requires_fresh_snapshot_for_correctness() {
             "actor_id": "act-a",
             "writer_kind": "EnsureIndices",
             "tables": [
-                {{"table_key":"node:Person","table_path":"{}","expected_version":{},"post_commit_pin":{}}}
+                {{"identity":{person_identity},"table_key":"node:Person","table_path":"{}","expected_version":{},"post_commit_pin":{}}}
             ]
         }}"#,
         person_uri, v1, v2
@@ -1313,7 +1408,7 @@ async fn recovery_multi_sidecar_requires_fresh_snapshot_for_correctness() {
             "actor_id": "act-b",
             "writer_kind": "EnsureIndices",
             "tables": [
-                {{"table_key":"node:Person","table_path":"{}","expected_version":{},"post_commit_pin":{}}}
+                {{"identity":{person_identity},"table_key":"node:Person","table_path":"{}","expected_version":{},"post_commit_pin":{}}}
             ]
         }}"#,
         person_uri, v2, v3
@@ -1396,14 +1491,12 @@ async fn recovery_multi_sidecar_requires_fresh_snapshot_for_correctness() {
 #[tokio::test]
 async fn recovery_classifies_feature_branch_sidecar_against_feature_branch() {
     use omnigraph::loader::{LoadMode, load_jsonl};
-    use omnigraph::table_store::TableStore;
-
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
 
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
     load_jsonl(
-        &mut db,
+        &db,
         r#"{"type":"Person","data":{"name":"alice","age":30}}
 "#,
         LoadMode::Append,
@@ -1437,16 +1530,12 @@ async fn recovery_classifies_feature_branch_sidecar_against_feature_branch() {
         .entry("node:Person")
         .expect("main snapshot must have Person entry")
         .table_version;
+    let (person_uri, person_identity) = node_table_fixture(&db, "Person").await;
     drop(db);
 
     // Bypass the manifest: append directly to Person's Lance HEAD on the
     // feature branch ref to advance HEAD past v_pin.
-    let person_uri = node_table_uri(uri, "Person");
-    let store = TableStore::new(uri, test_session());
-    let mut ds = store
-        .open_dataset_head(&person_uri, feature_branch_name.as_deref())
-        .await
-        .unwrap();
+    let mut ds = helpers::open_dataset_head(&person_uri, feature_branch_name.as_deref()).await;
     helpers::lance_append_inline(&mut ds, person_batch(&[("carol-id", "carol", Some(40))])).await;
     let v_head = ds.version().version;
     assert_eq!(v_head, v_pin + 1, "append must advance HEAD by 1");
@@ -1463,6 +1552,7 @@ async fn recovery_classifies_feature_branch_sidecar_against_feature_branch() {
             "writer_kind": "Mutation",
             "tables": [
                 {{
+                    "identity":{person_identity},
                     "table_key":"node:Person",
                     "table_path":"{}",
                     "expected_version":{},
@@ -1512,14 +1602,12 @@ async fn recovery_classifies_feature_branch_sidecar_against_feature_branch() {
 #[tokio::test]
 async fn recovery_rolls_back_feature_branch_sidecar_against_feature_branch() {
     use omnigraph::loader::{LoadMode, load_jsonl};
-    use omnigraph::table_store::TableStore;
-
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
 
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
     load_jsonl(
-        &mut db,
+        &db,
         r#"{"type":"Person","data":{"name":"alice","age":30}}
 "#,
         LoadMode::Append,
@@ -1552,16 +1640,12 @@ async fn recovery_rolls_back_feature_branch_sidecar_against_feature_branch() {
         .entry("node:Person")
         .expect("main snapshot must have Person entry")
         .table_version;
+    let (person_uri, person_identity) = node_table_fixture(&db, "Person").await;
     drop(db);
 
     // Bypass the manifest: append on the feature ref to advance HEAD past
     // the manifest pin.
-    let person_uri = node_table_uri(uri, "Person");
-    let store = TableStore::new(uri, test_session());
-    let mut ds = store
-        .open_dataset_head(&person_uri, feature_branch_name.as_deref())
-        .await
-        .unwrap();
+    let mut ds = helpers::open_dataset_head(&person_uri, feature_branch_name.as_deref()).await;
     helpers::lance_append_inline(&mut ds, person_batch(&[("dave-id", "dave", Some(50))])).await;
     let v_head = ds.version().version;
     assert_eq!(v_head, v_pin + 1);
@@ -1580,6 +1664,7 @@ async fn recovery_rolls_back_feature_branch_sidecar_against_feature_branch() {
             "writer_kind": "Mutation",
             "tables": [
                 {{
+                    "identity":{person_identity},
                     "table_key":"node:Person",
                     "table_path":"{}",
                     "expected_version":{},
@@ -1616,15 +1701,23 @@ async fn recovery_rolls_back_feature_branch_sidecar_against_feature_branch() {
     .unwrap();
 
     // Lance HEAD on the feature ref must have advanced (real restore ran).
-    let post = store
-        .open_dataset_head(&person_uri, feature_branch_name.as_deref())
-        .await
-        .unwrap();
+    let post = helpers::open_dataset_head(&person_uri, feature_branch_name.as_deref()).await;
     assert!(
         post.version().version > v_head,
         "real restore must have appended a commit on feature; v_head={}, post={}",
         v_head,
         post.version().version,
+    );
+    let primary_key = post
+        .schema()
+        .unenforced_primary_key()
+        .iter()
+        .map(|field| field.name.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        primary_key,
+        ["id"],
+        "restoring an older feature-branch image must preserve exactly `id` as its Lance unenforced primary key"
     );
 
     let db = Omnigraph::open(uri).await.unwrap();

@@ -22,6 +22,15 @@ pub enum ManifestConflictDetails {
         expected: u64,
         actual: u64,
     },
+    /// A logical authority value captured during write preparation changed
+    /// before the manifest visibility decision. Unlike a touched-table
+    /// version mismatch, this may name a read-only dependency such as the
+    /// target branch's graph head or schema identity.
+    ReadSetChanged {
+        member: String,
+        expected: Option<String>,
+        actual: Option<String>,
+    },
     /// Lance's row-level CAS rejected the publish because a concurrent writer
     /// landed a row with the same `object_id`. Distinct from
     /// `ExpectedVersionMismatch`: the caller's expectations (if any) still
@@ -77,6 +86,17 @@ pub enum OmniError {
     Compiler(#[from] omnigraph_compiler::error::CompilerError),
     #[error("storage: {0}")]
     Lance(String),
+    /// A manifest-pinned Lance version was reclaimed by cleanup. Kept typed at
+    /// the common opener so historical APIs never infer retention from error text.
+    #[error("historical table version {version} was reclaimed")]
+    HistoricalVersionReclaimed { version: u64 },
+
+    /// Lance rejected a stale transaction as semantically retryable. Kept
+    /// typed at the storage boundary so RFC-023 can distinguish an
+    /// effect-free key fence from an arbitrary I/O or execution failure
+    /// without parsing upstream error text.
+    #[error("retryable storage commit conflict: {0}")]
+    RetryableCommitConflict(String),
     #[error("query: {0}")]
     DataFusion(String),
     #[error("io: {0}")]
@@ -85,6 +105,87 @@ pub enum OmniError {
     Manifest(ManifestError),
     #[error("merge conflicts: {0:?}")]
     MergeConflicts(Vec<MergeConflict>),
+    /// A strict keyed insert found that the logical row id already exists in
+    /// the pinned table image, or lost a concurrent exact-id insertion race
+    /// before any effect from this attempt became visible.  This is distinct
+    /// from a stale read set: retrying the same strict insert must not silently
+    /// turn it into an upsert.
+    #[error("key conflict in table '{table_key}'")]
+    KeyConflict {
+        table_key: String,
+        /// Exact id observed by pinned preflight or the required fresh probe
+        /// after an effect-free substrate conflict. Optional on the wire only
+        /// for backward compatibility with older producers.
+        key: Option<String>,
+    },
+    /// A write was rejected before recovery was armed because its bounded
+    /// physical plan would exceed an explicit safety ceiling. This is a
+    /// retryable input-shaping error, not a partial-success signal.
+    #[error("resource limit exceeded for {resource}: actual {actual}, limit {limit}")]
+    ResourceLimitExceeded {
+        resource: String,
+        limit: u64,
+        actual: u64,
+    },
+    /// A commit change page can no longer be reconstructed contiguously.
+    #[error("change feed gap at commit '{first_unreadable_commit_id}'")]
+    ChangeFeedGap {
+        cursor: Option<String>,
+        first_unreadable_commit_id: String,
+    },
+    /// A commit-change cursor failed decoding or names a different scope
+    /// (graph, commit, or cursor version). Kept typed so callers can tell a
+    /// caller-side cursor bug from a retention gap without parsing text.
+    #[error("change cursor rejected: {reason}")]
+    ChangeCursorRejected { reason: String },
+
+    /// A caller attempted to admit an external Blob URI that is malformed or
+    /// outside this graph handle's immutable base allowlist. The URI must be a
+    /// normalized, credential-free spelling (or a redacted placeholder): this
+    /// error crosses HTTP/CLI boundaries and must never echo URI credentials.
+    #[error("external blob URI '{uri}' is not allowed: {reason}")]
+    ExternalBlobPolicy { uri: String, reason: String },
+    /// An allowed external Blob source could not be probed or read before the
+    /// write's first durable effect. Kept distinct from input-policy failures
+    /// so transports can report a dependency failure instead of an opaque 500
+    /// or a misleading malformed-request response.
+    #[error("external blob source '{uri}' is unavailable: {reason}")]
+    ExternalBlobSource { uri: String, reason: String },
+    /// Persisted table or Blob state contradicted the logical Blob contract.
+    /// This is a typed integrity failure rather than a generic storage string so
+    /// callers never reinterpret corrupt identity, metadata, or descriptors as
+    /// null or ordinary absence.
+    #[error("blob integrity violation: {reason}")]
+    BlobIntegrity { reason: String },
+    /// A managed Blob range used reversed or out-of-bounds coordinates.
+    #[error("blob range [{start}, {end}) is not satisfiable for a value of length {length}")]
+    BlobRangeNotSatisfiable { start: u64, end: u64, length: u64 },
+    /// A durable recovery intent overlaps this write. Its physical effects may
+    /// already have landed, or it may still be armed before its first effect;
+    /// either way the sidecar named by `operation_id` must be resolved before
+    /// the caller retries. Treating this as ordinary OCC would let a writer
+    /// advance around unresolved commit ownership.
+    #[error("recovery required for operation {operation_id}: {reason}")]
+    RecoveryRequired {
+        operation_id: String,
+        reason: String,
+    },
+    /// A caller-supplied write precondition named a branch head commit that
+    /// is no longer (or never was) the branch's current head. The write had
+    /// no effect. Distinct from `ReadSetChanged`: that is the engine's own
+    /// authority check and may be reprepared, while this is the caller's
+    /// compare-and-swap token, so it is terminal — retrying against a newer
+    /// head would silently discard the condition the caller asked for.
+    /// `actual` is `None` on a branch with no commits.
+    #[error(
+        "precondition failed on branch '{branch}': expected head '{expected}' but current is {}",
+        actual.as_deref().unwrap_or("<absent>")
+    )]
+    PreconditionFailed {
+        branch: String,
+        expected: String,
+        actual: Option<String>,
+    },
     /// Engine-layer policy enforcement (MR-722). Wraps either a policy
     /// denial ("you can't do that") or a policy-evaluation failure
     /// ("the policy engine itself blew up"). The HTTP layer maps
@@ -102,7 +203,80 @@ pub enum OmniError {
     AlreadyInitialized { uri: String },
 }
 
+impl From<omnigraph_storage::StorageError> for OmniError {
+    fn from(error: omnigraph_storage::StorageError) -> Self {
+        match error {
+            omnigraph_storage::StorageError::Internal(message) => Self::manifest_internal(message),
+            omnigraph_storage::StorageError::Io(error) => Self::Io(error),
+            omnigraph_storage::StorageError::ResourceLimit {
+                resource,
+                limit,
+                actual,
+                ..
+            } => Self::ResourceLimitExceeded {
+                resource,
+                limit,
+                actual,
+            },
+            // The display already carries the full diagnosis; engine
+            // consumers surface the message rather than match the variant.
+            err @ omnigraph_storage::StorageError::CreateIfAbsentUnsupported { .. } => {
+                Self::manifest_internal(err.to_string())
+            }
+        }
+    }
+}
+
 impl OmniError {
+    pub fn key_conflict(table_key: impl Into<String>, key: impl Into<String>) -> Self {
+        Self::KeyConflict {
+            table_key: table_key.into(),
+            key: Some(key.into()),
+        }
+    }
+
+    pub(crate) fn resource_limit(resource: impl Into<String>, limit: u64, actual: u64) -> Self {
+        Self::ResourceLimitExceeded {
+            resource: resource.into(),
+            limit,
+            actual,
+        }
+    }
+
+    pub(crate) fn external_blob_policy(uri: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::ExternalBlobPolicy {
+            uri: uri.into(),
+            reason: reason.into(),
+        }
+    }
+
+    pub(crate) fn external_blob_source(uri: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::ExternalBlobSource {
+            uri: uri.into(),
+            reason: reason.into(),
+        }
+    }
+
+    pub(crate) fn blob_integrity(reason: impl Into<String>) -> Self {
+        Self::BlobIntegrity {
+            reason: reason.into(),
+        }
+    }
+
+    pub(crate) fn is_retryable_commit_conflict(&self) -> bool {
+        matches!(self, Self::RetryableCommitConflict(_))
+    }
+
+    pub(crate) fn is_read_set_changed(&self) -> bool {
+        matches!(
+            self,
+            Self::Manifest(ManifestError {
+                details: Some(ManifestConflictDetails::ReadSetChanged { .. }),
+                ..
+            })
+        )
+    }
+
     pub fn manifest(message: impl Into<String>) -> Self {
         Self::Manifest(ManifestError::new(ManifestErrorKind::BadRequest, message))
     }
@@ -145,5 +319,47 @@ impl OmniError {
             ManifestError::new(ManifestErrorKind::Conflict, message)
                 .with_details(ManifestConflictDetails::RowLevelCasContention),
         )
+    }
+
+    pub fn manifest_read_set_changed(
+        member: impl Into<String>,
+        expected: Option<String>,
+        actual: Option<String>,
+    ) -> Self {
+        let member = member.into();
+        let message = format!(
+            "write authority '{}' changed during preparation (expected {}, current {}) — reprepare from the current branch state",
+            member,
+            expected.as_deref().unwrap_or("<absent>"),
+            actual.as_deref().unwrap_or("<absent>"),
+        );
+        Self::Manifest(
+            ManifestError::new(ManifestErrorKind::Conflict, message).with_details(
+                ManifestConflictDetails::ReadSetChanged {
+                    member,
+                    expected,
+                    actual,
+                },
+            ),
+        )
+    }
+
+    pub fn precondition_failed(
+        branch: impl Into<String>,
+        expected: impl Into<String>,
+        actual: Option<String>,
+    ) -> Self {
+        Self::PreconditionFailed {
+            branch: branch.into(),
+            expected: expected.into(),
+            actual,
+        }
+    }
+
+    pub fn recovery_required(operation_id: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::RecoveryRequired {
+            operation_id: operation_id.into(),
+            reason: reason.into(),
+        }
     }
 }

@@ -1,5 +1,5 @@
 pub mod commit_graph;
-pub mod graph_coordinator;
+mod graph_coordinator;
 pub mod manifest;
 mod omnigraph;
 mod recovery_audit;
@@ -7,44 +7,71 @@ mod schema_state;
 pub(crate) mod write_queue;
 
 pub use commit_graph::GraphCommit;
-pub use graph_coordinator::{GraphCoordinator, ReadTarget, ResolvedTarget, SnapshotId};
-pub use manifest::{Snapshot, SubTableEntry, SubTableUpdate};
+pub use graph_coordinator::{ReadTarget, ResolvedTarget, SnapshotId};
+pub use manifest::{Snapshot, SnapshotScanner, SnapshotTable, SubTableEntry, SubTableUpdate};
 pub(crate) use omnigraph::ensure_public_branch_ref;
-pub(crate) use omnigraph::WriteTxn;
 pub use omnigraph::{
-    CleanupPolicyOptions, InitOptions, MergeOutcome, Omnigraph, OpenMode, PendingIndex,
-    RepairAction, RepairClassification, RepairOptions, RepairStats, SchemaApplyOptions,
-    SchemaApplyResult, SkipReason, TableCleanupStats, TableOptimizeStats, TableRepairStats,
+    CleanupPolicyOptions, EXPORT_CHUNK_MAX_BYTES, ExportCut, InitOptions, MergeOutcome, Omnigraph,
+    OpenMode, PendingIndex, RepairAction, RepairClassification, RepairOptions, RepairStats,
+    SchemaApplyOptions, SchemaApplyResult, SkipReason, TableCleanupStats, TableOptimizeStats,
+    TableRepairStats,
 };
+pub(crate) use omnigraph::{DeferredTableFork, WriteAuthorityToken, WriteTxn};
+pub(crate) use omnigraph::{export_blob_values, logical_row_image};
 
 use crate::error::{OmniError, Result};
 
-pub(crate) const SCHEMA_APPLY_LOCK_BRANCH: &str = "__schema_apply_lock__";
+/// Process-local exclusion shared by immutable export cuts and cooperative
+/// whole-root destructive control. It grants no storage or graph authority.
+#[doc(hidden)]
+#[must_use = "dropping the guard releases destructive root control"]
+pub struct ExportRootExclusion {
+    _permit: write_queue::ExportDestructivePermit,
+}
 
-/// Mutation kind, threaded through the version-check call sites so the
-/// engine can apply an op-kind-aware policy:
+/// Nonwaitingly reserve one graph root against a live immutable export cut.
+#[doc(hidden)]
+pub fn reserve_export_root_exclusion(graph_uri: &str) -> Result<ExportRootExclusion> {
+    let normalized = crate::storage::normalize_root_uri(graph_uri)?;
+    let identity = crate::storage::write_queue_root_identity(&normalized)?;
+    let manager = write_queue::WriteQueueManager::for_root(&identity);
+    let permit = manager.try_acquire_export_destructive().ok_or_else(|| {
+        OmniError::ResourceLimitExceeded {
+            resource: "stream_export_slots".to_string(),
+            limit: 1,
+            actual: 2,
+        }
+    })?;
+    Ok(ExportRootExclusion { _permit: permit })
+}
+
+pub(crate) const SCHEMA_APPLY_LOCK_BRANCH: &str = "__schema_apply_lock__";
+/// Persisted graph-level property identity carried by each user property's
+/// physical Lance field.  Historical consumers compare this authority rather
+/// than inferring property lifetime from a Lance field id or field position.
+pub(crate) const STABLE_PROPERTY_ID_METADATA_KEY: &str = "omnigraph.stable_property_id";
+
+/// Mutation kind, threaded through the early table-version checks so the
+/// engine can apply an op-kind-aware staging policy. This check is not the
+/// RFC-022 publish authority: enrolled mutation/load attempts additionally
+/// capture an exact branch-wide `WriteTxn`, then revalidate it while holding
+/// the root-shared schema → branch → sorted-table gates.
 ///
 /// - `Insert` / `Merge`: skip the strict pre-stage `ensure_expected_version`
-///   check. Lance's `MergeInsertBuilder` rebases concurrent appends; the
-///   per-(table, branch) writer queue serializes `commit_staged`; the
-///   publisher's CAS (refreshed under the queue via
-///   `MutationStaging::commit_all`'s `snapshot_for_branch` call) catches
-///   genuine cross-process drift as `ManifestConflictDetails::ExpectedVersionMismatch`.
-///   The pre-stage strict check would over-reject in-process concurrent
-///   inserts, which is exactly the case PR 2 / MR-686 designed the
-///   per-table queue to allow.
+///   check because their staged files are reclaimable and the complete prepared
+///   attempt is checked later against the exact branch authority. On a
+///   pre-effect `ReadSetChanged`, mutation Insert and load Append/Merge discard
+///   the whole attempt and reprepare with a bounded retry; they never patch
+///   table pins beneath an already-validated plan.
 ///
-/// - `Update` / `Delete`: keep the strict check. These have read-modify-write
-///   semantics; Lance moving between the read at stage time and the write
-///   at commit time means the staged batch is computed against stale state.
-///   The strict check guards the per-query SI invariant. SERIALIZABLE
-///   opt-in (§VI.36 future seam) is the long-term answer for tighter
-///   semantics; today, in-process update-update races on the same key
-///   stay rejected as 409 — acceptable.
+/// - `Update` / `Delete`: keep the strict early check because these are
+///   read-modify-write effects computed from a pinned image. Enrolled attempts
+///   still perform the later branch-wide revalidation; a mismatch is strict
+///   `ReadSetChanged` (HTTP 409), not a transparent replay.
 ///
-/// - `SchemaRewrite`: keep the strict check. Schema apply runs under the
-///   graph-wide `__schema_apply_lock__` AND per-table queues; the strict
-///   check is uncontested at that point.
+/// - `SchemaRewrite`: keep the strict early check for overwrite/rewrite effects.
+///   An enrolled load Overwrite also uses the exact branch-wide gate and
+///   surfaces `ReadSetChanged`; schema apply has its own schema/table protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MutationOpKind {
     Insert,

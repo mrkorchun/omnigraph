@@ -1,14 +1,18 @@
-use std::ffi::OsString;
-use std::fs;
-use std::io::{self, Write};
-use std::path::PathBuf;
+#![recursion_limit = "256"]
+
 use clap::{Arg, ArgAction, Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use color_eyre::eyre::{Result, bail};
 use omnigraph::db::{Omnigraph, ReadTarget, SnapshotId};
 use omnigraph::loader::LoadMode;
+use omnigraph_api_types::{
+    BlobContentKindOutput, BlobStatOutput, ChangeOpOutput, ChangeOutput, CommitChangesOutput,
+    CommitOutput, ErrorOutput, GraphBatchLoadOutput, IngestOutput, ReadOutput, SchemaApplyOutput,
+    SnapshotTableOutput,
+};
 use omnigraph_cluster::{
-    ApplyOptions, ApplyOutput, ApproveOutput, DiagnosticSeverity, ForceUnlockOutput, PlanOutput, StateSyncOutput, StatusOutput,
-    ValidateOutput, apply_config_dir_with_options, approve_config_dir, force_unlock_config_dir, import_config_dir, plan_config_dir,
+    ApplyOptions, ApplyOutput, ApproveOutput, DiagnosticSeverity, ForceUnlockOutput, PlanOutput,
+    StateSyncOutput, StatusOutput, ValidateOutput, apply_config_dir_with_options,
+    approve_config_dir, force_unlock_config_dir, import_config_dir, plan_config_dir,
     refresh_config_dir, status_config_dir, validate_config_dir,
 };
 use omnigraph_compiler::query::parser::parse_query;
@@ -17,10 +21,6 @@ use omnigraph_compiler::{
     JsonParamMode, ParamMap, QueryLintOutput, QueryLintQueryKind, QueryLintSchemaSource,
     QueryLintSeverity, QueryLintStatus, SchemaMigrationPlan, SchemaMigrationStep, build_catalog,
     json_params_to_param_map, lint_query_file,
-};
-use omnigraph_api_types::{
-    ChangeOutput, CommitOutput, ErrorOutput, IngestOutput, ReadOutput, SchemaApplyOutput,
-    SnapshotTableOutput,
 };
 use omnigraph_server::queries::{QueryRegistry, check};
 use omnigraph_server::{
@@ -31,6 +31,10 @@ use reqwest::header::AUTHORIZATION;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use std::ffi::OsString;
+use std::fs;
+use std::io::{self, Write};
+use std::path::PathBuf;
 
 mod embed;
 mod operator;
@@ -39,15 +43,21 @@ mod read_format;
 use embed::{EmbedArgs, EmbedOutput, execute_embed};
 use read_format::{ReadOutputFormat, ReadRenderOptions, render_read};
 
+mod blob_cli;
 mod cli;
 mod client;
 mod helpers;
 mod output;
-mod scope;
 mod planes;
+mod scope;
 use cli::*;
 use helpers::*;
 use output::*;
+
+/// Exit code for a lost `--if-commit` compare-and-swap (HTTP 412): distinct
+/// from the generic failure exit (1) so scripts can branch on "someone else
+/// wrote first — re-read and retry" without matching message text.
+const EXIT_PRECONDITION_FAILED: i32 = 4;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -66,10 +76,13 @@ async fn main() -> Result<()> {
         Cli::from_arg_matches(&matches)?
     };
     let http_client = build_http_client()?;
-    // RFC-010 Slice 1: reject data-plane addressing flags (--server/--graph) on
-    // a verb that doesn't live on the data plane, from one declared table —
-    // before any per-command dispatch.
+    // RFC-010 Slice 1: reject scope-addressing flags a verb can't consume,
+    // from one declared flag × capability matrix — before any per-command
+    // dispatch.
     planes::guard_addressing(&cli)?;
+    // The verb's declared capability, threaded into scope resolution so the
+    // resolver and the guard share one classification (planes.rs).
+    let capability = planes::command_capability(&cli.command);
     match cli.command {
         Command::Login { name, token, json } => {
             let token = match token {
@@ -257,6 +270,7 @@ async fn main() -> Result<()> {
             json,
         } => {
             let client = client::GraphClient::resolve_with_policy(
+                capability,
                 cli.server.as_deref(),
                 cli.graph.as_deref(),
                 uri,
@@ -290,9 +304,11 @@ async fn main() -> Result<()> {
             // stderr so `--json` consumers reading stdout are unaffected.
             eprintln!(
                 "warning: `omnigraph ingest` is deprecated and will be removed in a future release; \
-                 use `omnigraph load --from <base> --mode <mode>` (ingest defaults: --from main --mode merge)"
+                 use strict graph-batch `omnigraph load --from <base> --mode <mode>` for new integrations \
+                 (ingest defaults: --from main --mode merge)"
             );
             let client = client::GraphClient::resolve_with_policy(
+                capability,
                 cli.server.as_deref(),
                 cli.graph.as_deref(),
                 uri,
@@ -321,6 +337,7 @@ async fn main() -> Result<()> {
                 json,
             } => {
                 let client = client::GraphClient::resolve_with_policy(
+                    capability,
                     cli.server.as_deref(),
                     cli.graph.as_deref(),
                     uri,
@@ -338,11 +355,9 @@ async fn main() -> Result<()> {
                     println!("created branch {} from {}", payload.name, payload.from);
                 }
             }
-            BranchCommand::List {
-                uri,
-                json,
-            } => {
+            BranchCommand::List { uri, json } => {
                 let client = client::GraphClient::resolve(
+                    capability,
                     cli.server.as_deref(),
                     cli.graph.as_deref(),
                     uri,
@@ -359,12 +374,9 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-            BranchCommand::Delete {
-                uri,
-                name,
-                json,
-            } => {
+            BranchCommand::Delete { uri, name, json } => {
                 let client = client::GraphClient::resolve_with_policy(
+                    capability,
                     cli.server.as_deref(),
                     cli.graph.as_deref(),
                     uri,
@@ -386,9 +398,11 @@ async fn main() -> Result<()> {
                 uri,
                 source,
                 into,
+                delete_branch,
                 json,
             } => {
                 let client = client::GraphClient::resolve_with_policy(
+                    capability,
                     cli.server.as_deref(),
                     cli.graph.as_deref(),
                     uri,
@@ -399,7 +413,29 @@ async fn main() -> Result<()> {
                 .await?;
                 let into = resolve_branch(into, None, "main");
                 echo_write_target(cli.quiet, "branch merge", client.uri(), client.is_remote());
-                let payload = client.branch_merge(&source, &into).await?;
+                let payload = client.branch_merge(&source, &into, delete_branch).await?;
+                // Warnings go to stderr so `--json` consumers reading stdout
+                // are unaffected. `branch_deleted: None` after requesting
+                // deletion means an older server ignored the unknown request
+                // field — surface that instead of silently leaving the branch.
+                if delete_branch {
+                    match payload.branch_deleted {
+                        Some(true) => {}
+                        Some(false) => eprintln!(
+                            "warning: merged, but could not delete branch '{}': {}",
+                            payload.source,
+                            payload
+                                .branch_delete_error
+                                .as_deref()
+                                .unwrap_or("unknown error")
+                        ),
+                        None => eprintln!(
+                            "warning: merged, but the server does not support --delete-branch; \
+                             branch '{}' was not deleted",
+                            payload.source
+                        ),
+                    }
+                }
                 if json {
                     print_json(&payload)?;
                 } else {
@@ -409,16 +445,16 @@ async fn main() -> Result<()> {
                         payload.target,
                         payload.outcome.as_str()
                     );
+                    if payload.branch_deleted == Some(true) {
+                        println!("deleted branch {}", payload.source);
+                    }
                 }
             }
         },
         Command::Commit { command } => match command {
-            CommitCommand::List {
-                uri,
-                branch,
-                json,
-            } => {
+            CommitCommand::List { uri, branch, json } => {
                 let client = client::GraphClient::resolve(
+                    capability,
                     cli.server.as_deref(),
                     cli.graph.as_deref(),
                     uri,
@@ -439,6 +475,7 @@ async fn main() -> Result<()> {
                 json,
             } => {
                 let client = client::GraphClient::resolve(
+                    capability,
                     cli.server.as_deref(),
                     cli.graph.as_deref(),
                     uri,
@@ -451,6 +488,37 @@ async fn main() -> Result<()> {
                     print_json(&commit)?;
                 } else {
                     print_commit_human(&commit);
+                }
+            }
+            CommitCommand::Changes {
+                uri,
+                commit_id,
+                cursor,
+                limit,
+                max_bytes,
+                json,
+            } => {
+                let client = client::GraphClient::resolve(
+                    capability,
+                    cli.server.as_deref(),
+                    cli.graph.as_deref(),
+                    uri,
+                    cli.profile.as_deref(),
+                    cli.store.as_deref(),
+                )
+                .await?;
+                let output = client
+                    .commit_changes(
+                        &commit_id,
+                        cursor.as_deref(),
+                        limit.unwrap_or(omnigraph::changes::COMMIT_CHANGES_DEFAULT_ROWS),
+                        max_bytes.unwrap_or(omnigraph::changes::COMMIT_CHANGES_DEFAULT_BYTES),
+                    )
+                    .await?;
+                if json {
+                    print_json(&output)?;
+                } else {
+                    print_commit_changes_human(&output);
                 }
             }
         },
@@ -497,6 +565,7 @@ async fn main() -> Result<()> {
                 allow_data_loss,
             } => {
                 let client = client::GraphClient::resolve_with_policy(
+                    capability,
                     cli.server.as_deref(),
                     cli.graph.as_deref(),
                     uri,
@@ -539,11 +608,9 @@ async fn main() -> Result<()> {
                     print_schema_apply_human(&output);
                 }
             }
-            SchemaCommand::Show {
-                uri,
-                json,
-            } => {
+            SchemaCommand::Show { uri, json } => {
                 let client = client::GraphClient::resolve(
+                    capability,
                     cli.server.as_deref(),
                     cli.graph.as_deref(),
                     uri,
@@ -599,12 +666,9 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Command::Snapshot {
-            uri,
-            branch,
-            json,
-        } => {
+        Command::Snapshot { uri, branch, json } => {
             let client = client::GraphClient::resolve(
+                capability,
                 cli.server.as_deref(),
                 cli.graph.as_deref(),
                 uri,
@@ -633,6 +697,7 @@ async fn main() -> Result<()> {
             table_keys,
         } => {
             let client = client::GraphClient::resolve(
+                capability,
                 cli.server.as_deref(),
                 cli.graph.as_deref(),
                 uri,
@@ -651,6 +716,72 @@ async fn main() -> Result<()> {
                 .export(&branch, &type_names, &table_keys, &mut stdout)
                 .await?;
         }
+        Command::Blob { command } => match command {
+            BlobCommand::Get {
+                entity,
+                type_name,
+                id,
+                property,
+                branch,
+                snapshot,
+                offset,
+                length,
+                out,
+            } => {
+                // Invalid range arithmetic is rejected before scope resolution
+                // can probe a server or open a graph.
+                let range = blob_cli::BlobRangeRequest::new(offset, length)?;
+                let query =
+                    blob_cli::blob_query(entity.into(), type_name, id, property, branch, snapshot);
+                let client = client::GraphClient::resolve(
+                    capability,
+                    cli.server.as_deref(),
+                    cli.graph.as_deref(),
+                    None,
+                    cli.profile.as_deref(),
+                    cli.store.as_deref(),
+                )
+                .await?;
+                match out {
+                    Some(path) => {
+                        let mut file = blob_cli::DeferredOutputFile::new(path);
+                        client.blob_get(&query, range, &mut file).await?;
+                    }
+                    None => {
+                        let stdout = io::stdout();
+                        let mut stdout = stdout.lock();
+                        client.blob_get(&query, range, &mut stdout).await?;
+                    }
+                }
+            }
+            BlobCommand::Stat {
+                entity,
+                type_name,
+                id,
+                property,
+                branch,
+                snapshot,
+                json,
+            } => {
+                let query =
+                    blob_cli::blob_query(entity.into(), type_name, id, property, branch, snapshot);
+                let client = client::GraphClient::resolve(
+                    capability,
+                    cli.server.as_deref(),
+                    cli.graph.as_deref(),
+                    None,
+                    cli.profile.as_deref(),
+                    cli.store.as_deref(),
+                )
+                .await?;
+                let output = client.blob_stat(&query).await?;
+                if json {
+                    print_json(&output)?;
+                } else {
+                    print_blob_stat_human(&output);
+                }
+            }
+        },
         Command::Query {
             name,
             query,
@@ -662,6 +793,7 @@ async fn main() -> Result<()> {
             json,
         } => {
             let client = client::GraphClient::resolve(
+                capability,
                 cli.server.as_deref(),
                 cli.graph.as_deref(),
                 None,
@@ -692,7 +824,7 @@ async fn main() -> Result<()> {
                     ReadTarget::Snapshot(s) => (None, Some(s.as_str().to_string())),
                 };
                 client
-                    .invoke_named(&name, false, params_json.as_ref(), branch, snapshot)
+                    .invoke_named(&name, false, params_json.as_ref(), branch, snapshot, None)
                     .await?
             };
             let format = resolve_read_format(format, json, None);
@@ -704,9 +836,11 @@ async fn main() -> Result<()> {
             query_string,
             params,
             branch,
+            if_commit,
             json,
         } => {
             let client = client::GraphClient::resolve_with_policy(
+                capability,
                 cli.server.as_deref(),
                 cli.graph.as_deref(),
                 None,
@@ -717,13 +851,19 @@ async fn main() -> Result<()> {
             .await?;
             let params_json = load_params_json(&params)?;
             let branch = resolve_branch(branch, None, "main");
-            let output: ChangeOutput = if query.is_some() || query_string.is_some() {
+            let result: Result<ChangeOutput> = if query.is_some() || query_string.is_some() {
                 // Ad-hoc lane: run the source; positional `name` selects within it.
                 let query_source =
                     resolve_query_source(query.as_ref(), query_string.as_deref(), None)?;
                 client
-                    .mutate(&branch, &query_source, name.as_deref(), params_json.as_ref())
-                    .await?
+                    .mutate(
+                        &branch,
+                        &query_source,
+                        name.as_deref(),
+                        params_json.as_ref(),
+                        if_commit.as_deref(),
+                    )
+                    .await
             } else {
                 // Catalog lane (served-only): invoke the stored mutation by name.
                 let Some(name) = name else {
@@ -733,8 +873,33 @@ async fn main() -> Result<()> {
                     );
                 };
                 client
-                    .invoke_named(&name, true, params_json.as_ref(), Some(branch), None)
-                    .await?
+                    .invoke_named(
+                        &name,
+                        true,
+                        params_json.as_ref(),
+                        Some(branch),
+                        None,
+                        if_commit.as_deref(),
+                    )
+                    .await
+            };
+            let output = match result {
+                Ok(output) => output,
+                // A lost --if-commit CAS is an expected outcome, not a failure:
+                // emit the structured body or message, then exit
+                // EXIT_PRECONDITION_FAILED.
+                Err(err) => match err.downcast::<helpers::PreconditionFailedCli>() {
+                    Ok(precondition) => {
+                        if json {
+                            print_json(&precondition.output)?;
+                        } else {
+                            eprintln!("{precondition}");
+                        }
+                        std::io::stdout().flush()?;
+                        std::process::exit(EXIT_PRECONDITION_FAILED);
+                    }
+                    Err(err) => return Err(err),
+                },
             };
             if json {
                 print_json(&output)?;
@@ -1099,18 +1264,14 @@ async fn main() -> Result<()> {
             }
         },
         Command::Graphs { command } => match command {
-            GraphsCommand::List {
-                uri,
-                json,
-            } => {
-                let client = client::GraphClient::resolve(
+            GraphsCommand::List { json } => {
+                // Registry scope (RFC-011): the bare server base URL, resolved
+                // synchronously — the async D7 require-graph probe cannot run
+                // here, and no `/graphs/<id>` is ever appended.
+                let client = client::GraphClient::resolve_registry(
                     cli.server.as_deref(),
-                    cli.graph.as_deref(),
-                    uri,
                     cli.profile.as_deref(),
-                    cli.store.as_deref(),
-                )
-                .await?;
+                )?;
                 let payload = client.list_graphs().await?;
                 if json {
                     print_json(&payload)?;
@@ -1124,7 +1285,6 @@ async fn main() -> Result<()> {
     }
     Ok(())
 }
-
 
 #[cfg(test)]
 #[path = "main_tests.rs"]

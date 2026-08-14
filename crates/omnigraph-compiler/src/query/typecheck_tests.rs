@@ -3,6 +3,28 @@ use crate::catalog::build_catalog;
 use crate::query::parser::parse_query;
 use crate::schema::parser::parse_schema;
 
+/// Node type name of a binding, panicking if it is an edge binding — the two
+/// namespaces can share a type name (see `setup_same_named_node_and_edge`).
+/// Indexing `ctx.bindings` covers the unbound case with its own panic.
+fn node_type_of(binding: &BoundVariable) -> &str {
+    match binding {
+        BoundVariable::Node { type_name } => type_name,
+        BoundVariable::Edge { type_name } => {
+            panic!("expected a node binding, found edge type `{type_name}`")
+        }
+    }
+}
+
+/// Edge type name of a binding — the dual of `node_type_of`.
+fn edge_type_of(binding: &BoundVariable) -> &str {
+    match binding {
+        BoundVariable::Edge { type_name } => type_name,
+        BoundVariable::Node { type_name } => {
+            panic!("expected an edge binding, found node type `{type_name}`")
+        }
+    }
+}
+
 fn setup() -> Catalog {
     let schema = parse_schema(
         r#"
@@ -25,6 +47,24 @@ title: String?
     build_catalog(&schema).unwrap()
 }
 
+fn setup_same_named_node_and_edge() -> Catalog {
+    // Node and edge namespaces are independent. These deliberately share a
+    // name so the typechecker cannot use `type_name` as a proxy for binding
+    // kind when it validates rebinding and traversal endpoints.
+    let schema = parse_schema(
+        r#"
+node Shared {
+label: String
+}
+edge Shared: Shared -> Shared {
+label: String?
+}
+"#,
+    )
+    .unwrap();
+    build_catalog(&schema).unwrap()
+}
+
 fn setup_vector() -> Catalog {
     let schema = parse_schema(
         r#"
@@ -38,12 +78,53 @@ embedding: Vector(3)
     build_catalog(&schema).unwrap()
 }
 
+#[test]
+fn mutation_target_retains_node_namespace_when_an_edge_shares_its_name() {
+    let catalog = setup_same_named_node_and_edge();
+    let qf = parse_query(
+        r#"
+query insert_shared() {
+insert Shared { label: "node" }
+}
+"#,
+    )
+    .unwrap();
+
+    let checked = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap();
+    match checked {
+        CheckedQuery::Mutation(ctx) => assert_eq!(
+            ctx.targets,
+            vec![MutationTarget::Node {
+                type_name: "Shared".to_string(),
+            }]
+        ),
+        CheckedQuery::Read(_) => panic!("expected mutation typecheck result"),
+    }
+}
+
 fn setup_list() -> Catalog {
     let schema = parse_schema(
         r#"
 node Person {
 name: String
 tags: [String]?
+}
+"#,
+    )
+    .unwrap();
+    build_catalog(&schema).unwrap()
+}
+
+fn setup_blob() -> Catalog {
+    let schema = parse_schema(
+        r#"
+node Document {
+name: String
+payload: Blob?
+}
+edge Attaches: Document -> Document {
+label: String?
+payload: Blob?
 }
 "#,
     )
@@ -217,7 +298,9 @@ return { $p.tags, $tags, $days }
 }
 
 #[test]
-fn test_contains_filter_requires_list_left_operand() {
+fn test_contains_filter_accepts_string_substring_overload() {
+    // A scalar String left operand resolves the overload to exact substring
+    // matching (previously a T7 error, so no existing query changes meaning).
     let catalog = setup();
     let qf = parse_query(
         r#"
@@ -231,10 +314,111 @@ return { $p.name }
 "#,
     )
     .unwrap();
+    assert!(typecheck_query(&catalog, &qf.queries[0]).is_ok());
+}
+
+#[test]
+fn test_string_contains_requires_string_right_operand() {
+    let catalog = setup();
+    let qf = parse_query(
+        r#"
+query q() {
+match {
+    $p: Person
+    $p.name contains 42
+}
+return { $p.name }
+}
+"#,
+    )
+    .unwrap();
     let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
     assert!(
         err.to_string()
-            .contains("contains requires a list property on the left")
+            .contains("string contains requires a String right operand")
+    );
+}
+
+#[test]
+fn test_contains_filter_requires_list_or_string_left_operand() {
+    let catalog = setup();
+    let qf = parse_query(
+        r#"
+query q() {
+match {
+    $p: Person
+    $p.age contains 3
+}
+return { $p.name }
+}
+"#,
+    )
+    .unwrap();
+    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    assert!(err.to_string().contains(
+        "contains requires a list property (membership) or a String property (substring)"
+    ));
+}
+
+#[test]
+fn test_starts_with_accepts_string_operands() {
+    let catalog = setup();
+    let qf = parse_query(
+        r#"
+query q($q: String) {
+match {
+    $p: Person
+    $p.name starts_with $q
+}
+return { $p.name }
+}
+"#,
+    )
+    .unwrap();
+    assert!(typecheck_query(&catalog, &qf.queries[0]).is_ok());
+}
+
+#[test]
+fn test_starts_with_rejects_non_string_left_operand() {
+    let catalog = setup();
+    let qf = parse_query(
+        r#"
+query q() {
+match {
+    $p: Person
+    $p.age starts_with "4"
+}
+return { $p.name }
+}
+"#,
+    )
+    .unwrap();
+    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("starts_with requires a String property on the left")
+    );
+}
+
+#[test]
+fn test_starts_with_rejects_non_string_right_operand() {
+    let catalog = setup();
+    let qf = parse_query(
+        r#"
+query q() {
+match {
+    $p: Person
+    $p.name starts_with 4
+}
+return { $p.name }
+}
+"#,
+    )
+    .unwrap();
+    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("starts_with requires a String right operand")
     );
 }
 
@@ -742,7 +926,7 @@ return { $f.name }
     .unwrap();
     let ctx = typecheck_query(&catalog, &qf.queries[0]).unwrap();
     assert_eq!(ctx.traversals[0].direction, Direction::Both);
-    assert_eq!(ctx.bindings["f"].type_name, "Person");
+    assert_eq!(node_type_of(&ctx.bindings["f"]), "Person");
 }
 
 #[test]
@@ -783,7 +967,7 @@ return { $f.name }
     .unwrap();
     let ctx = typecheck_query(&catalog, &qf.queries[0]).unwrap();
     assert_eq!(ctx.traversals[0].direction, Direction::Out);
-    assert_eq!(ctx.bindings["f"].type_name, "Person");
+    assert_eq!(node_type_of(&ctx.bindings["f"]), "Person");
 }
 
 #[test]
@@ -942,7 +1126,12 @@ insert Person {
     .unwrap();
     let checked = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap();
     match checked {
-        CheckedQuery::Mutation(ctx) => assert_eq!(ctx.target_types[0], "Person"),
+        CheckedQuery::Mutation(ctx) => assert_eq!(
+            ctx.targets[0],
+            MutationTarget::Node {
+                type_name: "Person".to_string(),
+            }
+        ),
         _ => panic!("expected mutation typecheck result"),
     }
 }
@@ -978,7 +1167,12 @@ insert Doc {
     .unwrap();
     let checked = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap();
     match checked {
-        CheckedQuery::Mutation(ctx) => assert_eq!(ctx.target_types[0], "Doc"),
+        CheckedQuery::Mutation(ctx) => assert_eq!(
+            ctx.targets[0],
+            MutationTarget::Node {
+                type_name: "Doc".to_string(),
+            }
+        ),
         _ => panic!("expected mutation typecheck result"),
     }
 }
@@ -1049,7 +1243,12 @@ insert Knows {
     .unwrap();
     let checked = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap();
     match checked {
-        CheckedQuery::Mutation(ctx) => assert_eq!(ctx.target_types[0], "Knows"),
+        CheckedQuery::Mutation(ctx) => assert_eq!(
+            ctx.targets[0],
+            MutationTarget::Edge {
+                type_name: "Knows".to_string(),
+            }
+        ),
         _ => panic!("expected mutation typecheck result"),
     }
 }
@@ -1084,7 +1283,12 @@ delete Knows where from = $from
     .unwrap();
     let checked = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap();
     match checked {
-        CheckedQuery::Mutation(ctx) => assert_eq!(ctx.target_types[0], "Knows"),
+        CheckedQuery::Mutation(ctx) => assert_eq!(
+            ctx.targets[0],
+            MutationTarget::Edge {
+                type_name: "Knows".to_string(),
+            }
+        ),
         _ => panic!("expected mutation typecheck result"),
     }
 }
@@ -1119,7 +1323,17 @@ insert Knows { from: $name, to: $friend }
     let checked = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap();
     match checked {
         CheckedQuery::Mutation(ctx) => {
-            assert_eq!(ctx.target_types, vec!["Person", "Knows"]);
+            assert_eq!(
+                ctx.targets,
+                vec![
+                    MutationTarget::Node {
+                        type_name: "Person".to_string(),
+                    },
+                    MutationTarget::Edge {
+                        type_name: "Knows".to_string(),
+                    },
+                ]
+            );
         }
         _ => panic!("expected mutation typecheck result"),
     }
@@ -1194,4 +1408,509 @@ update Event set { on: now() } where slug = "launch"
     let err = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap_err();
     assert!(err.to_string().contains("DateTime"));
     assert!(err.to_string().contains("property `on`"));
+}
+
+#[test]
+fn test_edge_binding_prop_access_in_filter_and_return() {
+    let catalog = setup();
+    let qf = parse_query(
+        r#"
+query q() {
+match {
+    $p: Person
+    $p $w:knows $f
+    $w.since >= date("2026-01-01")
+}
+return { $f.name, $w.since }
+}
+"#,
+    )
+    .unwrap();
+    let ctx = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+    assert_eq!(edge_type_of(&ctx.bindings["w"]), "Knows");
+    assert_eq!(
+        ctx.traversals[0].edge_binding.as_deref(),
+        Some("w"),
+        "resolved traversal carries the binding for lowering"
+    );
+}
+
+#[test]
+fn test_edge_binding_unknown_property_rejected() {
+    let catalog = setup();
+    let qf = parse_query(
+        r#"
+query q() {
+match {
+    $p: Person
+    $p $w:knows $f
+}
+return { $w.nonsense }
+}
+"#,
+    )
+    .unwrap();
+    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("Knows"), "names the edge type: {msg}");
+    assert!(
+        msg.contains("nonsense"),
+        "names the missing property: {msg}"
+    );
+}
+
+#[test]
+fn test_edge_binding_rejected_on_bounded_traversal() {
+    let catalog = setup();
+    let qf = parse_query(
+        r#"
+query q() {
+match {
+    $p: Person
+    $p $w:knows{1,3} $f
+}
+return { $f.name }
+}
+"#,
+    )
+    .unwrap();
+    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("T23"), "dedicated code: {msg}");
+    assert!(msg.contains("multi-hop"), "explains the restriction: {msg}");
+}
+
+#[test]
+fn test_edge_binding_name_collision_rejected() {
+    let catalog = setup();
+    let qf = parse_query(
+        r#"
+query q() {
+match {
+    $p: Person
+    $p $p:knows $f
+}
+return { $f.name }
+}
+"#,
+    )
+    .unwrap();
+    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    assert!(err.to_string().contains("T23"), "{err}");
+}
+
+#[test]
+fn test_edge_binding_cannot_reuse_a_fresh_traversal_endpoint() {
+    let catalog = setup_same_named_node_and_edge();
+
+    for pattern in ["$w $w:shared $b", "$a $w:shared $w"] {
+        let source = format!(
+            r#"
+query q() {{
+match {{ {pattern} }}
+return {{ $w.label }}
+}}
+"#
+        );
+        let qf = parse_query(&source).unwrap();
+        let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("T23"), "dedicated edge-binding error: {msg}");
+        assert!(
+            msg.contains("endpoint") && msg.contains("distinct"),
+            "explains the namespace collision: {msg}"
+        );
+    }
+}
+
+#[test]
+fn test_edge_binding_cannot_be_rebound_as_same_named_node_type() {
+    let catalog = setup_same_named_node_and_edge();
+    let qf = parse_query(
+        r#"
+query q() {
+match {
+    $a: Shared
+    $a $w:shared $b
+    $w: Shared
+}
+return { $w.label }
+}
+"#,
+    )
+    .unwrap();
+
+    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("T23"), "dedicated edge-binding error: {msg}");
+    assert!(
+        msg.contains("edge") && msg.contains("node"),
+        "reports the cross-kind rebind: {msg}"
+    );
+}
+
+#[test]
+fn test_edge_binding_cannot_be_a_same_named_traversal_endpoint() {
+    let catalog = setup_same_named_node_and_edge();
+
+    for second_traversal in ["$w $x:shared $c", "$c $x:shared $w"] {
+        let source = format!(
+            r#"
+query q() {{
+match {{
+    $a: Shared
+    $a $w:shared $b
+    {second_traversal}
+}}
+return {{ $c.label }}
+}}
+"#
+        );
+        let qf = parse_query(&source).unwrap();
+        let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("T23"), "dedicated edge-binding error: {msg}");
+        assert!(
+            msg.contains("edge") && msg.contains("endpoint"),
+            "reports the cross-kind endpoint use: {msg}"
+        );
+    }
+}
+
+#[test]
+fn test_blob_read_values_are_rejected_for_nodes_and_edges() {
+    let catalog = setup_blob();
+    for (binding_kind, match_clause, variable, scalar_property) in [
+        ("node", "$d: Document", "d", "name"),
+        ("edge", "$a: Document\n    $a $e:attaches $b", "e", "label"),
+    ] {
+        let cases = [
+            ("projection", format!("return {{ ${variable}.payload }}")),
+            (
+                "order",
+                format!(
+                    "return {{ ${variable}.{scalar_property} }}\norder {{ ${variable}.payload }}"
+                ),
+            ),
+            ("count", format!("return {{ count(${variable}.payload) }}")),
+            ("sum", format!("return {{ sum(${variable}.payload) }}")),
+            ("avg", format!("return {{ avg(${variable}.payload) }}")),
+            ("min", format!("return {{ min(${variable}.payload) }}")),
+            ("max", format!("return {{ max(${variable}.payload) }}")),
+        ];
+
+        for (operation, tail) in cases {
+            let source = format!("query q() {{\nmatch {{\n    {match_clause}\n}}\n{tail}\n}}");
+            let qf = parse_query(&source).unwrap_or_else(|error| {
+                panic!("{binding_kind} {operation} query must parse: {error}\n{source}")
+            });
+            let error = typecheck_query(&catalog, &qf.queries[0])
+                .expect_err(&format!("{binding_kind} {operation}"));
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "type error: T24: Blob property `${variable}.payload` is not available as a .gq read value; Blob values require a dedicated API"
+                ),
+                "{binding_kind} {operation}"
+            );
+        }
+    }
+
+    // The containment is property-type-specific; ordinary edge projections
+    // continue to use the existing bound-edge scan.
+    let scalar_edge = parse_query(
+        r#"
+query q() {
+match {
+    $a: Document
+    $a $e:attaches $b
+}
+return { $e.label }
+}
+"#,
+    )
+    .unwrap();
+    assert!(typecheck_query(&catalog, &scalar_edge.queries[0]).is_ok());
+}
+
+#[test]
+fn test_blob_count_cannot_bypass_result_schema_inference() {
+    let catalog = setup_blob();
+    let qf = parse_query(
+        r#"
+query q() {
+match { $d: Document }
+return { count($d.payload) }
+}
+"#,
+    )
+    .unwrap();
+    let ctx = TypeContext {
+        bindings: HashMap::from([(
+            "d".to_string(),
+            BoundVariable::Node {
+                type_name: "Document".to_string(),
+            },
+        )]),
+        aliases: HashMap::new(),
+        traversals: Vec::new(),
+    };
+    let error = infer_query_result_schema(&catalog, &qf.queries[0], &ctx).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "type error: T24: Blob property `$d.payload` is not available as a .gq read value; Blob values require a dedicated API"
+    );
+}
+
+#[test]
+fn test_blob_parameters_are_rejected_as_read_values() {
+    let catalog = setup_blob();
+    let cases = [
+        ("projection", "return { $payload }"),
+        ("aliased projection", "return { $payload as copy }"),
+        ("order", "return { $d.name }\norder { $payload }"),
+        ("count", "return { count($payload) }"),
+    ];
+
+    for (operation, tail) in cases {
+        let source = format!("query q($payload: Blob) {{\nmatch {{ $d: Document }}\n{tail}\n}}");
+        let qf = parse_query(&source)
+            .unwrap_or_else(|error| panic!("{operation} query must parse: {error}\n{source}"));
+        let error = typecheck_query(&catalog, &qf.queries[0]).expect_err(operation);
+        assert_eq!(
+            error.to_string(),
+            "type error: T24: Blob parameter `$payload` is not available as a .gq read value; Blob values require a dedicated API",
+            "{operation}"
+        );
+    }
+}
+
+#[test]
+fn test_blob_match_and_comparison_refusals_remain_pinned() {
+    let catalog = setup_blob();
+
+    let matched = parse_query(
+        r#"
+query q($payload: Blob) {
+match { $d: Document { payload: $payload } }
+return { $d.name }
+}
+"#,
+    )
+    .unwrap();
+    let error = typecheck_query(&catalog, &matched.queries[0]).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "type error: T3: blob property `Document.payload` cannot be used in match patterns"
+    );
+
+    let parameter_comparison = parse_query(
+        r#"
+query q($left: Blob, $right: Blob) {
+match {
+    $d: Document
+    $left = $right
+}
+return { $d.name }
+}
+"#,
+    )
+    .unwrap();
+    let error = typecheck_query(&catalog, &parameter_comparison.queries[0]).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "type error: T7: blob comparisons in filters are not supported"
+    );
+
+    // The textual grammar treats a bare `$xs contains $x` as traversal-like,
+    // but the AST is a public compiler surface. Pin containment there too so
+    // callers cannot route Blob membership around the ordinary comparison
+    // guard.
+    let direct_ast = QueryDecl {
+        name: "blob_membership".to_string(),
+        description: None,
+        instruction: None,
+        params: vec![
+            Param {
+                name: "xs".to_string(),
+                type_name: "[Blob]".to_string(),
+                nullable: false,
+            },
+            Param {
+                name: "x".to_string(),
+                type_name: "Blob".to_string(),
+                nullable: false,
+            },
+        ],
+        match_clause: vec![Clause::Filter(Filter {
+            left: Expr::Variable("xs".to_string()),
+            op: CompOp::Contains,
+            right: Expr::Variable("x".to_string()),
+        })],
+        return_clause: vec![Projection {
+            expr: Expr::Literal(Literal::String("unreachable".to_string())),
+            alias: None,
+        }],
+        order_clause: Vec::new(),
+        limit: None,
+        mutations: Vec::new(),
+    };
+    let error = typecheck_query(&catalog, &direct_ast).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "type error: T7: blob comparisons in filters are not supported"
+    );
+
+    for (kind, match_clause, variable) in [
+        ("node", "$d: Document", "d"),
+        ("edge", "$a: Document\n    $a $e:attaches $b", "e"),
+    ] {
+        let source = format!(
+            "query q($payload: Blob) {{\nmatch {{\n    {match_clause}\n    ${variable}.payload = $payload\n}}\nreturn {{ $payload }}\n}}"
+        );
+        let qf = parse_query(&source)
+            .unwrap_or_else(|error| panic!("{kind} comparison must parse: {error}\n{source}"));
+        let error = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "type error: T24: Blob property `${variable}.payload` is not available as a .gq read value; Blob values require a dedicated API"
+            ),
+            "{kind} comparison"
+        );
+    }
+}
+
+#[test]
+fn test_blob_mutation_predicates_are_rejected_for_nodes_and_edges() {
+    let catalog = setup_blob();
+    for (kind, target) in [("node", "Document"), ("edge", "Attaches")] {
+        for param_type in ["Blob", "String"] {
+            let source = format!(
+                "query delete_target($payload: {param_type}) {{\ndelete {target} where payload = $payload\n}}"
+            );
+            let qf = parse_query(&source).unwrap();
+            let error = typecheck_query_decl(&catalog, &qf.queries[0])
+                .expect_err("Blob predicates must never use assignment coercions");
+            assert_eq!(
+                error.to_string(),
+                "type error: T11: blob property `payload` cannot be used in WHERE predicates",
+                "{kind} {param_type} predicate"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_blob_mutation_assignment_remains_supported() {
+    let catalog = setup_blob();
+    for param_type in ["Blob", "String"] {
+        let source = format!(
+            r#"
+query update_payload($payload: {param_type}) {{
+update Document set {{ payload: $payload }} where name = "doc"
+}}
+"#
+        );
+        let qf = parse_query(&source).unwrap();
+        assert!(
+            matches!(
+                typecheck_query_decl(&catalog, &qf.queries[0]),
+                Ok(CheckedQuery::Mutation(_))
+            ),
+            "{param_type} assignment must remain available"
+        );
+    }
+}
+
+#[test]
+fn test_edge_binding_aggregate_typechecks() {
+    // The uniformity promise ("works wherever a node field does") includes
+    // aggregates: count over an edge property, grouped by a node field.
+    let catalog = setup();
+    let qf = parse_query(
+        r#"
+query knows_counts() {
+match {
+    $p: Person
+    $p $w:knows $f
+}
+return { $f.name, count($w.since) }
+}
+"#,
+    )
+    .unwrap();
+    let ctx = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+    assert!(matches!(&ctx.bindings["w"], BoundVariable::Edge { .. }));
+}
+
+#[test]
+fn test_edge_binding_rejected_in_search_field() {
+    // Would otherwise typecheck (title is a String edge prop) and then be
+    // SILENTLY DROPPED by the engine's search-filter hoist, which targets a
+    // NodeScan the edge binding does not have.
+    let catalog = setup();
+    let qf = parse_query(
+        r#"
+query q() {
+match {
+    $p: Person
+    $p $w:worksAt $c
+    search($w.title, "engineer")
+}
+return { $c.name }
+}
+"#,
+    )
+    .unwrap();
+    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("T23"), "{msg}");
+    assert!(msg.contains("search"), "{msg}");
+}
+
+#[test]
+fn test_edge_binding_rejected_in_nearest() {
+    let catalog = setup();
+    let qf = parse_query(
+        r#"
+query q() {
+match {
+    $p: Person
+    $p $w:worksAt $c
+}
+return { $c.name }
+order { nearest($w.title, "x") }
+limit 5
+}
+"#,
+    )
+    .unwrap();
+    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("T23"),
+        "clear edge-binding error, not a confusing catalog miss: {msg}"
+    );
+}
+
+#[test]
+fn test_edge_binding_bare_use_rejected() {
+    let catalog = setup();
+    let qf = parse_query(
+        r#"
+query q() {
+match {
+    $p: Person
+    $p $w:knows $f
+}
+return { $w }
+}
+"#,
+    )
+    .unwrap();
+    let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("T23"), "{msg}");
+    assert!(msg.contains("propert"), "points at property access: {msg}");
 }

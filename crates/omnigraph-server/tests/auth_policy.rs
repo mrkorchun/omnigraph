@@ -5,19 +5,19 @@ use std::env;
 use std::fs;
 use std::sync::Arc;
 
-use axum::body::Body;
+use axum::body::{Body, to_bytes};
 use axum::http::header::AUTHORIZATION;
 use axum::http::{Method, Request, StatusCode};
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::OmniError;
 use omnigraph::loader::LoadMode;
 use omnigraph_server::api::{
-    BranchCreateRequest, BranchMergeRequest, ChangeRequest, ErrorOutput, ExportRequest, ReadRequest, SchemaApplyRequest,
+    BranchCreateRequest, BranchMergeRequest, ChangeRequest, ErrorOutput, ExportRequest,
+    ReadRequest, SchemaApplyRequest,
 };
 use omnigraph_server::{AppState, build_app};
 use serde_json::{Value, json};
 use tower::ServiceExt;
-
 
 mod support;
 use support::*;
@@ -387,7 +387,15 @@ async fn policy_allows_read_but_distinguishes_401_from_403() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn policy_uses_resolved_branch_for_snapshot_reads() {
-    let temp = init_loaded_graph().await;
+    let schema = fs::read_to_string(fixture("test.pg"))
+        .unwrap()
+        .replace("    age: I32?", "    age: I32?\n    avatar: Blob?");
+    let data = format!(
+        "{}\n{}",
+        fs::read_to_string(fixture("test.jsonl")).unwrap(),
+        r#"{"type":"Person","data":{"name":"Blob Reader","avatar":"base64:QXV0aG9yaXplZA=="}}"#
+    );
+    let temp = init_graph_with_schema_and_data(&schema, &data).await;
     let graph = graph_path(temp.path());
     let snapshot_id = {
         let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
@@ -397,7 +405,10 @@ async fn policy_uses_resolved_branch_for_snapshot_reads() {
     fs::write(&policy_path, POLICY_PROTECTED_READ_YAML).unwrap();
     let state = AppState::open_with_bearer_tokens_and_policy(
         graph.to_string_lossy().to_string(),
-        vec![("act-bruno".to_string(), "team-token".to_string())],
+        vec![
+            ("act-bruno".to_string(), "team-token".to_string()),
+            ("act-denied".to_string(), "denied-token".to_string()),
+        ],
         Some(&policy_path),
     )
     .await
@@ -409,7 +420,7 @@ async fn policy_uses_resolved_branch_for_snapshot_reads() {
         query_name: Some("get_person".to_string()),
         params: Some(json!({ "name": "Alice" })),
         branch: None,
-        snapshot: Some(snapshot_id),
+        snapshot: Some(snapshot_id.clone()),
     };
     let (status, body) = json_response(
         &app,
@@ -430,6 +441,105 @@ async fn policy_uses_resolved_branch_for_snapshot_reads() {
         read.snapshot.as_deref()
     );
     assert_eq!(body["row_count"], 1);
+
+    let blob_uri = g(&format!(
+        "/blob?entity=node&type=Person&id=Blob%20Reader&property=avatar&snapshot={snapshot_id}"
+    ));
+
+    let missing = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&blob_uri)
+                .method(Method::GET)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+
+    let denied = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&blob_uri)
+                .method(Method::GET)
+                .header("authorization", "Bearer denied-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+    let allowed = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&blob_uri)
+                .method(Method::GET)
+                .header("authorization", "Bearer team-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(allowed.status(), StatusCode::OK);
+    assert_eq!(
+        allowed.headers().get("omnigraph-snapshot-id").unwrap(),
+        snapshot_id.as_str()
+    );
+    assert_eq!(
+        &to_bytes(allowed.into_body(), usize::MAX).await.unwrap()[..],
+        b"Authorized"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn policy_authorizes_omitted_commit_list_branch_as_main() {
+    // `GET /commits` without `branch` is documented and implemented as
+    // main's history, so the policy gate must see `branch = main` — the
+    // same normalization `server_snapshot` performs. Under a read grant
+    // scoped to protected branches (main protected), the omitted form
+    // must behave exactly like the explicit `?branch=main` form.
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let policy_path = temp.path().join("policy.yaml");
+    fs::write(&policy_path, POLICY_PROTECTED_READ_YAML).unwrap();
+    let state = AppState::open_with_bearer_tokens_and_policy(
+        graph.to_string_lossy().to_string(),
+        vec![("act-bruno".to_string(), "team-token".to_string())],
+        Some(&policy_path),
+    )
+    .await
+    .unwrap();
+    let app = build_app(state);
+
+    let (explicit_status, explicit_body) = json_response(
+        &app,
+        Request::builder()
+            .uri(g("/commits?branch=main"))
+            .method(Method::GET)
+            .header("authorization", "Bearer team-token")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(explicit_status, StatusCode::OK);
+
+    let (omitted_status, omitted_body) = json_response(
+        &app,
+        Request::builder()
+            .uri(g("/commits"))
+            .method(Method::GET)
+            .header("authorization", "Bearer team-token")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(omitted_status, StatusCode::OK);
+    assert_eq!(omitted_body, explicit_body);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -533,6 +643,7 @@ async fn policy_blocks_non_admin_merge_to_main_and_allows_admin() {
     let merge = BranchMergeRequest {
         source: "feature".to_string(),
         target: Some("main".to_string()),
+        delete_branch: false,
     };
     let (deny_status, deny_body) = json_response(
         &app,
@@ -607,7 +718,7 @@ async fn authenticated_change_stamps_actor_on_commits() {
     let head = commits_body["commits"]
         .as_array()
         .unwrap()
-        .last()
+        .first()
         .expect("head commit should exist");
     assert_eq!(head["actor_id"], "act-andrew");
 }
@@ -659,6 +770,7 @@ async fn authenticated_branch_merge_stamps_merge_actor_on_head_commit() {
     let merge = BranchMergeRequest {
         source: "feature".to_string(),
         target: Some("main".to_string()),
+        delete_branch: false,
     };
     let (merge_status, merge_body) = json_response(
         &app,
@@ -688,9 +800,61 @@ async fn authenticated_branch_merge_stamps_merge_actor_on_head_commit() {
     let head = commit_body["commits"]
         .as_array()
         .unwrap()
-        .last()
+        .first()
         .expect("head commit should exist");
     assert_eq!(head["actor_id"], "act-ragnor");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn branch_merge_delete_branch_policy_denial_is_non_fatal() {
+    // act-ragnor (admins) may merge into the protected target, but the
+    // composed source deletion targets the UNPROTECTED branch `feature`,
+    // which `admins-merge` (target_branch_scope: protected) does not allow.
+    // The deletion runs under its own `branch_delete` decision, so the merge
+    // must succeed while the denial is reported non-fatally — composition
+    // never smuggles a delete through a merge permission.
+    let (temp, app) = app_for_loaded_graph_with_auth_tokens_and_policy(
+        &[("act-ragnor", "token-admin")],
+        POLICY_YAML,
+    )
+    .await;
+    let graph = graph_path(temp.path());
+
+    let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+    db.branch_create_from(ReadTarget::branch("main"), "feature")
+        .await
+        .unwrap();
+    drop(db);
+
+    let merge = BranchMergeRequest {
+        source: "feature".to_string(),
+        target: Some("main".to_string()),
+        delete_branch: true,
+    };
+    let (merge_status, merge_body) = json_response(
+        &app,
+        Request::builder()
+            .uri(g("/branches/merge"))
+            .method(Method::POST)
+            .header("authorization", "Bearer token-admin")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&merge).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(merge_status, StatusCode::OK);
+    assert_eq!(merge_body["outcome"], "already_up_to_date");
+    assert_eq!(merge_body["branch_deleted"], false);
+    assert!(
+        merge_body["branch_delete_error"]
+            .as_str()
+            .unwrap()
+            .contains("policy denied action 'branch_delete'")
+    );
+
+    let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+    let branches = db.branch_list().await.unwrap();
+    assert!(branches.iter().any(|branch| branch == "feature"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

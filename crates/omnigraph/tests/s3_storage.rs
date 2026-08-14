@@ -5,8 +5,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use omnigraph::db::MergeOutcome;
 use omnigraph::db::{Omnigraph, ReadTarget};
-use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes, with_traversal_mode};
+use omnigraph::instrumentation::{
+    MergeWriteProbes, QueryIoProbes, with_merge_write_probes, with_query_io_probes,
+    with_traversal_mode,
+};
 use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::{ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy};
 
 use helpers::*;
 
@@ -17,8 +21,8 @@ async fn s3_compatible_graph_lifecycle_works() {
         return;
     };
 
-    let mut db = Omnigraph::init(&uri, TEST_SCHEMA).await.unwrap();
-    load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite)
+    let db = Omnigraph::init(&uri, TEST_SCHEMA).await.unwrap();
+    load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
 
@@ -91,12 +95,12 @@ async fn s3_branch_change_merge_flow_works() {
     };
 
     let mut main = Omnigraph::init(&uri, TEST_SCHEMA).await.unwrap();
-    load_jsonl(&mut main, TEST_DATA, LoadMode::Overwrite)
+    load_jsonl(&main, TEST_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(&uri).await.unwrap();
+    let feature = Omnigraph::open(&uri).await.unwrap();
     feature
         .mutate(
             "feature",
@@ -144,8 +148,11 @@ async fn s3_public_load_uses_hidden_run_and_publishes() {
         return;
     };
 
-    let mut db = Omnigraph::init(&uri, TEST_SCHEMA).await.unwrap();
-    load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite)
+    let schema =
+        format!("{TEST_SCHEMA}\nnode Document {{\n    title: String @key\n    content: Blob\n}}\n");
+    let graph_uri = format!("{uri}/graph");
+    let db = Omnigraph::init(&graph_uri, &schema).await.unwrap();
+    load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
 
@@ -159,7 +166,7 @@ async fn s3_public_load_uses_hidden_run_and_publishes() {
 
     // Direct-to-target writes: no run state machine, just the
     // published commit lands the row. Verify by reopening and reading.
-    let mut reopened = Omnigraph::open(&uri).await.unwrap();
+    let mut reopened = Omnigraph::open(&graph_uri).await.unwrap();
     let loaded = query_main(
         &mut reopened,
         TEST_QUERIES,
@@ -170,6 +177,63 @@ async fn s3_public_load_uses_hidden_run_and_publishes() {
     .unwrap()
     .to_rust_json();
     assert_eq!(loaded[0]["p.name"], "Loaded-Over-S3");
+
+    // RFC-033's only server-safe source scheme is S3. Exercise it against the
+    // configured backend rather than inferring remote behavior from file://:
+    // two URI spellings for one object share one metadata probe and one payload
+    // read, and keyed load owns the resulting bytes after the source disappears.
+    let external_base = format!("{uri}/external/");
+    let external_uri = format!("{external_base}shared~source.bin");
+    let adapter = omnigraph::storage::storage_for_uri(&uri).unwrap();
+    adapter
+        .write_text(&external_uri, "RustFS external Blob")
+        .await
+        .unwrap();
+    let policy = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(&external_base, ExternalBlobExecutionScope::ServerSafe).unwrap(),
+    ])
+    .unwrap();
+    let db = db.with_external_blob_policy(policy).unwrap();
+    let encoded_alias = external_uri.replace("~source", "%7Esource");
+    assert_ne!(encoded_alias, external_uri);
+    let rows = format!(
+        "{}\n{}",
+        serde_json::json!({
+            "type": "Document",
+            "data": {"title": "remote-a", "content": external_uri},
+        }),
+        serde_json::json!({
+            "type": "Document",
+            "data": {"title": "remote-b", "content": encoded_alias},
+        })
+    );
+    let probes = MergeWriteProbes::default();
+    with_merge_write_probes(probes.clone(), db.load("main", &rows, LoadMode::Append))
+        .await
+        .unwrap();
+    assert_eq!(probes.external_blob_probe_inputs(), 2);
+    assert_eq!(
+        probes.external_blob_probe_calls(),
+        1,
+        "normalized-equivalent S3 sources must issue one metadata probe"
+    );
+    assert_eq!(
+        probes.external_blob_payload_read_calls(),
+        1,
+        "one prepared keyed batch must read a normalized S3 source once"
+    );
+
+    adapter.delete(&external_uri).await.unwrap();
+    let reopened = Omnigraph::open(&graph_uri).await.unwrap();
+    for title in ["remote-a", "remote-b"] {
+        let blob = read_managed_blob_bytes(
+            &reopened,
+            ReadTarget::branch("main"),
+            node_blob_cell("Document", title, "content"),
+        )
+        .await;
+        assert_eq!(&blob[..], b"RustFS external Blob");
+    }
 }
 
 /// The conditional-write contract the cluster ledger depends on (RFC-006):
@@ -188,6 +252,21 @@ async fn s3_adapter_conditional_writes_contract() {
 
     assert!(adapter.write_text_if_absent(&object, "v1").await.unwrap());
     assert!(!adapter.write_text_if_absent(&object, "v1b").await.unwrap());
+    assert_eq!(
+        adapter
+            .read_text_if_exists(&object)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("v1")
+    );
+    assert_eq!(
+        adapter
+            .read_text_if_exists(&format!("{uri}/missing-probe.json"))
+            .await
+            .unwrap(),
+        None
+    );
 
     let (text, version) = adapter.read_text_versioned(&object).await.unwrap();
     assert_eq!(text, "v1");
@@ -223,6 +302,7 @@ async fn s3_adapter_conditional_writes_contract() {
     assert!(!adapter.exists(&format!("{uri}/tree/a.json")).await.unwrap());
     adapter.delete_prefix(&format!("{uri}/tree")).await.unwrap();
     adapter.delete(&object).await.unwrap();
+    assert_eq!(adapter.read_text_if_exists(&object).await.unwrap(), None);
 }
 
 /// Schema apply against an S3 graph — the cluster's schema executor will
@@ -233,8 +313,8 @@ async fn s3_schema_apply_migrates_live_graph() {
         eprintln!("skipping s3 schema apply test: OMNIGRAPH_S3_TEST_BUCKET is not set");
         return;
     };
-    let mut db = Omnigraph::init(&uri, TEST_SCHEMA).await.unwrap();
-    load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite)
+    let db = Omnigraph::init(&uri, TEST_SCHEMA).await.unwrap();
+    load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
 
@@ -263,9 +343,9 @@ async fn s3_fresh_branch_traversal_reuses_main_graph_index_with_etags() {
         return;
     };
 
-    let mut writer = Omnigraph::init(&uri, TEST_SCHEMA).await.unwrap();
+    let writer = Omnigraph::init(&uri, TEST_SCHEMA).await.unwrap();
     // TEST_DATA seeds Alice->Bob and Alice->Charlie Knows edges.
-    load_jsonl(&mut writer, TEST_DATA, LoadMode::Overwrite)
+    load_jsonl(&writer, TEST_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
 

@@ -1,10 +1,11 @@
 //! Per-query staging accumulator for direct-publish writes.
 //!
 //! `MutationStaging` accumulates per-table input batches in memory during a
-//! `mutate_as` or `load` query, then at end-of-query commits each touched
-//! table via Lance's distributed-write API (one `stage_*` + `commit_staged`
-//! per table) and returns the publisher inputs (`SubTableUpdate` list +
-//! `expected_table_versions`).
+//! `mutate_as` or `load` query. At end-of-query it prepares one staged Lance
+//! transaction per touched existing ref (or a deferred first-touch plan), then
+//! joins the RFC-022 protocol: acquire ordered gates, revalidate the complete
+//! read set, arm durable recovery, apply the physical effects, and return the
+//! exact publisher inputs while retaining the guards through manifest CAS.
 //!
 //! Read-your-writes within the same query is satisfied by the in-memory
 //! pending batches (see `pending_batches`) — read sites union the committed
@@ -13,7 +14,8 @@
 //!
 //! This module is shared by the engine's mutation path (`exec/mutation.rs`)
 //! and the bulk loader (`loader/mod.rs`); both feed insert/update batches
-//! into `pending` and route end-of-query commits through `finalize`.
+//! into `pending` and route end-of-query work through `stage_all` then
+//! `commit_all`, followed by one exact manifest publish.
 //! Deletes accumulate as predicates in `delete_predicates` (via
 //! `record_delete`) and stage through the same `stage_* → commit_staged`
 //! path as writes — `stage_delete` produces a deletion-vector transaction
@@ -24,24 +26,45 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::storage_layer::{SnapshotHandle, StagedHandle};
+use crate::storage_layer::{
+    KEYED_WRITE_MAX_BYTES, KEYED_WRITE_MAX_ROWS, KeyedWriteSemantics, SnapshotHandle, StagedHandle,
+};
 use arrow_array::{Array, RecordBatch, StringArray, UInt32Array};
 use arrow_schema::SchemaRef;
 use futures::stream::StreamExt;
 
 use crate::db::manifest::{
-    RecoverySidecarHandle, SidecarKind, SidecarTablePin, new_sidecar, write_sidecar,
+    RecoveryAuthorityToken, RecoveryLineageIntent, RecoverySidecarHandle, SidecarKind,
+    SidecarTablePin, confirm_occ_sidecar_v9, new_occ_sidecar_v9, write_sidecar,
 };
 use crate::db::{MutationOpKind, SubTableUpdate};
 use crate::error::{OmniError, Result};
+use crate::table_store::ExternalBlobUriCollector;
 
-/// Whether the per-table accumulator should commit via `stage_append`,
-/// `stage_merge_insert`, or `stage_overwrite`.
+/// Logical semantics for one accumulated table write.
+///
+/// Both additive modes route through RFC-023's exact-`id` fenced adapter.
+/// The names deliberately describe graph semantics rather than Lance
+/// operations: keyed graph tables never select a bare `Append` transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PendingMode {
-    Append,
-    Merge,
+    StrictInsert,
+    Upsert,
     Overwrite,
+}
+
+/// Work that must be staged only after a first-touch target ref exists. Lance
+/// writes uncommitted fragment/deletion files under the opened branch's tree;
+/// staging against the inherited source and later committing on the target
+/// would publish paths that do not exist in the target tree.
+enum DeferredStagePlan {
+    Pending {
+        mode: PendingMode,
+        batch: RecordBatch,
+    },
+    Delete {
+        predicate: String,
+    },
 }
 
 /// Per-table accumulator. Each insert/update op pushes a `RecordBatch` into
@@ -66,23 +89,42 @@ impl PendingTable {
     fn total_rows(&self) -> usize {
         self.batches.iter().map(|b| b.num_rows()).sum()
     }
+
+    fn total_bytes(&self) -> Result<u64> {
+        self.batches.iter().try_fold(0_u64, |bytes, batch| {
+            let batch_bytes = u64::try_from(batch.get_array_memory_size()).map_err(|_| {
+                OmniError::manifest_internal("pending keyed batch bytes exceed u64")
+            })?;
+            bytes
+                .checked_add(batch_bytes)
+                .ok_or_else(|| OmniError::manifest_internal("pending keyed byte count overflow"))
+        })
+    }
 }
 
 /// Stable per-table identifiers captured on first touch and reused at
 /// finalize time. Avoids re-resolving the dataset path / branch.
 #[derive(Debug, Clone)]
 pub(crate) struct StagedTablePath {
+    /// Immutable logical table lifetime captured with this path/version.
+    pub(crate) identity: crate::db::manifest::TableIdentity,
     pub(crate) full_path: String,
+    /// Final Lance ref recorded in the manifest update.
     pub(crate) table_branch: Option<String>,
+    /// First-touch named-branch fork deferred until the v9 recovery envelope
+    /// (whose retained mutation/load payload field is `protocol_v3`) is
+    /// durable. Preparation reads the inherited `source_entry`; after arming,
+    /// commit creates `target_branch` and stages branch-local files there.
+    pub(crate) deferred_fork: Option<crate::db::DeferredTableFork>,
 }
 
 /// Per-query staging state.
 ///
-/// Replaces the legacy inline-commit `MutationStaging.latest` map with
-/// an in-memory accumulator that defers all Lance HEAD advances to
-/// end-of-query. Inserts, updates AND deletes all stage here, so the bug
-/// class "Lance HEAD drifts ahead of `__manifest`" is unreachable in
-/// `mutate_as` and `load` by construction.
+/// Replaces the legacy per-statement inline-commit map with an in-memory
+/// accumulator that defers every Lance HEAD advance to the query commit
+/// boundary. Inserts, updates, and deletes share one effect set. Durable
+/// recovery intent owns the remaining effect-to-manifest-CAS gap; statement
+/// failures cannot create uncovered HEAD drift.
 #[derive(Default)]
 pub(crate) struct MutationStaging {
     /// Pre-write manifest version per table — the publisher's CAS fence at
@@ -124,16 +166,29 @@ impl MutationStaging {
     pub(crate) fn ensure_path(
         &mut self,
         table_key: &str,
+        identity: crate::db::manifest::TableIdentity,
         full_path: String,
         table_branch: Option<String>,
+        deferred_fork: Option<crate::db::DeferredTableFork>,
         expected_version: u64,
         op_kind: MutationOpKind,
-    ) {
+    ) -> Result<()> {
+        if let Some(existing) = self.paths.get(table_key) {
+            if existing.identity != identity {
+                return Err(OmniError::manifest_read_set_changed(
+                    format!("table_identity:{table_key}"),
+                    Some(existing.identity.to_string()),
+                    Some(identity.to_string()),
+                ));
+            }
+        }
         self.paths
             .entry(table_key.to_string())
             .or_insert(StagedTablePath {
+                identity,
                 full_path,
                 table_branch,
+                deferred_fork,
             });
         self.expected_versions
             .entry(table_key.to_string())
@@ -151,16 +206,16 @@ impl MutationStaging {
                 }
             })
             .or_insert(op_kind);
+        Ok(())
     }
 
     /// Append a batch to the per-table accumulator.
     ///
     /// `mode` is asserted-consistent with prior pushes for the same table:
-    /// `Append`+`Append` stays Append; any `Merge` upgrades the table to
-    /// Merge (e.g. an `update Person` after `insert Knows from='X' to='Y'`
-    /// when both produce content on `node:Person`). Once Merge is set,
-    /// subsequent appends roll into the merge stream — `WhenNotMatched =
-    /// InsertAll` correctly inserts append-shaped rows.
+    /// `StrictInsert`+`StrictInsert` stays strict; any `Upsert` upgrades the
+    /// table to upsert (e.g. an update after an insert in one mutation). The
+    /// generated ids used by mutation insert make that upgrade semantics-safe;
+    /// bulk load uses one mode for the complete operation.
     pub(crate) fn append_batch(
         &mut self,
         table_key: &str,
@@ -208,14 +263,48 @@ impl MutationStaging {
                 )));
             }
         }
+        if matches!(mode, PendingMode::StrictInsert | PendingMode::Upsert) {
+            let existing_rows = self
+                .pending
+                .get(table_key)
+                .map(PendingTable::total_rows)
+                .unwrap_or(0);
+            let rows = existing_rows
+                .checked_add(batch.num_rows())
+                .ok_or_else(|| OmniError::manifest_internal("pending keyed row count overflow"))?;
+            if rows > KEYED_WRITE_MAX_ROWS {
+                return Err(OmniError::resource_limit(
+                    format!("keyed rows for {table_key}"),
+                    KEYED_WRITE_MAX_ROWS as u64,
+                    rows as u64,
+                ));
+            }
+            let existing_bytes = match self.pending.get(table_key) {
+                Some(existing) => existing.total_bytes()?,
+                None => 0,
+            };
+            let batch_bytes = u64::try_from(batch.get_array_memory_size()).map_err(|_| {
+                OmniError::manifest_internal("pending keyed batch bytes exceed u64")
+            })?;
+            let bytes = existing_bytes
+                .checked_add(batch_bytes)
+                .ok_or_else(|| OmniError::manifest_internal("pending keyed byte count overflow"))?;
+            if bytes > KEYED_WRITE_MAX_BYTES {
+                return Err(OmniError::resource_limit(
+                    format!("keyed bytes for {table_key}"),
+                    KEYED_WRITE_MAX_BYTES,
+                    bytes,
+                ));
+            }
+        }
         let entry = self
             .pending
             .entry(table_key.to_string())
             .or_insert_with(|| PendingTable::new(schema.clone(), mode));
-        // Upgrade Append -> Merge if any op needs merge semantics. Overwrite
-        // is never mixed with additive modes (guarded above).
-        if mode == PendingMode::Merge && entry.mode == PendingMode::Append {
-            entry.mode = PendingMode::Merge;
+        // Upgrade StrictInsert -> Upsert if any op needs upsert semantics.
+        // Overwrite is never mixed with additive modes (guarded above).
+        if mode == PendingMode::Upsert && entry.mode == PendingMode::StrictInsert {
+            entry.mode = PendingMode::Upsert;
         }
         entry.batches.push(batch);
         Ok(())
@@ -303,6 +392,27 @@ impl MutationStaging {
         self.pending.get(table_key).map(|p| p.schema.clone())
     }
 
+    /// Arrow resources already retained before a later pending-aware update
+    /// scan allocates its matched full-row batch. Rows remain a per-table
+    /// keyed-write fence, while bytes include every pending table so one graph
+    /// mutation cannot multiply the 32 MiB retained-memory budget by touching
+    /// several tables.
+    pub(crate) fn pending_resource_usage(&self, table_key: &str) -> Result<(u64, u64)> {
+        let rows = u64::try_from(
+            self.pending
+                .get(table_key)
+                .map(PendingTable::total_rows)
+                .unwrap_or(0),
+        )
+        .map_err(|_| OmniError::manifest_internal("pending keyed row count exceeds u64"))?;
+        let bytes = self.pending.values().try_fold(0_u64, |total, pending| {
+            total
+                .checked_add(pending.total_bytes()?)
+                .ok_or_else(|| OmniError::manifest_internal("pending keyed byte count overflow"))
+        })?;
+        Ok((rows, bytes))
+    }
+
     /// `true` if neither pending writes nor delete predicates have any state —
     /// the query made no observable writes.
     pub(crate) fn is_empty(&self) -> bool {
@@ -351,10 +461,15 @@ impl MutationStaging {
             delete_predicates,
             // Validation-only; consumed before staging, nothing to commit here.
             deleted_ids: _,
-            op_kinds,
+            op_kinds: _,
         } = self;
 
-        let mut stage_inputs: Vec<(String, PendingTable, StagedTablePath, u64)> =
+        let expected_identities = paths
+            .iter()
+            .map(|(table_key, path)| (table_key.clone(), path.identity))
+            .collect();
+
+        let mut stage_inputs: Vec<(String, PreparedPendingTable, StagedTablePath, u64)> =
             Vec::with_capacity(pending.len());
         for (table_key, table) in pending {
             let path = paths.get(&table_key).cloned().ok_or_else(|| {
@@ -369,24 +484,83 @@ impl MutationStaging {
                     table_key
                 ))
             })?;
+            let table = prepare_pending_table(&table_key, table)?;
+            // Finish the per-table last-write-wins fold before looking at URI
+            // inputs. A superseded row is not part of the graph operation and
+            // must not trigger policy checks, source probes, or byte charges.
+            db.storage()
+                .validate_keyed_write_batch(&table_key, &table.batch)?;
             stage_inputs.push((table_key, table, path, expected));
         }
+
+        // External sources are a graph-operation input, not a per-table
+        // staging detail. Discover every surviving URI after folding, then
+        // authorize and probe the complete set before reading any payload or
+        // letting a participant future write an uncommitted Lance file.
+        let mut external_blob_uris = ExternalBlobUriCollector::default();
+        let mut copied_external_blob_uri_indices = Vec::new();
+        for (_, table, _, _) in &stage_inputs {
+            let added = external_blob_uris.include_batch(&table.batch)?;
+            if matches!(table.mode, PendingMode::StrictInsert | PendingMode::Upsert) {
+                copied_external_blob_uri_indices.extend(added);
+            }
+        }
+        let external_blob_preflight = db
+            .storage()
+            .preflight_external_blob_uris(external_blob_uris.as_slice())
+            .await?;
+        let copied_external_blob_uris = copied_external_blob_uri_indices
+            .iter()
+            .map(|index| external_blob_uris.as_slice()[*index].as_str())
+            .collect::<Vec<_>>();
+        let copied_external_blob_bytes =
+            external_blob_preflight.materialized_payload_bytes(&copied_external_blob_uris)?;
+        if copied_external_blob_bytes > KEYED_WRITE_MAX_BYTES {
+            return Err(OmniError::resource_limit(
+                "materialized external blob payload bytes",
+                KEYED_WRITE_MAX_BYTES,
+                copied_external_blob_bytes,
+            ));
+        }
+
+        // Only after the complete operation has passed policy, source, and
+        // aggregate-copy admission do we read payload bytes. Reuse remains
+        // batch-bounded so this vector cannot retain an operation-sized cache.
+        for (table_key, table, _, _) in &mut stage_inputs {
+            table.batch = match table.mode {
+                PendingMode::StrictInsert | PendingMode::Upsert => {
+                    db.storage()
+                        .prepare_keyed_write_batch_with_preflight(
+                            table_key,
+                            table.batch.clone(),
+                            &external_blob_preflight,
+                        )
+                        .await?
+                }
+                PendingMode::Overwrite => db
+                    .storage()
+                    .prepare_overwrite_blob_references_with_preflight(
+                        table_key,
+                        table.batch.clone(),
+                        &external_blob_preflight,
+                    )?,
+            };
+        }
         let concurrency = concurrency.min(stage_inputs.len()).max(1);
-        let mut staged_entries: Vec<StagedTableEntry> = futures::stream::iter(
-            stage_inputs.into_iter().map(
+        let mut staged_entries: Vec<StagedTableEntry> =
+            futures::stream::iter(stage_inputs.into_iter().map(
                 |(table_key, table, path, expected)| async move {
                     stage_pending_table(db, table_key, table, path, expected).await
                 },
-            ),
-        )
-        .buffered(concurrency)
-        .collect::<Vec<Result<Option<StagedTableEntry>>>>()
-        .await
-        .into_iter()
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .flatten()
-        .collect();
+            ))
+            .buffered(concurrency)
+            .collect::<Vec<Result<Option<StagedTableEntry>>>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect();
 
         // Second pass: stage deletes through the same staged path. D₂
         // guarantees a delete-touched table carries no pending write batches,
@@ -420,8 +594,7 @@ impl MutationStaging {
                     .collect::<Vec<_>>()
                     .join(" OR ")
             };
-            if let Some(entry) =
-                stage_delete_table(db, table_key, combined, path, expected).await?
+            if let Some(entry) = stage_delete_table(db, table_key, combined, path, expected).await?
             {
                 staged_entries.push(entry);
             }
@@ -430,75 +603,169 @@ impl MutationStaging {
         Ok(StagedMutation {
             staged: staged_entries,
             expected_versions,
-            op_kinds,
+            expected_identities,
         })
     }
+}
+
+struct PreparedPendingTable {
+    mode: PendingMode,
+    batch: RecordBatch,
+}
+
+/// Enforce raw accumulated keyed ceilings, then collapse one table to the
+/// single input its Lance writer consumes. Upsert's repeated ids are folded
+/// last-write-wins before external payload accounting or reads.
+fn prepare_pending_table(table_key: &str, table: PendingTable) -> Result<PreparedPendingTable> {
+    if table.batches.is_empty() {
+        return Err(OmniError::manifest_internal(format!(
+            "pending table '{table_key}' has no batches"
+        )));
+    }
+
+    if matches!(table.mode, PendingMode::StrictInsert | PendingMode::Upsert) {
+        let (rows, bytes) =
+            table
+                .batches
+                .iter()
+                .try_fold((0_u64, 0_u64), |(rows, bytes), batch| {
+                    let batch_rows = u64::try_from(batch.num_rows())
+                        .map_err(|_| OmniError::manifest_internal("keyed batch rows exceed u64"))?;
+                    let batch_bytes =
+                        u64::try_from(batch.get_array_memory_size()).map_err(|_| {
+                            OmniError::manifest_internal("keyed batch bytes exceed u64")
+                        })?;
+                    Ok::<_, OmniError>((
+                        rows.checked_add(batch_rows).ok_or_else(|| {
+                            OmniError::manifest_internal("keyed row count overflow")
+                        })?,
+                        bytes.checked_add(batch_bytes).ok_or_else(|| {
+                            OmniError::manifest_internal("keyed byte count overflow")
+                        })?,
+                    ))
+                })?;
+        if rows > KEYED_WRITE_MAX_ROWS as u64 {
+            return Err(OmniError::resource_limit(
+                format!("keyed rows for {table_key}"),
+                KEYED_WRITE_MAX_ROWS as u64,
+                rows,
+            ));
+        }
+        if bytes > KEYED_WRITE_MAX_BYTES {
+            return Err(OmniError::resource_limit(
+                format!("keyed bytes for {table_key}"),
+                KEYED_WRITE_MAX_BYTES,
+                bytes,
+            ));
+        }
+    }
+
+    let mode = table.mode;
+    let batch = match mode {
+        PendingMode::Upsert => dedupe_merge_batches_by_id(&table.schema, table.batches)?,
+        PendingMode::StrictInsert | PendingMode::Overwrite => {
+            if table.batches.len() == 1 {
+                table.batches.into_iter().next().unwrap()
+            } else {
+                arrow_select::concat::concat_batches(&table.schema, &table.batches)
+                    .map_err(|error| OmniError::Lance(error.to_string()))?
+            }
+        }
+    };
+    Ok(PreparedPendingTable { mode, batch })
 }
 
 async fn stage_pending_table(
     db: &crate::db::Omnigraph,
     table_key: String,
-    table: PendingTable,
+    table: PreparedPendingTable,
     path: StagedTablePath,
     expected: u64,
 ) -> Result<Option<StagedTableEntry>> {
-    // Reopen the dataset for staging. Append/Merge can be rebased later by
-    // Lance + publisher CAS; Overwrite is a strict replacement and uses the
-    // same SchemaRewrite policy as schema apply.
+    // Reopen the pinned dataset. Existing-table effects stage on this handle
+    // now. A deferred first-touch effect uses it only as the inherited source
+    // pin; its files stage on the target handle after sidecar + fork.
     let stage_kind = match table.mode {
-        PendingMode::Append => crate::db::MutationOpKind::Insert,
-        PendingMode::Merge => crate::db::MutationOpKind::Merge,
+        PendingMode::StrictInsert => crate::db::MutationOpKind::Insert,
+        PendingMode::Upsert => crate::db::MutationOpKind::Merge,
         PendingMode::Overwrite => crate::db::MutationOpKind::SchemaRewrite,
     };
-    let ds = db
-        .reopen_for_mutation(
-            &table_key,
-            &path.full_path,
-            path.table_branch.as_deref(),
-            expected,
-            stage_kind,
-        )
-        .await?;
-
-    if table.batches.is_empty() {
-        return Ok(None);
-    }
-
-    let combined = match table.mode {
-        PendingMode::Merge => dedupe_merge_batches_by_id(&table.schema, table.batches)?,
-        PendingMode::Append | PendingMode::Overwrite => {
-            if table.batches.len() == 1 {
-                table.batches.into_iter().next().unwrap()
-            } else {
-                arrow_select::concat::concat_batches(&table.schema, &table.batches)
-                    .map_err(|e| OmniError::Lance(e.to_string()))?
-            }
+    let ds = match path.deferred_fork.as_ref() {
+        Some(fork) => {
+            db.storage()
+                .open_snapshot_at_entry(&fork.source_entry)
+                .await?
+        }
+        None => {
+            db.reopen_for_mutation(
+                &table_key,
+                &path.full_path,
+                path.table_branch.as_deref(),
+                expected,
+                stage_kind,
+            )
+            .await?
         }
     };
+
+    let combined = table.batch;
+
+    if path.deferred_fork.is_some() {
+        // The recovery identity is minted before the fork; the actual Lance
+        // transaction is staged on the new target ref after the sidecar is
+        // durable, then bound to this UUID. Its read version remains Lance's
+        // independently-derived value and is checked by the binder.
+        let planned_transaction = pre_minted_transaction_identity(expected);
+        return Ok(Some(StagedTableEntry {
+            table_key,
+            path,
+            expected_version: expected,
+            dataset: ds,
+            pending_mode: Some(table.mode),
+            staged_write: None,
+            deferred_stage: Some(DeferredStagePlan::Pending {
+                mode: table.mode,
+                batch: combined,
+            }),
+            planned_transaction,
+        }));
+    }
 
     // Stage produces uncommitted fragments + transaction. No Lance HEAD
     // advance until `commit_all` runs `commit_staged`.
     let staged = match table.mode {
-        PendingMode::Append => db.storage().stage_append(&ds, combined, &[]).await?,
-        PendingMode::Merge => {
+        PendingMode::StrictInsert => {
             db.storage()
-                .stage_merge_insert(
+                .stage_keyed_write(
                     ds.clone(),
+                    &table_key,
                     combined,
-                    vec!["id".to_string()],
-                    lance::dataset::WhenMatched::UpdateAll,
-                    lance::dataset::WhenNotMatched::InsertAll,
+                    KeyedWriteSemantics::StrictInsert,
+                )
+                .await?
+        }
+        PendingMode::Upsert => {
+            db.storage()
+                .stage_keyed_write(
+                    ds.clone(),
+                    &table_key,
+                    combined,
+                    KeyedWriteSemantics::Upsert,
                 )
                 .await?
         }
         PendingMode::Overwrite => db.storage().stage_overwrite(&ds, combined).await?,
     };
+    let planned_transaction = staged.transaction_identity();
     Ok(Some(StagedTableEntry {
         table_key,
         path,
         expected_version: expected,
         dataset: ds,
-        staged_write: staged,
+        pending_mode: Some(table.mode),
+        staged_write: Some(staged),
+        deferred_stage: None,
+        planned_transaction,
     }))
 }
 
@@ -517,137 +784,261 @@ async fn stage_delete_table(
     path: StagedTablePath,
     expected: u64,
 ) -> Result<Option<StagedTableEntry>> {
-    let ds = db
-        .reopen_for_mutation(
-            &table_key,
-            &path.full_path,
-            path.table_branch.as_deref(),
-            expected,
-            crate::db::MutationOpKind::Delete,
-        )
-        .await?;
+    let ds = match path.deferred_fork.as_ref() {
+        Some(fork) => {
+            db.storage()
+                .open_snapshot_at_entry(&fork.source_entry)
+                .await?
+        }
+        None => {
+            db.reopen_for_mutation(
+                &table_key,
+                &path.full_path,
+                path.table_branch.as_deref(),
+                expected,
+                crate::db::MutationOpKind::Delete,
+            )
+            .await?
+        }
+    };
+    if path.deferred_fork.is_some() {
+        // Probe only. The actual deletion vector must be written under the
+        // target branch tree after the durable fork intent creates that ref.
+        if db
+            .storage()
+            .first_row_id_for_filter(&ds, &predicate)
+            .await?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        return Ok(Some(StagedTableEntry {
+            table_key,
+            path,
+            expected_version: expected,
+            dataset: ds,
+            pending_mode: None,
+            staged_write: None,
+            deferred_stage: Some(DeferredStagePlan::Delete { predicate }),
+            planned_transaction: pre_minted_transaction_identity(expected),
+        }));
+    }
     match db.storage().stage_delete(&ds, &predicate).await? {
         Some(staged) => Ok(Some(StagedTableEntry {
             table_key,
             path,
             expected_version: expected,
             dataset: ds,
-            staged_write: staged,
+            pending_mode: None,
+            planned_transaction: staged.transaction_identity(),
+            staged_write: Some(staged),
+            deferred_stage: None,
         })),
         None => Ok(None),
     }
 }
 
-/// Output of [`MutationStaging::stage_all`]. Carries the staged Lance
-/// transactions (Phase A complete; uncommitted fragments written) plus
-/// the per-table metadata needed to write the recovery sidecar, run
-/// `commit_staged` (Phase B), and produce the publisher's input.
+/// Output of [`MutationStaging::stage_all`]. Carries ready Lance transactions
+/// for existing refs and complete deferred stage plans for first-touch named
+/// refs, plus the metadata needed to arm recovery, apply Stage-F effects, and
+/// produce the publisher's input.
 ///
-/// Splitting `stage_all` and `commit_all` is the structural prerequisite
-/// for MR-686: a future commit can drop queue acquisition + manifest-pin
-/// revalidation between Phase A and Phase B without touching staging
-/// logic.
+/// Splitting `stage_all` and `commit_all` keeps reclaimable preparation outside
+/// writer gates while the latter owns ordered acquisition, revalidation,
+/// recovery arming, and effects.
 pub(crate) struct StagedMutation {
     /// One entry per table that had pending write batches or delete
-    /// predicates successfully staged (Phase A complete, no HEAD advance).
+    /// predicates prepared (and, for an existing ref, successfully staged).
     /// Deletes flow through this same vector as inserts/updates/overwrites —
     /// there is no separate inline-commit path.
     staged: Vec<StagedTableEntry>,
     /// Pre-write manifest version per table — the publisher's CAS fence.
     expected_versions: HashMap<String, u64>,
-    /// Strictest op_kind per touched table, propagated from
-    /// `MutationStaging::op_kinds` so `commit_all`'s drift check
-    /// fires only on read-modify-write tables.
-    op_kinds: HashMap<String, MutationOpKind>,
+    /// Identity paired with every alias in `expected_versions`, including a
+    /// zero-row delete that produced no physical staged effect.
+    expected_identities: HashMap<String, crate::db::manifest::TableIdentity>,
 }
 
 /// Per-table state captured during `stage_all` and consumed by
-/// `commit_all`. Holds the opened snapshot (so `commit_staged` doesn't
-/// re-open) plus the staged Lance transaction that `commit_staged`
-/// will execute. Both held as opaque `TableStorage` handles per MR-793
-/// §III.9 — the inner `lance::Dataset` / `StagedWrite` are not visible
-/// to engine code outside the storage layer.
+/// `commit_all`. Holds the opened snapshot plus either a staged Lance
+/// transaction or a deferred first-touch plan. Storage handles remain opaque
+/// per MR-793 §III.9 — the inner `lance::Dataset` / `StagedWrite` are not
+/// visible to engine code outside the storage layer.
 struct StagedTableEntry {
     table_key: String,
     path: StagedTablePath,
     expected_version: u64,
     dataset: SnapshotHandle,
-    staged_write: StagedHandle,
+    /// Present for constructive writes so a proven effect-free commit conflict
+    /// can retain strict-vs-upsert semantics. Deletes/overwrites do not use the
+    /// RFC-023 conflict normalization.
+    pending_mode: Option<PendingMode>,
+    staged_write: Option<StagedHandle>,
+    deferred_stage: Option<DeferredStagePlan>,
+    planned_transaction: crate::table_store::StagedTransactionIdentity,
 }
 
-/// Output of [`StagedMutation::commit_all`] (Phase B): the publisher's input plus
-/// the queue guards the caller must hold across the manifest publish.
+fn pre_minted_transaction_identity(
+    read_version: u64,
+) -> crate::table_store::StagedTransactionIdentity {
+    crate::table_store::StagedTransactionIdentity {
+        read_version,
+        // Lance treats the UUID as an opaque transaction identity/path
+        // component. A ULID is equally unique and filesystem-safe while
+        // avoiding a second UUID generator in the engine surface.
+        uuid: format!("omnigraph-{}", ulid::Ulid::new()),
+    }
+}
+
+async fn stage_deferred_plan(
+    db: &crate::db::Omnigraph,
+    table_key: &str,
+    target: SnapshotHandle,
+    plan: DeferredStagePlan,
+    planned: &crate::table_store::StagedTransactionIdentity,
+) -> Result<StagedHandle> {
+    let mut staged = match plan {
+        DeferredStagePlan::Pending { mode, batch } => match mode {
+            PendingMode::StrictInsert => {
+                db.storage()
+                    .stage_keyed_write(
+                        target.clone(),
+                        table_key,
+                        batch,
+                        KeyedWriteSemantics::StrictInsert,
+                    )
+                    .await?
+            }
+            PendingMode::Upsert => {
+                db.storage()
+                    .stage_keyed_write(
+                        target.clone(),
+                        table_key,
+                        batch,
+                        KeyedWriteSemantics::Upsert,
+                    )
+                    .await?
+            }
+            PendingMode::Overwrite => db.storage().stage_overwrite(&target, batch).await?,
+        },
+        DeferredStagePlan::Delete { predicate } => db
+            .storage()
+            .stage_delete(&target, &predicate)
+            .await?
+            .ok_or_else(|| {
+                OmniError::manifest_read_set_changed(
+                    "deferred_delete_match",
+                    Some("matching row at inherited pin".to_string()),
+                    Some("no matching row on exact target fork".to_string()),
+                )
+            })?,
+    };
+    staged.bind_transaction_identity(planned)?;
+    Ok(staged)
+}
+
+/// Re-probe a strict batch against fresh *manifest-pinned* authority after its
+/// Armed intent was proven effect-free and retired. Lance's retryable conflict
+/// class is broader than a key collision (Bloom false positives and unrelated
+/// incompatible transaction shapes share it), so only an actually visible id
+/// may be normalized to `KeyConflict`.
+async fn fresh_conflicting_strict_id(
+    db: &crate::db::Omnigraph,
+    branch: Option<&str>,
+    identity: crate::db::manifest::TableIdentity,
+    table_key: &str,
+    source_ids: &[String],
+) -> Result<Option<String>> {
+    let branch = branch.filter(|name| *name != "main");
+    let snapshot = db.fresh_snapshot_for_branch(branch).await?;
+    let Some(entry) = snapshot.entry(table_key) else {
+        return Ok(None);
+    };
+    if entry.identity != identity {
+        return Ok(None);
+    }
+    let table = db.storage().open_snapshot_at_entry(entry).await?;
+    db.storage().first_existing_id(&table, source_ids).await
+}
+
+/// Output of [`StagedMutation::commit_all`] after Stage F: the publisher's input
+/// plus the queue guards the caller must hold through Stage G manifest publish.
 pub(crate) struct CommittedMutation {
     /// Per-table updates to publish to the manifest.
     pub(crate) updates: Vec<SubTableUpdate>,
-    /// Per-table manifest pins refreshed under the write queue — the publisher's CAS fence.
-    pub(crate) expected_versions: HashMap<String, u64>,
-    /// Recovery sidecar to delete after Phase C succeeds (`None` when nothing staged).
+    /// Per-table physical pins captured in the immutable `WriteTxn`; the
+    /// publisher checks them together with native branch identity, exact graph
+    /// head, and schema identity as one authority precondition.
+    pub(crate) expected_versions: crate::db::manifest::ExpectedTableVersions,
+    /// Recovery sidecar to delete during Stage H after manifest CAS succeeds
+    /// (`None` when nothing staged).
     pub(crate) sidecar_handle: Option<RecoverySidecarHandle>,
-    /// Per-`(table, branch)` write-queue guards — the caller MUST hold these across
-    /// the manifest publish (see `commit_all`) so no writer interleaves between
-    /// `commit_staged` and the publish.
+    /// Root schema, coarse branch, and sorted `(table, branch)` guards. The
+    /// caller MUST hold the complete set across manifest publish (see
+    /// `commit_all`) so no same-process writer interleaves after revalidation.
     pub(crate) guards: Vec<tokio::sync::OwnedMutexGuard<()>>,
-    /// Post-`commit_staged` handle per STAGED table (table_key → handle at the
-    /// just-committed version). Carried out (RFC-013 step 3b, collapse #4) so the
-    /// publish-prepare index build reuses it instead of a fresh `reopen_for_mutation`
-    /// at the same version. Deletes are staged too, so their committed handle is
-    /// present here like any other write.
-    pub(crate) committed_handles: HashMap<String, SnapshotHandle>,
 }
 
 impl StagedMutation {
-    /// **Phase B** of the two-phase commit: acquire per-`(table_key,
-    /// branch)` queues, revalidate manifest pins, write the recovery
-    /// sidecar, run `commit_staged` per table to advance Lance HEAD, and
-    /// return the publisher's input plus the queue guards.
+    /// RFC-022 Stages C–F: acquire ordered schema/branch/table gates, revalidate
+    /// the complete read set, arm the recovery sidecar, run `commit_staged` per
+    /// table to advance Lance HEAD, and return the publisher input plus guards.
     ///
     /// **Caller must hold the returned `_guards` Vec across the
     /// subsequent manifest publish.** Releasing guards before publish
-    /// would let another writer interleave their commit_staged between
-    /// ours and our publish — which would correctly fail our CAS but
-    /// leave Lance HEAD advanced (the residual class MR-870 recovers
-    /// from). Holding the guards across publish keeps the residual
-    /// unreachable for op-execution failures on the happy path.
+    /// would let another writer interleave its physical effects between ours
+    /// and publish. The exact publisher precondition would still reject stale
+    /// authority, but our already-advanced Lance HEAD would then require the
+    /// durable v9 sidecar to recover. Holding the guards closes that avoidable
+    /// same-process window; the sidecar remains the crash/foreign-process
+    /// correctness authority.
     ///
-    /// Revalidation: between `stage_all` and `commit_all`, another
-    /// writer (in the same process or another process sharing the
-    /// graph) may have committed to one of our touched tables, advancing
-    /// the manifest pin past our `expected_version`. We revalidate
-    /// under the queue and fail-fast with `manifest_conflict` before
-    /// any `commit_staged` so the orphaned uncommitted fragments stay
-    /// unreferenced (cleaned by `cleanup_old_versions`'s age sweep)
-    /// rather than being committed and creating a Lance-HEAD-ahead
-    /// residual.
-    /// `held_guards`: when the caller already holds the per-`(table_key,
-    /// branch)` write queues for every touched table (the fork path acquires
-    /// them up front, before the fork, and holds them through the manifest
-    /// publish), it passes `(acquired_keys, guards)` here so `commit_all`
-    /// reuses them instead of re-acquiring — the queue is a non-re-entrant
-    /// `tokio::Mutex`, so re-acquiring a held key would self-deadlock.
-    /// `None` (the steady-state path) means `commit_all` acquires them
-    /// itself. `acquired_keys` must cover every key `commit_all` would
-    /// acquire (debug-asserted below) — the guards from `acquire_many` don't
-    /// carry their keys, so the caller hands the key set alongside them. The
-    /// fork path guarantees coverage by keying every touched table uniformly
-    /// by the resolved target branch.
+    /// Revalidation: between `stage_all` and `commit_all`, another writer may
+    /// change any member of the attempt's branch-wide read authority, including
+    /// a table this attempt does not write. Under the ordered gates we first
+    /// reject any newly armed overlapping sidecar, then compare the complete
+    /// immutable token. A safe insert/Append/Merge caller discards and fully
+    /// reprepares; strict Update/Delete/Overwrite returns `ReadSetChanged`.
+    /// Both outcomes occur before `commit_staged`, so staged transaction files
+    /// remain unreferenced and reclaimable.
+    /// First-touch named-branch forks are also deferred to this phase. The
+    /// method acquires schema → branch → table gates, revalidates the complete
+    /// read token, arms the v9 recovery envelope, and only then creates any Lance refs.
     pub(crate) async fn commit_all(
         self,
         db: &crate::db::Omnigraph,
         branch: Option<&str>,
         sidecar_kind: SidecarKind,
         actor_id: Option<&str>,
-        held_guards: Option<(
-            Vec<(String, Option<String>)>,
-            Vec<tokio::sync::OwnedMutexGuard<()>>,
-        )>,
-        txn: Option<&crate::db::WriteTxn>,
+        txn: &crate::db::WriteTxn,
+        lineage_intent: &crate::db::manifest::LineageIntent,
     ) -> Result<CommittedMutation> {
         let StagedMutation {
             mut staged,
-            mut expected_versions,
-            op_kinds,
+            expected_versions,
+            expected_identities,
         } = self;
+
+        let expected_versions = expected_versions
+            .into_iter()
+            .map(|(table_key, table_version)| {
+                let identity = expected_identities
+                    .get(&table_key)
+                    .copied()
+                    .ok_or_else(|| {
+                        OmniError::manifest_internal(format!(
+                            "staged mutation is missing identity for table '{table_key}'"
+                        ))
+                    })?;
+                Ok((
+                    identity,
+                    crate::db::manifest::TableVersionExpectation {
+                        table_key,
+                        table_version,
+                    },
+                ))
+            })
+            .collect::<Result<crate::db::manifest::ExpectedTableVersions>>()?;
 
         // Per-(table_key, branch) queues for every touched table. Sorted by
         // `acquire_many` internally so all multi-table writers (mutation,
@@ -656,86 +1047,67 @@ impl StagedMutation {
         // are staged like every other write, so holding the queue from before
         // `commit_staged` through the publish keeps no Lance HEAD ahead of the
         // manifest on the happy path.
-        let mut queue_keys: Vec<(String, Option<String>)> =
-            Vec::with_capacity(staged.len());
+        let mut queue_keys: Vec<(String, Option<String>)> = Vec::with_capacity(staged.len());
         for entry in &staged {
             queue_keys.push((entry.table_key.clone(), entry.path.table_branch.clone()));
         }
-        // Reuse the caller's guards (fork path) when handed in, else acquire
-        // our own. When reusing, every key we would acquire MUST already be
-        // covered — re-acquiring a held non-re-entrant key would deadlock, and
-        // a key we'd need but DON'T hold would commit unserialized. This is a
-        // load-bearing safety invariant, so it is checked in ALL builds (not a
-        // debug_assert) and fails the write loudly+safely rather than silently
-        // proceeding unguarded if a future execution path ever touches a table
-        // outside the caller's pre-computed set.
-        let guards = match held_guards {
-            Some((acquired_keys, guards)) => {
-                let held: std::collections::HashSet<&(String, Option<String>)> =
-                    acquired_keys.iter().collect();
-                if let Some(missing) = queue_keys.iter().find(|k| !held.contains(k)) {
-                    return Err(OmniError::manifest_internal(format!(
-                        "commit_all: pre-held write-queue guards do not cover touched table \
-                         '{}' on branch {:?} — the caller's up-front acquisition set diverged \
-                         from the staged/inline set (a touched-table-set bug)",
-                        missing.0, missing.1
-                    )));
-                }
-                guards
-            }
-            None => db.write_queue().acquire_many(&queue_keys).await,
-        };
+        // Total order shared with schema apply: schema gate, branch gate, then
+        // sorted per-table gates. Hold the full set through manifest publish.
+        let schema_guard = db
+            .write_queue()
+            .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
+            .await;
+        let branch_guard = db.write_queue().acquire_branch(branch).await;
+        let mut guards = vec![schema_guard, branch_guard];
+        guards.extend(db.write_queue().acquire_many(&queue_keys).await);
+
+        // Stage A ran the roll-forward-only healer before preparation, while
+        // reclaimable transaction files were staged outside these gates. A
+        // different writer can therefore arm a recovery intent in that gap.
+        // Re-list after acquiring schema -> branch -> table gates and reject
+        // that intent before revalidation or any new sidecar/ref/table effect.
+        // Do NOT invoke the healer here: recovery acquires this same ordered
+        // gate set and would deadlock/re-enter the write protocol.
+        //
+        // OCC is branch-wide, so every unresolved sidecar for this normalized
+        // graph branch is relevant even when it names a disjoint table. Schema
+        // apply changes the catalog contract and conservatively blocks every
+        // enrolled data branch. `list_sidecars` is URI-sorted; choosing the
+        // first relevant operation makes conflict attribution deterministic.
+        let enrolled_branch = branch.filter(|name| *name != "main");
+        let pending_sidecars =
+            crate::db::manifest::list_sidecars(db.root_uri(), db.storage_adapter()).await?;
+        if let Some(owner) = pending_sidecars.iter().find(|sidecar| {
+            let sidecar_branch = sidecar.branch.as_deref().filter(|name| *name != "main");
+            sidecar.writer_kind == SidecarKind::SchemaApply || sidecar_branch == enrolled_branch
+        }) {
+            return Err(OmniError::recovery_required(
+                owner.operation_id.clone(),
+                format!(
+                    "pending {:?} recovery operation blocks writes on branch '{}'",
+                    owner.writer_kind,
+                    enrolled_branch.unwrap_or("main"),
+                ),
+            ));
+        }
 
         // Re-capture manifest pins under the queue (PR 2 / MR-686).
         //
         // expected_versions was captured when the mutation first opened
         // each table for mutation (the query's read-time pin). For
-        // non-strict inserts / merge-style appends, a writer may advance
-        // the table before we acquire the queue and Lance can still
-        // safely rebase the write, so we refresh expected_versions to
-        // the queued manifest pin.
+        // Any writer may advance the branch while we stage reclaimable files
+        // outside the gate. RFC-022 does not patch those prepared table pins or
+        // transparently rebase a validated transaction: every mismatch rejects
+        // the complete attempt before effects. Mutation inserts and load
+        // append/merge may then reprepare at their outer bounded retry loop;
+        // strict read-modify-write operations return the typed conflict.
         //
-        // Strict read-modify-write ops (update / delete /
-        // schema-rewrite) are different: the staged batch was computed
-        // against the read-time pin, even if stage_all later re-opened
-        // the dataset at HEAD. For those ops, compare read-time
-        // expected_version to the queued manifest pin and fail before
-        // any Lance HEAD movement if the target drifted. This can
-        // over-reject a single mutation that inserts, then upgrades to
-        // update, while another writer advances the table between the
-        // two touches; that is safe-by-default and keeps one invariant
-        // until `ensure_path` learns how to bump expected_version on
-        // op-kind upgrade.
-        //
-        // Why a fresh per-branch snapshot (and not the bound-branch
-        // `db.snapshot()` / `snapshot_for_branch()` fast path): a stale
-        // engine handle may be bound to the same branch it is writing. For
-        // non-strict Insert/Merge, that stale local view is allowed to rebase
-        // to the live manifest pin under the queue; only uncovered Lance
-        // HEAD>manifest drift is refused. For writes targeting a branch other
-        // than the engine's bound branch (e.g., feature-branch ingest from a
-        // server handle bound to main), the same helper also resolves the
-        // correct branch pin. The cost is one fresh manifest read per mutation
-        // plus one Lance HEAD open per staged table for the drift guard below.
-        //
-        // Multi-coordinator deployments (§VI.27 aspirational) get
-        // genuine cross-process drift detection from this read for
-        // free.
-        //
-        // This MUST be as fresh as a FRESH per-branch manifest read for the OCC
-        // re-capture below. With a `WriteTxn` the schema contract was already
-        // validated at capture, so the txn arm uses `occ_snapshot_for_branch`
-        // (RFC-013 PR2 #1a): a cheap incarnation probe reuses the warm
-        // coordinator when it is already current (probe-match ⟺ warm == fresh)
-        // and falls through to the cold `_unchecked` read on any mismatch — so
-        // freshness AND cross-process drift detection are preserved while the
-        // common same-branch sequential write skips the O(fragments) scan.
-        // Without a txn, keep the checked cold read (legacy path).
-        let snapshot = match txn {
-            Some(_) => db.occ_snapshot_for_branch(branch).await?,
-            None => db.fresh_snapshot_for_branch(branch).await?,
-        };
-        for entry in staged.iter_mut() {
+        // Revalidate the complete coarse authority under the branch/table
+        // gates. The helper probe-reuses a current warm coordinator and opens
+        // the target branch fresh on any mismatch, returning the snapshot from
+        // that same authority view. No prepared table pin is patched forward.
+        let snapshot = db.revalidate_write_txn(txn).await?;
+        for entry in &staged {
             let current = snapshot
                 .entry(&entry.table_key)
                 .map(|e| e.table_version)
@@ -746,102 +1118,62 @@ impl StagedMutation {
                     ))
                 })?;
 
-            // Insert / Merge tables skip this check: concurrent inserts on
-            // disjoint keys legitimately coexist via Lance's auto-rebase, so
-            // the check would over-reject the existing Phase 2 same-key
-            // insert path (`change_concurrent_inserts_same_key_serialize_without_409`).
-            let strict = op_kinds
-                .get(&entry.table_key)
-                .map(|k| k.strict_pre_stage_version_check())
-                .unwrap_or(false);
-            if strict && entry.expected_version != current {
-                return Err(OmniError::manifest_expected_version_mismatch(
-                    entry.table_key.clone(),
-                    entry.expected_version,
-                    current,
+            // RFC-022-enrolled mutation/load attempts never patch a prepared
+            // table expectation to a newer manifest pin. The complete branch
+            // token was just revalidated; any remaining table mismatch is a
+            // stale/internally-inconsistent read set and must restart the
+            // whole validation attempt before effects.
+            if entry.expected_version != current {
+                return Err(OmniError::manifest_read_set_changed(
+                    format!("table_head:{}", entry.table_key),
+                    Some(entry.expected_version.to_string()),
+                    Some(current.to_string()),
                 ));
             }
 
-            // Separate manifest-visible concurrency from uncovered Lance drift.
-            // Non-strict inserts/merges are allowed to rebase from their staged
-            // read version to the fresh manifest pin above, but only if the
-            // live Lance HEAD still equals that manifest pin. If an external
-            // raw Lance write or a pre-fix maintenance path moved HEAD without
-            // publishing `__manifest`, this write must not silently fold it.
-            //
-            // `latest_version_id` reads the latest manifest pointer off the
-            // already-open staged handle (the #2 staging open) WITHOUT a fresh
-            // `Dataset::open` — the same cheap live-HEAD probe
-            // `ManifestCoordinator::probe_latest_version` uses. This replaces a
-            // redundant `open_dataset_head` (RFC-013 step 3b, collapse
-            // #3): the drift comparison below is byte-identical; only how `head`
-            // is obtained changes (probe vs cold open).
-            let head = entry
-                .dataset
-                .dataset()
-                .latest_version_id()
-                .await
-                .map_err(|e| OmniError::Lance(e.to_string()))?;
-            if head < current {
-                return Err(OmniError::manifest_internal(format!(
-                    "table '{}' Lance HEAD version {} is behind manifest version {}",
-                    entry.table_key, head, current
-                )));
-            }
-            if head > current {
-                // Error path only: tell the operator which drift class
-                // this is. Uncovered drift (external raw Lance write,
-                // pre-fix maintenance) goes through `omnigraph repair`.
-                // Sidecar-covered drift reaching this guard means the
-                // write-entry heal deferred it (rollback-eligible), and
-                // `repair` refuses while a sidecar is pending — the
-                // recovery path is a read-write reopen. A list failure
-                // must not mask the conflict — and must not pick a
-                // class confidently either: "could not classify" names
-                // both paths and the cause, never routing the operator
-                // to a command that will refuse.
-                let action = match crate::db::manifest::list_sidecars(
-                    db.root_uri(),
-                    db.storage_adapter(),
-                )
-                .await
-                {
-                    Ok(sidecars) => {
-                        let covered = sidecars.iter().any(|sidecar| {
-                            sidecar.tables.iter().any(|pin| {
-                                // Branch-aware: a sidecar pinning the
-                                // same table on ANOTHER branch does not
-                                // cover this branch's drift — a reopen
-                                // would recover that sidecar but leave
-                                // this drift for `repair`.
-                                pin.table_key == entry.table_key
-                                    && pin.table_branch == entry.path.table_branch
-                            })
-                        });
-                        if covered {
-                            "a pending recovery sidecar requires rollback — reopen the \
-                             graph read-write (e.g. restart the server) to recover"
-                                .to_string()
-                        } else {
-                            "run `omnigraph repair` before writing".to_string()
-                        }
-                    }
-                    Err(list_err) => format!(
-                        "could not classify the drift (sidecar listing failed: {}); \
-                         run `omnigraph repair`, or reopen the graph read-write if \
-                         repair reports a pending recovery sidecar",
-                        list_err
-                    ),
-                };
-                return Err(OmniError::manifest_conflict(format!(
-                    "table '{}' has Lance HEAD version {} ahead of manifest version {}; {}",
-                    entry.table_key, head, current, action
-                )));
+            // A deferred fork is intentionally staged from the exact inherited
+            // source entry. The source ref (often main) may advance after the
+            // graph branch was cut; that is unrelated to this branch's pinned
+            // snapshot. The target ref does not exist yet, so there is no live
+            // target HEAD to compare until after the recovery intent is armed.
+            if entry.path.deferred_fork.is_some() {
+                if entry.dataset.version() != current {
+                    return Err(OmniError::manifest_read_set_changed(
+                        format!("table_head:{}", entry.table_key),
+                        Some(current.to_string()),
+                        Some(entry.dataset.version().to_string()),
+                    ));
+                }
+                continue;
             }
 
-            entry.expected_version = current;
-            expected_versions.insert(entry.table_key.clone(), current);
+            // Separate manifest-visible concurrency from uncovered Lance drift.
+            // The shared pre-arm check probes this already-open staged handle,
+            // attributes covered drift to its exact recovery operation, and
+            // routes uncovered drift through explicit operator repair. Keeping
+            // the rule here and in control/maintenance adapters behind one
+            // helper prevents a future writer from weakening ownership by
+            // emitting its sidecar before checking the physical baseline.
+            db.ensure_existing_effect_baseline(
+                &entry.table_key,
+                entry.path.table_branch.as_deref(),
+                current,
+                &entry.dataset,
+            )
+            .await?;
         }
+        // An empty load/mutation has no independently durable table effect.
+        // It may still publish its fixed lineage intent, but arming recovery
+        // would manufacture an effect plan where none exists.
+        if staged.is_empty() {
+            return Ok(CommittedMutation {
+                updates: Vec::new(),
+                expected_versions,
+                sidecar_handle: None,
+                guards,
+            });
+        }
+
         // Sidecar protocol: build the per-table pin list and write the
         // sidecar BEFORE any `commit_staged` advances Lance HEAD, so any
         // commit→publish residual is recoverable on the next open. Deletes
@@ -849,38 +1181,171 @@ impl StagedMutation {
         // `staged` entry here — one pin at `expected + 1` (a single staged
         // commit advances exactly one version), no inline special-casing.
         let mut pins: Vec<SidecarTablePin> = Vec::with_capacity(staged.len());
+        let mut planned_transactions = HashMap::with_capacity(staged.len());
         for entry in &staged {
+            planned_transactions.insert(entry.path.identity, entry.planned_transaction.clone());
             pins.push(SidecarTablePin {
+                identity: entry.path.identity,
                 table_key: entry.table_key.clone(),
                 table_path: entry.path.full_path.clone(),
                 expected_version: entry.expected_version,
                 post_commit_pin: entry.expected_version + 1,
-                // Mutation/Load use strict single-commit classification, not
-                // BranchMerge's Phase-B confirmation — left None.
                 confirmed_version: None,
                 table_branch: entry.path.table_branch.clone(),
             });
         }
 
-        let sidecar_handle = if pins.is_empty() {
-            None
-        } else {
-            let sidecar = new_sidecar(
-                sidecar_kind,
-                branch.map(|s| s.to_string()),
-                actor_id.map(str::to_string),
-                pins,
-            );
-            Some(write_sidecar(db.root_uri(), db.storage_adapter(), &sidecar).await?)
+        let authority = RecoveryAuthorityToken {
+            branch_identifier: txn.authority.branch_identifier.clone(),
+            graph_head: txn.authority.graph_head.clone(),
+            schema_identity_domain: txn.authority.schema_identity_domain.clone(),
+            schema_ir_hash: txn.authority.schema_ir_hash.clone(),
+            schema_identity_version: txn.authority.schema_identity_version,
         };
+        let recovery_lineage = RecoveryLineageIntent {
+            graph_commit_id: lineage_intent.graph_commit_id.clone(),
+            branch: lineage_intent.branch.clone(),
+            actor_id: lineage_intent.actor_id.clone(),
+            merged_parent_commit_id: lineage_intent.merged_parent_commit_id.clone(),
+            created_at: lineage_intent.created_at,
+        };
+        let mut sidecar = new_occ_sidecar_v9(
+            sidecar_kind,
+            branch.map(str::to_string),
+            actor_id.map(str::to_string),
+            pins,
+            authority,
+            recovery_lineage,
+            planned_transactions,
+        )?;
+        // Deterministic pre-effect race point: authority has been validated and
+        // the intent is fully prepared in memory, but neither the durable
+        // sidecar nor a target fork exists yet. A concurrent winner may publish;
+        // this attempt then discards/reprepares on the collision below.
+        crate::failpoints::maybe_fail(crate::failpoints::names::FORK_BEFORE_CLASSIFY)?;
+        let sidecar_handle =
+            Some(write_sidecar(db.root_uri(), db.storage_adapter(), &sidecar).await?);
+        let operation_id = sidecar.operation_id.clone();
+        if staged
+            .iter()
+            .any(|entry| entry.path.deferred_fork.is_some())
+        {
+            crate::failpoints::maybe_fail(crate::failpoints::names::MUTATION_POST_SIDECAR_PRE_FORK)
+                .map_err(|error| {
+                    OmniError::recovery_required(operation_id.clone(), error.to_string())
+                })?;
+        }
+
+        // The v9 intent (with the retained `protocol_v3` payload shape) is now
+        // durable. Only now may a first-touch named-table
+        // fork become visible in Lance. Its transaction is then staged on the
+        // fresh target handle (so Lance writes branch-local file paths) and
+        // bound to the pre-minted UUID already recorded in the sidecar.
+        let mut created_any_fork = false;
+        for entry in &mut staged {
+            let Some(fork) = entry.path.deferred_fork.clone() else {
+                continue;
+            };
+            match db
+                .fork_dataset_from_entry_state_under_intent(
+                    &entry.table_key,
+                    fork.source_entry.identity,
+                    &entry.path.full_path,
+                    fork.source_entry.table_branch.as_deref(),
+                    fork.source_entry.table_version,
+                    &fork.target_branch,
+                    Some(&operation_id),
+                )
+                .await
+            {
+                Ok(target) => {
+                    entry.dataset = target;
+                    created_any_fork = true;
+                    let plan = entry.deferred_stage.take().ok_or_else(|| {
+                        OmniError::manifest_internal(format!(
+                            "deferred fork for '{}' has no deferred stage plan",
+                            entry.table_key
+                        ))
+                    })?;
+                    let staged_write = match stage_deferred_plan(
+                        db,
+                        &entry.table_key,
+                        entry.dataset.clone(),
+                        plan,
+                        &entry.planned_transaction,
+                    )
+                    .await
+                    {
+                        Ok(staged_write) => staged_write,
+                        Err(error) => {
+                            // Strict preflight can discover an inherited match
+                            // only after the first-touch target ref exists. The
+                            // sidecar is already Armed, so return KeyConflict
+                            // only after exact classification removes the
+                            // untouched fork and retires the empty intent.
+                            if matches!(&error, OmniError::KeyConflict { .. }) {
+                                match crate::db::manifest::finalize_effect_free_occ_sidecar(
+                                    db.root_uri(),
+                                    db.storage_adapter(),
+                                    &snapshot,
+                                    &sidecar,
+                                )
+                                .await
+                                {
+                                    Ok(true) => return Err(error),
+                                    Ok(false) => {}
+                                    Err(finalize_error) => {
+                                        return Err(OmniError::recovery_required(
+                                            operation_id,
+                                            format!(
+                                                "staging on deferred table fork '{}' failed and \
+                                                 the effect-free intent could not be finalized: \
+                                                 {error}; finalization: {finalize_error}",
+                                                entry.table_key
+                                            ),
+                                        ));
+                                    }
+                                }
+                            }
+                            return Err(OmniError::recovery_required(
+                                operation_id,
+                                format!(
+                                    "staging on deferred table fork '{}' failed after recovery \
+                                     intent was armed: {error}",
+                                    entry.table_key
+                                ),
+                            ));
+                        }
+                    };
+                    entry.staged_write = Some(staged_write);
+                }
+                Err(error) => {
+                    // Once the intent is durable, a fork error is not proof that
+                    // no physical effect occurred. Lance may have created the ref
+                    // successfully and then failed while reopening/verifying it;
+                    // reclaim-and-refork can likewise fail after deleting or
+                    // recreating a ref. Keep the sidecar for exact Full recovery
+                    // even when this is the first table. A future typed storage
+                    // outcome may recover the pre-effect retry optimization only
+                    // when it can *prove* the ref was never changed.
+                    return Err(OmniError::recovery_required(
+                        operation_id,
+                        format!(
+                            "deferred table fork failed after recovery intent was armed: {error}"
+                        ),
+                    ));
+                }
+            }
+        }
+        if created_any_fork {
+            crate::failpoints::maybe_fail(crate::failpoints::names::MUTATION_POST_FORK_PRE_COMMIT)
+                .map_err(|error| {
+                    OmniError::recovery_required(operation_id.clone(), error.to_string())
+                })?;
+        }
 
         let mut updates: Vec<SubTableUpdate> = Vec::with_capacity(staged.len());
-
-        // Carry each staged table's post-`commit_staged` handle out so the
-        // publish-prepare index build reuses it (collapse #4) instead of
-        // re-opening the dataset at the same just-committed version.
-        let mut committed_handles: HashMap<String, SnapshotHandle> =
-            HashMap::with_capacity(staged.len());
+        let mut committed_transactions = HashMap::with_capacity(staged.len());
 
         for entry in staged {
             let StagedTableEntry {
@@ -888,19 +1353,148 @@ impl StagedMutation {
                 path,
                 expected_version: _,
                 dataset,
+                pending_mode,
                 staged_write,
+                deferred_stage: _,
+                planned_transaction: _,
             } = entry;
 
-            let new_ds = db.storage().commit_staged(dataset, staged_write).await?;
-            let state = db.storage().table_state(&path.full_path, &new_ds).await?;
+            let mut staged_write = staged_write.ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "table '{}' reached commit without a staged transaction",
+                    table_key
+                ))
+            })?;
+            let strict_source_ids = staged_write.take_strict_source_ids();
+
+            let outcome = match db
+                .storage()
+                .commit_staged_exact(dataset, staged_write)
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    if updates.is_empty() && error.is_retryable_commit_conflict() {
+                        match crate::db::manifest::finalize_effect_free_occ_sidecar(
+                            db.root_uri(),
+                            db.storage_adapter(),
+                            &snapshot,
+                            &sidecar,
+                        )
+                        .await
+                        {
+                            Ok(true) => {
+                                return match pending_mode {
+                                    Some(PendingMode::StrictInsert) => {
+                                        let source_ids = strict_source_ids.ok_or_else(|| {
+                                            OmniError::manifest_internal(format!(
+                                                "strict table '{table_key}' lost its conflict re-probe ids"
+                                            ))
+                                        })?;
+                                        match fresh_conflicting_strict_id(
+                                            db,
+                                            branch,
+                                            path.identity,
+                                            &table_key,
+                                            &source_ids,
+                                        )
+                                        .await
+                                        {
+                                            Ok(Some(key)) => {
+                                                Err(OmniError::key_conflict(table_key, key))
+                                            }
+                                            Ok(None) => Err(OmniError::manifest_read_set_changed(
+                                                format!("key_fence:{table_key}"),
+                                                Some("prepared strict exact-id write".to_string()),
+                                                Some(
+                                                    "retryable substrate conflict without a visible exact-id match"
+                                                        .to_string(),
+                                                ),
+                                            )),
+                                            Err(probe_error) => Err(probe_error),
+                                        }
+                                    }
+                                    Some(PendingMode::Upsert) => {
+                                        Err(OmniError::manifest_read_set_changed(
+                                            format!("key_fence:{table_key}"),
+                                            Some("prepared exact-id write".to_string()),
+                                            Some("concurrent exact-id write".to_string()),
+                                        ))
+                                    }
+                                    // Deletes and overwrites do not acquire
+                                    // strict-insert semantics merely because
+                                    // Lance described their conflict as
+                                    // retryable. Preserve the typed substrate
+                                    // error after retiring the empty intent.
+                                    Some(PendingMode::Overwrite) | None => Err(error),
+                                };
+                            }
+                            Ok(false) => {}
+                            Err(finalize_error) => {
+                                return Err(OmniError::recovery_required(
+                                    operation_id,
+                                    format!(
+                                        "commit failed and the effect-free intent could not be \
+                                         finalized: {error}; finalization: {finalize_error}"
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                    return Err(OmniError::recovery_required(
+                        operation_id,
+                        error.to_string(),
+                    ));
+                }
+            };
+            if !outcome.is_exact() {
+                return Err(OmniError::recovery_required(
+                    operation_id,
+                    format!(
+                        "table '{}' committed a rebased Lance transaction at version {} (planned {:?}, committed {:?})",
+                        table_key,
+                        outcome.committed_version(),
+                        outcome.planned_transaction(),
+                        outcome.committed_transaction(),
+                    ),
+                ));
+            }
+            committed_transactions.insert(path.identity, outcome.committed_transaction().clone());
+            let new_ds = outcome.into_snapshot();
+            let state = db
+                .storage()
+                .table_state(&path.full_path, &new_ds)
+                .await
+                .map_err(|error| {
+                    OmniError::recovery_required(operation_id.clone(), error.to_string())
+                })?;
             updates.push(SubTableUpdate {
+                identity: path.identity,
                 table_key: table_key.clone(),
                 table_version: state.version,
                 table_branch: path.table_branch.clone(),
                 row_count: state.row_count,
                 version_metadata: state.version_metadata,
             });
-            committed_handles.insert(table_key, new_ds);
+            crate::failpoints::maybe_fail(crate::failpoints::names::MUTATION_POST_TABLE_COMMIT)
+                .map_err(|error| {
+                    OmniError::recovery_required(operation_id.clone(), error.to_string())
+                })?;
+        }
+
+        if let Err(error) = confirm_occ_sidecar_v9(
+            db.root_uri(),
+            db.storage_adapter(),
+            &mut sidecar,
+            &updates,
+            &committed_transactions,
+        )
+        .await
+        {
+            return Err(OmniError::recovery_required(
+                operation_id,
+                error.to_string(),
+            ));
         }
 
         Ok(CommittedMutation {
@@ -908,7 +1502,6 @@ impl StagedMutation {
             expected_versions,
             sidecar_handle,
             guards,
-            committed_handles,
         })
     }
 }

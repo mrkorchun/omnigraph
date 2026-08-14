@@ -120,10 +120,8 @@ pub async fn init_graph_with_schema_and_data(schema: &str, data: &str) -> tempfi
     Omnigraph::init(graph.to_str().unwrap(), schema)
         .await
         .unwrap();
-    let mut db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
-    load_jsonl(&mut db, data, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+    load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
     temp
 }
 
@@ -502,12 +500,6 @@ pub fn renamed_age_schema() -> String {
         .replace("age: I32?", "years: I32? @rename_from(\"age\")")
 }
 
-pub fn indexed_name_schema() -> String {
-    fs::read_to_string(fixture("test.pg"))
-        .unwrap()
-        .replace("name: String @key", "name: String @key @index")
-}
-
 pub fn unsupported_schema_change() -> String {
     fs::read_to_string(fixture("test.pg"))
         .unwrap()
@@ -874,6 +866,7 @@ pub mod matrix {
                 let body = serde_json::to_vec(&BranchMergeRequest {
                     source,
                     target: Some(target),
+                    delete_branch: false,
                 })
                 .unwrap();
                 let response = app
@@ -1142,6 +1135,7 @@ pub async fn http_merge_decision(
     let req = BranchMergeRequest {
         source: "feature".to_string(),
         target: Some("main".to_string()),
+        delete_branch: false,
     };
     let (status, _body) = json_response(
         &app,

@@ -193,6 +193,7 @@ pub(crate) fn parse_cluster_config(config_dir: &Path) -> ParsedConfig {
 
     diagnostics.extend(duplicate_key_diagnostics(&text));
     diagnostics.extend(future_field_diagnostics(&text));
+    diagnostics.extend(removed_field_diagnostics(&text));
     if has_errors(&diagnostics) {
         return ParsedConfig {
             raw: None,
@@ -365,18 +366,21 @@ pub(crate) async fn observe_declared_graphs(
                         applies_to: None,
                         embedding_provider: None,
                         embedding_profile: None,
+                        external_blob_policy: None,
                     },
                 );
                 let query_digests = state_query_digests_for_graph(state, &graph.id);
                 let embedding_provider = state_graph_embedding_provider(state, &graph.id);
                 let embedding_provider_digest =
                     state_embedding_provider_digest(state, embedding_provider.as_deref());
-                let graph_digest_value = graph_digest(
+                let external_blob_policy = state_graph_external_blob_policy(state, &graph.id);
+                let graph_digest_value = graph_digest_with_external_blob_policy(
                     &graph.id,
                     Some(&observation.schema_digest),
                     Some(&query_digests),
                     embedding_provider.as_deref(),
                     embedding_provider_digest.as_ref(),
+                    &external_blob_policy,
                 );
                 state.applied_revision.resources.insert(
                     graph_address.clone(),
@@ -385,6 +389,7 @@ pub(crate) async fn observe_declared_graphs(
                         applies_to: None,
                         embedding_provider,
                         embedding_profile: None,
+                        external_blob_policy: persisted_external_blob_policy(&external_blob_policy),
                     },
                 );
                 state.observations.insert(
@@ -541,6 +546,8 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
     let mut graph_query_digests: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
     let mut graph_schema_digests: BTreeMap<String, String> = BTreeMap::new();
     let mut graph_embedding_providers: BTreeMap<String, String> = BTreeMap::new();
+    let mut graph_external_blob_policies: BTreeMap<String, omnigraph::ExternalBlobPolicy> =
+        BTreeMap::new();
     let mut embedding_provider_digests: BTreeMap<String, String> = BTreeMap::new();
     let mut embedding_providers: BTreeMap<String, EmbeddingProviderConfig> = BTreeMap::new();
 
@@ -579,6 +586,10 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
         );
         let graph_address = graph_address(graph_id);
         let schema_address = schema_address(graph_id);
+        graph_external_blob_policies.insert(
+            graph_id.clone(),
+            validate_external_blob_policy(graph_id, &graph.external_blobs, &mut diagnostics),
+        );
         dependencies.insert(Dependency {
             from: schema_address.clone(),
             to: graph_address.clone(),
@@ -728,12 +739,15 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
         let embedding_provider = graph_embedding_providers.get(graph_id);
         let embedding_provider_digest =
             embedding_provider.and_then(|address| embedding_provider_digests.get(address));
-        let digest = graph_digest(
+        let digest = graph_digest_with_external_blob_policy(
             graph_id,
             graph_schema_digests.get(graph_id),
             graph_query_digests.get(graph_id),
             embedding_provider.map(String::as_str),
             embedding_provider_digest,
+            graph_external_blob_policies
+                .get(graph_id)
+                .expect("every graph has a validated external Blob policy"),
         );
         resources.insert(
             graph_address(graph_id),
@@ -747,6 +761,7 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
     }
 
     let mut policy_bindings: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut policy_binding_owners: BTreeMap<String, String> = BTreeMap::new();
     for (policy_name, policy) in &raw.policies {
         validate_id(
             "policy name",
@@ -764,12 +779,16 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
 
         let policy_address = policy_address(policy_name);
         let mut normalized_bindings: Vec<String> = Vec::new();
+        let mut binds_cluster = false;
+        let mut graph_binding = None;
         for (idx, target) in policy.applies_to.iter().enumerate() {
             match normalize_policy_target(target) {
                 PolicyTarget::Cluster => {
+                    binds_cluster = true;
                     normalized_bindings.push("cluster".to_string());
                 }
                 PolicyTarget::Graph(graph_id) => {
+                    graph_binding.get_or_insert_with(|| graph_id.clone());
                     normalized_bindings.push(graph_address(&graph_id));
                     if raw.graphs.contains_key(&graph_id) {
                         dependencies.insert(Dependency {
@@ -796,20 +815,71 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
 
         normalized_bindings.sort();
         normalized_bindings.dedup();
-        policy_bindings.insert(policy_address.clone(), normalized_bindings);
+
+        let mixes_binding_kinds = binds_cluster && graph_binding.is_some();
+        if mixes_binding_kinds {
+            diagnostics.push(Diagnostic::error(
+                "policy_mixed_binding_kinds",
+                format!("policies.{policy_name}.applies_to"),
+                "one policy bundle cannot bind both `cluster` and graph scopes; split server and graph rules into separate bundles",
+            ));
+        }
+        for binding in &normalized_bindings {
+            match policy_binding_owners.entry(binding.clone()) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(policy_name.clone());
+                }
+                std::collections::btree_map::Entry::Occupied(entry) => {
+                    diagnostics.push(Diagnostic::error(
+                        "duplicate_policy_binding",
+                        format!("policies.{policy_name}.applies_to"),
+                        format!(
+                            "policy bundles `{}` and `{policy_name}` both bind `{binding}`; merge them or leave exactly one bundle for that scope",
+                            entry.get()
+                        ),
+                    ));
+                }
+            }
+        }
 
         let policy_path = resolve_config_path(&config_dir, &policy.file);
-        match fs::read(&policy_path) {
-            Ok(bytes) => {
+        match fs::read_to_string(&policy_path) {
+            Ok(source) => {
                 resources.insert(
                     policy_address.clone(),
                     ResourceSummary {
-                        address: policy_address,
+                        address: policy_address.clone(),
                         kind: "policy".to_string(),
-                        digest: sha256_hex(&bytes),
+                        digest: sha256_hex(source.as_bytes()),
                         path: Some(display_path(&policy_path)),
                     },
                 );
+                let validation =
+                    omnigraph_policy::PolicyConfig::from_source(&source).and_then(|_| {
+                        match (binds_cluster, graph_binding.as_deref()) {
+                            (true, None) => {
+                                omnigraph_policy::PolicyEngine::load_server_from_source(&source)
+                                    .map(|_| ())
+                            }
+                            (false, Some(graph_id)) => {
+                                omnigraph_policy::PolicyEngine::load_graph_from_source(
+                                    &source, graph_id,
+                                )
+                                .map(|_| ())
+                            }
+                            // Binding diagnostics above own the mixed/empty cases. Still parse the
+                            // source strictly, but do not pretend one policy can have both runtime
+                            // kinds or choose an arbitrary kind for an unbound bundle.
+                            _ => Ok(()),
+                        }
+                    });
+                if let Err(err) = validation {
+                    diagnostics.push(Diagnostic::error(
+                        "policy_invalid",
+                        format!("policies.{policy_name}.file"),
+                        format!("policy file '{}' is invalid: {err}", policy_path.display()),
+                    ));
+                }
             }
             Err(err) => diagnostics.push(Diagnostic::error(
                 "policy_file_missing",
@@ -820,6 +890,7 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
                 ),
             )),
         }
+        policy_bindings.insert(policy_address, normalized_bindings);
     }
 
     let mut resource_digests = BTreeMap::new();
@@ -839,6 +910,10 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
                 .cloned()
                 .unwrap_or_default(),
             embedding_provider: graph_embedding_providers.get(graph_id).cloned(),
+            external_blob_policy: graph_external_blob_policies
+                .get(graph_id)
+                .cloned()
+                .expect("every graph has a validated external Blob policy"),
         })
         .collect();
     let config_digest = desired_config_digest(&raw, &resource_digests);
@@ -859,6 +934,47 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
         diagnostics,
         config_dir,
         config_file,
+    }
+}
+
+fn validate_external_blob_policy(
+    graph_id: &str,
+    config: &ExternalBlobsConfig,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> omnigraph::ExternalBlobPolicy {
+    if config.allow.is_empty() {
+        return omnigraph::ExternalBlobPolicy::Deny;
+    }
+
+    let mut bases = Vec::with_capacity(config.allow.len());
+    let mut invalid = false;
+    for (index, configured) in config.allow.iter().enumerate() {
+        match omnigraph::ExternalBlobBase::new(&configured.base, configured.scope.into()) {
+            Ok(base) => bases.push(base),
+            Err(error) => {
+                invalid = true;
+                diagnostics.push(Diagnostic::error(
+                    "invalid_external_blob_base",
+                    format!("graphs.{graph_id}.external_blobs.allow[{index}].base"),
+                    error.to_string(),
+                ));
+            }
+        }
+    }
+    if invalid {
+        return omnigraph::ExternalBlobPolicy::Deny;
+    }
+
+    match omnigraph::ExternalBlobPolicy::allow(bases) {
+        Ok(policy) => policy,
+        Err(error) => {
+            diagnostics.push(Diagnostic::error(
+                "invalid_external_blob_policy",
+                format!("graphs.{graph_id}.external_blobs.allow"),
+                error.to_string(),
+            ));
+            omnigraph::ExternalBlobPolicy::Deny
+        }
     }
 }
 
@@ -902,6 +1018,33 @@ pub(crate) fn validate_query_source(
             err.to_string(),
         )),
     }
+}
+
+/// Keys that existed in an unreleased development line and were removed.
+///
+/// `GraphConfig` is `deny_unknown_fields`, so a stale key already fails — but
+/// with a raw serde message that reads like a typo. Name the removal instead,
+/// so an operator carrying a development `cluster.yaml` is told what happened
+/// and what to do.
+pub(crate) fn removed_field_diagnostics(text: &str) -> Vec<Diagnostic> {
+    let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(text) else {
+        return Vec::new();
+    };
+    let Some(graphs) = value.get("graphs").and_then(|graphs| graphs.as_mapping()) else {
+        return Vec::new();
+    };
+    graphs
+        .iter()
+        .filter_map(|(id, decl)| {
+            let id = id.as_str()?;
+            decl.as_mapping()?.get("streaming")?;
+            Some(Diagnostic::error(
+                "removed_streaming_declaration",
+                format!("graphs.{id}.streaming"),
+                "`streaming` was removed: the MemWAL firehose is gone and graphs no longer carry a stream profile. Delete this key. A graph written by a development build that had it must be exported with that build and rebuilt.".to_string(),
+            ))
+        })
+        .collect()
 }
 
 pub(crate) fn future_field_diagnostics(text: &str) -> Vec<Diagnostic> {

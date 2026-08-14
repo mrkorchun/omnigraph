@@ -2,47 +2,55 @@
 
 A reference for the `omnigraph` binary's command surface and the per-operator `~/.omnigraph/config.yaml` schema. For a quick-start guide, see [cli.md](index.md).
 
-Top-level command families and subcommands. Graph-targeting commands accept a positional `file://`/`s3://` URI, `--server <name|url>` (an operator-defined server from `~/.omnigraph/config.yaml` by name, or a literal `http(s)://` URL, optionally with `--graph <id>` for multi-graph servers; exclusive with a positional URI), `--store <uri>` (a single graph's storage directly), or `--profile <name>` / `$OMNIGRAPH_PROFILE` (a named scope bundle; see [Scopes & profiles](#scopes--profiles)); `cluster` commands use `--config <dir>`, while `policy` and `queries` read a cluster's applied state via `--cluster <dir|uri>`. A remote server is addressed only with `--server` — a positional `http(s)://` URI is rejected. **`query`/`mutate` are the exception**: their positional is a stored-query *name*, not a graph URI, so they address the graph only via `--store`/`--server`/`--profile`/defaults.
+Top-level command families and subcommands. Graph-targeting commands accept a positional `file://`/`s3://` URI, `--server <name|url>` (an operator-defined server from `~/.omnigraph/config.yaml` by name, or a literal `http(s)://` URL, optionally with `--graph <id>` for multi-graph servers; exclusive with a positional URI), `--store <uri>` (a single graph's storage directly), or `--profile <name>` / `$OMNIGRAPH_PROFILE` (a named scope bundle; see [Scopes & profiles](#scopes--profiles)); `cluster` commands use `--config <dir>`, while `policy` and `queries` read a cluster's applied state via `--cluster <dir|uri>`. A remote server is addressed only with `--server` — a positional `http(s)://` URI is rejected. **`query`/`mutate` and `blob` are scoped-only exceptions**: their positionals name a stored query or logical Blob cell, not a graph URI, so they address the graph only via `--store`/`--server`/`--profile`/defaults.
 
 ## Top-level commands
 
 | Command | Purpose |
 |---|---|
 | `init` | `--schema <pg>` → initialize a graph (start cluster configs from the [cluster.md](../clusters/index.md) quick-start) |
-| `load` | bulk load a branch, local or remote (`--mode overwrite\|append\|merge` is **required** — overwrite is destructive, so there is no default). Without `--from` the target branch must exist; `--from <base>` forks a missing `--branch` from `<base>` first |
-| `ingest` | deprecated alias of `load --from <base>` (defaults: `--from main --mode merge`); prints a one-line warning to stderr |
+| `load` | strict bounded graph-level NDJSON ingestion, local or remote. Remote loads send raw `application/x-ndjson` to `/load/ndjson`; embedded loads call the same strict engine boundary. One file is one ordinary graph transaction and succeeds only after its manifest commit is visible. `--data <path>` and `--mode overwrite\|append\|merge` are **required**. Without `--from` the target branch must exist; `--from <base>` forks a missing `--branch` from `<base>` first |
+| `ingest` | deprecated compatibility loader retaining the historical permissive parser and JSON `/ingest` route (defaults: `--from main --mode merge`); new integrations should use strict graph-batch `load`; prints a one-line warning to stderr |
 | `query <name>` (alias: `read`) | run a read query. **Catalog lane** (default): `<name>` is a stored query invoked **by name** from the served catalog (served-only — address with `--server`/`--profile`; the verb asserts the query is a read). **Ad-hoc lane**: with `--query <path>` or `-e`/`--query-string <GQ>`, runs that source (the positional `<name>` then selects which query in it). No positional graph URI — address via `--store`/`--server`/`--profile`. `read` is the deprecated previous name (one-line stderr warning) |
-| `mutate <name>` (alias: `change`) | run a mutation query; same catalog (by-name, served-only, verb asserts mutation) / ad-hoc (`--query`/`-e`) lanes as `query`. `change` is the deprecated previous name (one-line stderr warning) |
+| `mutate <name>` (alias: `change`) | run a mutation query; same catalog (by-name, served-only, verb asserts mutation) / ad-hoc (`--query`/`-e`) lanes as `query`. `--if-commit <id>` makes the write conditional (compare-and-swap): it runs only if the branch head commit (from a `query --json` response or `commit list`) still equals `<id>`; a lost race exits with code 4 and, with `--json`, the structured `precondition_failure` body — re-read and decide again. Remote conditional writes use a dedicated capability route, so an older server fails with 404 before execution instead of ignoring the condition. `change` is the deprecated previous name (one-line stderr warning) |
+| `blob get \| stat ENTITY TYPE ID PROPERTY` | read one logical node/edge Blob cell. `get` streams raw managed bytes to stdout or `--out`; `stat` performs descriptor-only metadata output. Accepts `--store`, `--server` + `--graph`, or a store/server profile/default, but no positional graph URI or `--cluster`. See [Blob read commands](#blob-read-commands) |
 | `alias <name> [args]` | invoke an operator alias — a read-only personal binding (under `aliases:` in `~/.omnigraph/config.yaml`) to a stored query on a named server (replaces the removed `--alias` flag; stored mutations are rejected before execution) |
 | `snapshot` | print current snapshot (per-table version + row count) |
 | `export` | dump to JSONL on stdout (`--type T`, `--table K` filters) |
-| `branch create \| list \| delete \| merge` | branching ops |
-| `commit list \| show` | inspect commit graph |
+| `branch create \| list \| delete \| merge` | branching ops. `merge --delete-branch` deletes the source branch after a successful merge (its own `branch_delete` policy check; a refusal is a stderr warning, not a failure — see [merge](../branching/merge.md)) |
+| `commit list \| show \| changes` | inspect commit graph. `list` is newest-first; `--branch <name>` lists that branch's reachable history, omitted = `main`; `changes <commit_id>` emits exact ordered `before`/`after` images and supports `--cursor`, `--limit`, `--max-bytes` |
 | `schema plan \| apply \| show (alias: get)` | migrations. `apply` refuses a cluster-managed graph (one whose storage is inside a cluster) and points at `cluster apply` — those graphs evolve through the cluster ledger, not a direct apply |
 | `lint` (alias: `check`) | offline / graph-backed query validation. Replaces `query lint` / `query check`, which are kept as deprecated argv-level shims that print a one-line warning and rewrite to `omnigraph lint` |
-| `cluster validate \| plan \| apply \| approve \| status \| refresh \| import \| force-unlock` | declarative cluster control plane. `validate` checks a local `cluster.yaml` folder and referenced schema/query/policy files; `plan` diffs it against local JSON state at `__cluster/state.json`, annotates dispositions, and embeds real schema-migration previews; `apply` converges the cluster — stored-query/policy catalog writes (content-addressed under `__cluster/resources/`), graph creates, schema updates (soft drops only; `--as` records the actor), and graph deletes behind a digest-bound approval from `cluster approve <resource> --as <actor>` (`apply`/`approve` default the actor from `~/.omnigraph/config.yaml`'s `operator.actor` when `--as` is omitted); what apply converges is what an `omnigraph-server --cluster <dir>` deployment serves on its next restart (`--cluster` is the server's only boot source — cluster-only); `status` reads the state ledger; `refresh`/`import` explicitly update local JSON state from read-only graph observations; `force-unlock <LOCK_ID>` manually removes a held local state lock by exact id |
-| `optimize` | non-destructive Lance compaction (skips tables with `Blob` columns or uncovered drift; `--json` reports `skipped`) |
+| `cluster validate \| plan \| apply \| approve \| status \| refresh \| import \| force-unlock` | declarative cluster control plane. `validate` checks a local `cluster.yaml` folder and referenced schema/query/policy files; `plan` diffs it against local JSON state; `apply` converges resources, graph creation, schema updates, and approved graph deletion; `status` reads the state ledger; `refresh`/`import` update local state from read-only graph observations; `force-unlock <LOCK_ID>` removes only the exact held local lock |
+| `optimize` | non-destructive Lance compaction + index reconciliation (blob-bearing tables use the normal path; tables with uncovered drift are skipped and `--json` reports `skipped`) |
 | `repair [--confirm] [--force]` | preview or explicitly publish uncovered manifest/head drift. `--confirm` heals verified maintenance drift and exits non-zero if suspicious/unverifiable drift is refused; `--force --confirm` publishes suspicious/unverifiable drift after operator review |
 | `cleanup --keep N --older-than 7d --confirm` | destructive version GC (`--confirm` to execute; also needs `--yes` against a non-local `s3://` target — see *Write diagnostics & destructive confirmation*) |
 | `embed` | offline JSONL embedding pipeline |
 | `policy validate \| test \| explain` | Cedar tooling against a cluster's applied policies (`--cluster <dir>`; `--graph <id>` picks a graph's bundle when several apply). `test` takes `--tests <file>`; `explain` takes `--actor`/`--action`/`--branch`/`--target-branch` |
 | `queries list \| validate` | inspect a cluster's applied stored-query registry (`--cluster <dir\|uri>`; `--graph <id>` to scope one graph). `list` prints each query's kind (read/mutation), name, typed params, and `[mcp: …]` exposure; a query's `@description`/`@instruction` are shown as indented `description:` / `instruction:` lines when declared (omitted otherwise). `--json` emits `{name, mcp_expose, tool_name, mutation, params}` plus `description`/`instruction` **only when present** — matching the HTTP `GET /queries` catalog ([server.md](../operations/server.md)). `validate` type-checks the registry and exits non-zero on a broken query |
+| `graphs list` | enumerate the graphs a multi-graph server serves (`GET /graphs`). Registry scope: addresses the bare server URL via `--server <name\|url>` / `--profile <name>` only — `--graph`/`--store`/`--as` are rejected, and a scope's `default_graph` is ignored |
 | `profile list \| show [<name>]` | read-only inspection of `~/.omnigraph/config.yaml` profiles. `list` shows each profile's binding (server/cluster/store) + default graph and marks the `$OMNIGRAPH_PROFILE`-active one; JSON keeps `binding` and adds `scope_kind`, `target`, `valid`, and `error`; `show` resolves one profile's scope (endpoint + default graph), defaulting to the active profile, else the flat operator defaults |
-| `version` / `-v` | print `omnigraph 0.7.x` |
+| `version` / `-v` | print the OmniGraph release and served internal-schema version |
+
+Effectful `load`, `ingest`, and `mutate` commands include a `commit` object in
+their `--json` output. It is the exact graph commit published by that write,
+with `graph_commit_id`, manifest branch/version, parent ids, actor, and creation
+time—not a later lookup of the branch head. A successful mutation that matches
+no rows publishes nothing and returns `"commit": null`.
 
 ## Command capabilities
 
 Every command declares the **capability** it needs — what it requires to reach a graph — which determines the addressing flags that apply:
 
-- **`any`** — `query`, `mutate`, `load`, `ingest`, `branch *`, `snapshot`, `export`, `commit *`, `schema show`, `schema apply`. Run against a graph **served (via a server) or embedded (direct against a store)**: accept a positional `file://`/`s3://` URI, `--server <name|url>` (+ `--graph <id>` for multi-graph servers), `--store <uri>`, or `--profile <name>`. A remote server is addressed with `--server` — a positional `http(s)://` URI does **not** dispatch to one.
-- **`served`** — `graphs list`. Requires a server (accepts `--server` / `--profile`).
-- **`direct`** — `init`, `optimize`, `repair`, `cleanup`, `schema plan`, `lint`. Need **direct storage access** (`file://` / `s3://`), never through a server. They accept a positional `URI`, but **not** `--server`, and a remote (`http(s)://`) URI is rejected. `optimize` / `repair` / `cleanup` additionally accept **`--cluster <dir|s3://…> --graph <id>`** (`--cluster` is a cluster directory or storage-root URI, named via `clusters:` in `~/.omnigraph/config.yaml` or a literal root), which resolves the graph's storage URI from the served cluster state (so you needn't know the `<storage>/graphs/<id>.omni` layout). `--graph` is the one graph selector across all scopes — on these three verbs it picks the cluster graph; on the other `direct` verbs it does not apply.
+- **`any`** — `query`, `mutate`, `blob get|stat`, `load`, `ingest`, `branch *`, `snapshot`, `export`, `commit *`, `schema show`, `schema apply`. Run against a graph **served (via a server) or embedded (direct against a store)**. Most accept a positional `file://`/`s3://` URI, `--server <name|url>` (+ `--graph <id>` for multi-graph servers), `--store <uri>`, or `--profile <name>`. `query`/`mutate` reserve their positional for a query name; `blob get|stat` reserve four positionals for the logical cell selector. Those scoped-only commands use `--store`, `--server` + `--graph`, or an applicable store/server profile/default and do not accept a positional graph URI. A remote server is addressed with `--server` — a positional `http(s)://` URI does **not** dispatch to one.
+- **`served`** — `graphs list`. It addresses the graph registry at the bare server URL through `--server` or a server profile. `--graph`, direct `--store`, and client-supplied `--as` are rejected.
+- **`direct`** — `init`, `optimize`, `repair`, `cleanup`, `schema plan`, `lint`. Need **direct storage access** (`file://` / `s3://`), never through a server. They accept a positional `URI`, but **not** `--server`, and a remote (`http(s)://`) URI is rejected. `optimize` / `repair` / `cleanup` additionally accept **`--cluster <dir|s3://…> --graph <id>`** (`--cluster` is a cluster directory or storage-root URI, named via `clusters:` in `~/.omnigraph/config.yaml` or a literal root), which resolves the graph's storage URI from the served cluster state (so you needn't know the `<storage>/graphs/<id>.omni` layout). `--graph` is the one graph selector across all scopes — on these three verbs it picks the cluster graph; on the other `direct` verbs it does not apply. `--as` does not apply to any `direct` verb — maintenance records no actor.
 - **`control`** — `cluster *` via `--config <dir>`; `policy *` and `queries *` via `--cluster <dir|uri>` or a cluster profile.
 - **`local`** — `alias`, `embed`, `login`, `logout`, `profile`, `version`. Address no explicit graph scope.
 
 These restrictions are enforced and reported, not silent:
 
-- A scope flag on a verb that can't consume it fails loudly rather than being silently dropped — `--server` outside a served scope, `--cluster` outside cluster-scoped verbs, or `--graph` where no multi-graph scope applies, e.g.: ``optimize is a direct (storage-native) command; --server addresses a served graph and does not apply. Pass a storage URI, or --cluster <dir> --graph <id>.``
+- A scope flag on a verb that cannot consume it fails loudly rather than being silently dropped — `--server` outside a served or `any` scope, `--cluster` outside cluster-scoped verbs, `--graph` where no multi-graph scope applies, `--store` outside verbs that consume it, `--as` outside actor-recording writes, or `--profile` on verbs that never resolve a scope. For example: ``optimize is a direct (storage-native) command; --server addresses a served graph and does not apply. Pass a storage URI, or --cluster <dir> --graph <id>.``
 - A `direct` verb pointed at a remote URI fails loudly, e.g.: ``optimize is a direct (storage-native) command and needs direct storage access; the resolved target is a remote server (https://…). Pass the graph's file:// or s3:// URI.``
 - A data verb pointed at a positional `http(s)://` URI fails loudly: ``a remote graph must be addressed with --server <url> — a positional (or --uri) http(s):// URL no longer dispatches to a server.``
 - `init` into an **established cluster's** storage layout (`<root>/graphs/<id>.omni` where `<root>` holds `__cluster/state.json`) is refused — graphs in a cluster are created by `cluster apply` (which records ledger / recovery / approvals), not `init`.
@@ -51,11 +59,93 @@ To maintain a server-backed graph, run the `direct` verbs from a host with stora
 
 `omnigraph --help` lists commands with a **capability legend** at the bottom (any / served / direct / control / local).
 
+## Blob read commands
+
+```text
+omnigraph blob get ENTITY TYPE ID PROPERTY
+  [--branch NAME | --snapshot ID]
+  [--offset N] [--length N] [--out PATH]
+
+omnigraph blob stat ENTITY TYPE ID PROPERTY
+  [--branch NAME | --snapshot ID] [--json]
+```
+
+`ENTITY` is `node` or `edge`; `TYPE` and `PROPERTY` are names in the current
+accepted graph schema. The selector remains graph-level. It never exposes a
+Lance table, dataset, physical row address, or per-table lane.
+
+Both commands have `any` capability but are scoped-only: use `--store URI` or
+`--server NAME_OR_URL --graph ID`, a store/server `--profile`, or the
+corresponding operator default. There is no positional graph URI and no
+`--cluster`; a cluster-bound profile is rejected as the wrong plane. `--as` is
+also rejected because these read-only commands do not consume it. Reads default
+to branch `main`. `--branch` and `--snapshot` are mutually exclusive.
+
+### `blob get`
+
+Managed content is written as exact raw bytes, without JSON or base64 framing.
+With no `--out`, stdout is the byte stream. With `--out PATH`, the path receives
+that same stream.
+
+| Flags | Selected bytes |
+|---|---|
+| neither `--offset` nor `--length` | complete value |
+| `--offset N --length M` | `N..N+M` |
+| `--offset N` | `N` through the end |
+| `--length M` | `0..M` |
+
+An explicit end beyond the value is clamped to EOF, matching HTTP Range
+semantics. A start at or beyond the end of a non-empty value is unsatisfiable.
+Requested `--length 0` and `N + M` overflow fail before graph/server resolution;
+an unsatisfiable start fails before payload transfer. A full get of a valid
+empty managed Blob is different: it succeeds with zero bytes. The command
+consumes larger representations through consecutive engine/HTTP ranges, each
+bounded by the 4 MiB engine read ceiling; it does not buffer the whole value
+before writing.
+
+A storage or transport error after transfer starts is loud: the process exits
+nonzero. It cannot retract a prefix already written to stdout, and `--out` may
+retain the successfully delivered prefix. A failure before the first payload
+byte leaves an existing `--out` path untouched. Scripts that require atomic
+replacement even after a mid-stream failure should target a temporary file,
+check for a zero exit status, and then rename it.
+
+Whole-object external values are not downloaded. The command exits nonzero,
+reports the stored URI, and suggests `blob stat`; remote HTTP redirects are not
+followed. A ranged external descriptor is unsupported and fails loudly rather
+than widening the logical value to the complete target object.
+
+### `blob stat`
+
+`stat` classifies managed descriptors and whole-object external descriptors and
+reads no payload bytes. A ranged external descriptor fails loudly, just as it
+does for `get`; it is never reported as if it named the complete target object.
+Human output and `--json` carry the same facts. The JSON contract is:
+
+- `selector`: `{ entity, type, id, property }`;
+- `kind`: `managed` or `external`;
+- managed only: `size` and strong `etag`;
+- external only: stored `uri`;
+- `target`: the requested `branch` or `snapshot` when explicit, plus the always
+  present exact opaque graph-view witness `resolved_snapshot`.
+
+Fields that do not apply are omitted rather than emitted as JSON null. A null
+cell returns the typed not-found failure; it is not an external value or a
+managed value of size zero. Remote stat uses HEAD and never retries with GET or
+follows the external redirect. Treat `resolved_snapshot` as opaque: a live
+branch normally produces a synthetic manifest witness, not a commit ULID, and
+the ETag suffix may differ after copying the same graph to another store. An
+explicit `--snapshot ID` remains separately and exactly echoed as
+`target.snapshot`.
+
+`blob put` and `blob clear` are not implemented in this read-only slice. They
+remain RFC-033 Phase 3 work through the ordinary Mutation/recovery path.
+
 ## Write diagnostics & destructive confirmation
 
 Two global flags make writes self-documenting and guard the dangerous ones:
 
-- **Every write echoes its resolved target to stderr** — `omnigraph load → s3://acme/brain/graphs/knowledge.omni (direct, remote)` — so you catch a scope that resolved somewhere unexpected (e.g. *prod*) before it lands. Applies to `load`, `ingest`, `mutate`, `branch create|delete|merge`, `schema apply`, `optimize`, `repair`, `cleanup`. The line is stderr, so `--json` consumers reading stdout are unaffected; suppress it with **`--quiet`**.
+- **Every write echoes its resolved target to stderr** — `omnigraph load → s3://acme/brain/graphs/knowledge.omni (direct, remote)` — so you catch a scope that resolved somewhere unexpected (e.g. *prod*) before it lands. Applies to `load`, `ingest`, `branch create|delete|merge`, `schema apply`, `optimize`, `repair`, `cleanup` (`mutate` does not currently echo). The line is stderr, so `--json` consumers reading stdout are unaffected; suppress it with **`--quiet`**.
 - **Destructive writes against a non-local scope require confirmation.** `cleanup`, overwrite `load` (`--mode overwrite`), and `branch delete` proceed freely against a local (`file://`) graph, but when the resolved target is **not local** (a served `http(s)://` graph or an `s3://` store/cluster) they require explicit consent: pass **`--yes`** to confirm, an interactive terminal is prompted, and a non-interactive run (no TTY, or `--json`) **refuses with an error** rather than silently destroying. `cleanup` still also requires its existing `--confirm` (preview→execute); `--yes` is the additional non-local consent.
 
 A "local" target is a bare path or a `file://` URI; `http(s)://`, `s3://`, and other object-store schemes are non-local.
@@ -125,7 +215,9 @@ sticky "current" mode. Inspect what is defined with `omnigraph profile list` and
     `GET /graphs` lists the graphs and you must pass `--graph <id>` (the CLI
     lists the candidates if you omit it). It falls back to the bare URL only
     when `/graphs` is unavailable: policy-gated, unreachable, or a
-    non-`omnigraph` endpoint.
+    non-`omnigraph` endpoint. `graphs list` itself is exempt — it *is* the
+    enumeration, so it always addresses the bare server URL (a scope's
+    `default_graph` is ignored there).
 
 `--target`, `--cluster-graph`, and the positional-`http(s)://`→remote dispatch
 have been **removed** (`--graph` is now the one graph selector across server and
@@ -196,20 +288,16 @@ references. `cluster plan` reads local JSON state from
 apply, refresh, and import acquire `__cluster/lock.json` by default and release
 it before returning. `cluster apply` converges the cluster to its config in one
 ordered run: it creates declared graphs, applies schema updates (soft drops
-only — see [schema](../schema/index.md)), writes stored-query/policy catalog
-resources (content-addressed under `__cluster/resources/`), and executes
-approved graph deletes; it requires an existing `state.json` (run `import`
-first). Applied state does not serve traffic until an `omnigraph-server
---cluster <dir>` restart picks up the new revision. Standalone schema deletes
-remain unsupported and are reported as `deferred` with a warning. `cluster
-status` reads state only and reports any existing lock metadata. `force-unlock`
-removes a lock only when the supplied id exactly matches the lock file.
+only), writes stored-query/policy catalog resources, and executes approved graph
+deletes. Applied state does not serve traffic until an `omnigraph-server
+--cluster <dir>` restart picks up the new revision. `cluster status` reads state
+only and reports any existing lock metadata. `force-unlock` removes a lock only
+when the supplied id exactly matches the lock file.
+
 `refresh` requires an existing `state.json`; `import` creates one only when it
 is missing. Both observe declared graphs read-only at
-`<config-dir>/graphs/<graph-id>.omni`. External state backends, automatic
-stale-lock breaking, `plan --refresh`, pipelines, UI specs, embeddings,
-aliases, and bindings are not yet supported. See
-[cluster-config.md](../clusters/config.md).
+`<config-dir>/graphs/<graph-id>.omni`. See
+[cluster configuration](../clusters/config.md).
 
 ## Output formats (`query` command, alias: `read`)
 

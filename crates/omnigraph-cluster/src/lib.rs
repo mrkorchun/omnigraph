@@ -1,3 +1,8 @@
+// The cluster state-machine tests compose several large async futures; rustc
+// needs the wider layout-query budget while building the lib-test harness
+// (with or without failpoints). Production builds keep the default.
+#![cfg_attr(test, recursion_limit = "256")]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self};
 use std::path::{Path, PathBuf};
@@ -20,11 +25,14 @@ pub mod failpoints;
 mod config;
 mod diff;
 mod serve;
+mod state_lock;
 mod store;
 mod sweep;
 mod types;
 use config::{
-    QueriesDecl, graph_address, initial_import_state, load_desired, observe_declared_graphs, parse_cluster_config, preview_schema_migration, schema_address, state_resource_digests, validate_cluster_header,
+    QueriesDecl, graph_address, initial_import_state, load_desired, observe_declared_graphs,
+    parse_cluster_config, preview_schema_migration, schema_address, state_resource_digests,
+    validate_cluster_header,
 };
 use diff::{
     FailedGraphOrigin, ResourceKind, append_embedding_profile_changes,
@@ -62,7 +70,38 @@ fn store_for(config_dir: &Path, storage_root: Option<&str>) -> Result<ClusterSto
 }
 
 pub fn validate_config_dir(config_dir: impl AsRef<Path>) -> ValidateOutput {
-    let outcome = load_desired(config_dir.as_ref());
+    let mut outcome = load_desired(config_dir.as_ref());
+    // This release intentionally tightens the historical permissive URI
+    // behavior. Keep the notice on the validate surface (rather than every
+    // plan/apply invocation): a valid graph with no bases must make its
+    // effective default-Deny posture visible before an operator upgrades a
+    // workload that previously supplied external references.
+    if !has_errors(&outcome.diagnostics) {
+        let denied_graphs = outcome
+            .desired
+            .as_ref()
+            .map(|desired| {
+                desired
+                    .graphs
+                    .iter()
+                    .filter(|graph| {
+                        matches!(
+                            &graph.external_blob_policy,
+                            omnigraph::ExternalBlobPolicy::Deny
+                        )
+                    })
+                    .map(|graph| graph.id.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for graph_id in denied_graphs {
+            outcome.diagnostics.push(Diagnostic::warning(
+                "external_blob_ingress_default_deny",
+                format!("graphs.{graph_id}.external_blobs"),
+                "effective policy is deny: new external Blob URI references will be rejected; existing stored references remain readable",
+            ));
+        }
+    }
     let (resource_digests, resources, dependencies) = match outcome.desired {
         Some(desired) => (
             desired.resource_digests,
@@ -389,6 +428,20 @@ pub async fn apply_config_dir_with_options(
         );
     };
 
+    // State metadata is an authority boundary. Validate the as-read graph
+    // composites before the recovery sweep can reuse any embedded policy or
+    // binding metadata while rolling the ledger forward.
+    if !validate_state_graph_resource_digests(&state, &mut diagnostics) {
+        return early_return(
+            display_path(&desired.config_dir),
+            Some(desired.config_digest),
+            observations,
+            Vec::new(),
+            state.resource_statuses,
+            diagnostics,
+        );
+    }
+
     // Snapshot the as-read state BEFORE the sweep so sweep mutations count as
     // changes for the final dirty check and get persisted by the state CAS.
     let before_value =
@@ -412,7 +465,6 @@ pub async fn apply_config_dir_with_options(
         &sweep.pending_graphs,
         &approved,
     );
-
     // Defensive invariant: nothing the approval gate covers may be executable
     // WITHOUT a matching approval. Gated changes with a valid artifact are the
     // sanctioned exception (stage 4C).
@@ -503,7 +555,9 @@ pub async fn apply_config_dir_with_options(
                 continue;
             }
         };
-        if let Err(diagnostic) = failpoints::maybe_fail(crate::failpoints::names::CLUSTER_APPLY_BEFORE_GRAPH_CREATE) {
+        if let Err(diagnostic) =
+            failpoints::maybe_fail(crate::failpoints::names::CLUSTER_APPLY_BEFORE_GRAPH_CREATE)
+        {
             // Simulated crash before the init: the sidecar stays for the
             // sweep (row 1: root absent -> intent removed next run).
             diagnostics.push(diagnostic);
@@ -580,7 +634,9 @@ pub async fn apply_config_dir_with_options(
         // Crash point: the graph exists, the cluster state does not record it
         // yet. A failure here must acknowledge nothing; the next run's sweep
         // rolls the ledger forward (row 4).
-        if let Err(diagnostic) = failpoints::maybe_fail(crate::failpoints::names::CLUSTER_APPLY_AFTER_GRAPH_CREATE) {
+        if let Err(diagnostic) =
+            failpoints::maybe_fail(crate::failpoints::names::CLUSTER_APPLY_AFTER_GRAPH_CREATE)
+        {
             diagnostics.push(diagnostic);
             return early_return(
                 display_path(&desired.config_dir),
@@ -720,7 +776,9 @@ pub async fn apply_config_dir_with_options(
                 continue;
             }
         };
-        if let Err(diagnostic) = failpoints::maybe_fail(crate::failpoints::names::CLUSTER_APPLY_BEFORE_SCHEMA_APPLY) {
+        if let Err(diagnostic) =
+            failpoints::maybe_fail(crate::failpoints::names::CLUSTER_APPLY_BEFORE_SCHEMA_APPLY)
+        {
             // Simulated crash before the engine call: the sidecar stays; the
             // sweep retires it next run (ledger still consistent with live).
             diagnostics.push(diagnostic);
@@ -780,7 +838,9 @@ pub async fn apply_config_dir_with_options(
         }
         // Crash point: the manifest moved, the ledger does not record it yet.
         // A failure here acknowledges nothing; the sweep rolls forward.
-        if let Err(diagnostic) = failpoints::maybe_fail(crate::failpoints::names::CLUSTER_APPLY_AFTER_SCHEMA_APPLY) {
+        if let Err(diagnostic) =
+            failpoints::maybe_fail(crate::failpoints::names::CLUSTER_APPLY_AFTER_SCHEMA_APPLY)
+        {
             diagnostics.push(diagnostic);
             return early_return(
                 display_path(&desired.config_dir),
@@ -865,7 +925,9 @@ pub async fn apply_config_dir_with_options(
     // Crash point: payloads are on disk, state has not moved. A failure here
     // must leave state.json byte-identical and acknowledge nothing; re-running
     // apply repairs via the skip-if-exists blob reuse.
-    if let Err(diagnostic) = failpoints::maybe_fail(crate::failpoints::names::CLUSTER_APPLY_AFTER_PAYLOAD_PHASE) {
+    if let Err(diagnostic) =
+        failpoints::maybe_fail(crate::failpoints::names::CLUSTER_APPLY_AFTER_PAYLOAD_PHASE)
+    {
         diagnostics.push(diagnostic);
         return early_return(
             display_path(&desired.config_dir),
@@ -912,6 +974,21 @@ pub async fn apply_config_dir_with_options(
             })
             .map(|artifact| artifact.approval_id.clone());
         let graph_uri = backend.graph_root(graph_id);
+        let _export_exclusion = match omnigraph::db::reserve_export_root_exclusion(&graph_uri) {
+            Ok(guard) => guard,
+            Err(error) => {
+                diagnostics.push(Diagnostic::error(
+                        "graph_delete_export_in_progress",
+                        graph_addr.clone(),
+                        format!(
+                            "cannot remove graph root '{graph_uri}' while an immutable export owns it: {error}"
+                        ),
+                    ));
+                failed_graphs.insert(graph_id.clone(), FailedGraphOrigin::GraphDelete);
+                graph_moving_aborted = true;
+                continue;
+            }
+        };
         let observed_manifest_version = match Omnigraph::open_read_only(&graph_uri).await {
             Ok(db) => match db.snapshot_of(ReadTarget::branch("main")).await {
                 Ok(snapshot) => Some(snapshot.version()),
@@ -942,7 +1019,9 @@ pub async fn apply_config_dir_with_options(
                 continue;
             }
         };
-        if let Err(diagnostic) = failpoints::maybe_fail(crate::failpoints::names::CLUSTER_APPLY_BEFORE_GRAPH_DELETE) {
+        if let Err(diagnostic) =
+            failpoints::maybe_fail(crate::failpoints::names::CLUSTER_APPLY_BEFORE_GRAPH_DELETE)
+        {
             // Simulated crash before removal: row 8 retires the intent and
             // the still-valid approval lets a later run retry.
             diagnostics.push(diagnostic);
@@ -967,7 +1046,9 @@ pub async fn apply_config_dir_with_options(
         }
         // Crash point: the root is gone, the ledger does not record it yet.
         // The sweep rolls forward (row 7b) and consumes the approval.
-        if let Err(diagnostic) = failpoints::maybe_fail(crate::failpoints::names::CLUSTER_APPLY_AFTER_GRAPH_DELETE) {
+        if let Err(diagnostic) =
+            failpoints::maybe_fail(crate::failpoints::names::CLUSTER_APPLY_AFTER_GRAPH_DELETE)
+        {
             diagnostics.push(diagnostic);
             return early_return(
                 display_path(&desired.config_dir),
@@ -1011,6 +1092,7 @@ pub async fn apply_config_dir_with_options(
                                 .embedding_providers
                                 .get(&change.resource)
                                 .cloned(),
+                            external_blob_policy: None,
                         },
                     );
                     set_resource_status_applied(&mut new_state, &change.resource);
@@ -1023,10 +1105,10 @@ pub async fn apply_config_dir_with_options(
                     new_state.resource_statuses.remove(&change.resource);
                 }
             },
-            Some(ApplyDisposition::Blocked) => {
+            Some(ApplyDisposition::Blocked)
                 // The sweep owns recovery statuses (Drifted/Error with their
                 // conditions); a generic Blocked must not clobber them.
-                if change.reason.as_deref() != Some("cluster_recovery_pending") {
+                if change.reason.as_deref() != Some("cluster_recovery_pending") => {
                     set_resource_status(
                         &mut new_state,
                         &change.resource,
@@ -1035,7 +1117,6 @@ pub async fn apply_config_dir_with_options(
                         "waiting on an unapplied or missing dependency",
                     );
                 }
-            }
             _ => {}
         }
     }
@@ -1050,7 +1131,7 @@ pub async fn apply_config_dir_with_options(
             record_approval_consumed(&mut new_state, approval_id, "apply");
         }
     }
-    recompute_state_graph_digests(&mut new_state, &desired);
+    recompute_state_graph_digests(&mut new_state, &desired, &changes);
 
     let mut residual = diff_resources(
         &state_resource_digests(&new_state),
@@ -1073,7 +1154,9 @@ pub async fn apply_config_dir_with_options(
         // persisted-statuses revert contract below is exercised; a cfg_callback
         // on this point can mutate state.json to simulate a concurrent writer,
         // making write_state's CAS check fail organically.
-        let write_result = match failpoints::maybe_fail(crate::failpoints::names::CLUSTER_APPLY_BEFORE_STATE_WRITE) {
+        let write_result = match failpoints::maybe_fail(
+            crate::failpoints::names::CLUSTER_APPLY_BEFORE_STATE_WRITE,
+        ) {
             Ok(()) => {
                 backend
                     .write_state(&new_state, expected_cas.as_deref(), &mut observations)
@@ -1529,6 +1612,22 @@ async fn sync_config_dir(config_dir: &Path, operation: StateSyncOperation) -> St
         (StateSyncOperation::Import, None) => initial_import_state(&desired),
     };
 
+    // Refresh and recovery may derive a replacement graph composite from
+    // state-resident metadata. Refuse a severed binding before either pass can
+    // turn hand-edited metadata into a newly self-consistent applied revision.
+    if !validate_state_graph_resource_digests(&state, &mut diagnostics) {
+        return StateSyncOutput {
+            ok: false,
+            operation,
+            config_dir: display_path(&desired.config_dir),
+            state_observations: observations,
+            resource_digests: state_resource_digests(&state),
+            resource_statuses: state.resource_statuses,
+            observations: state.observations,
+            diagnostics,
+        };
+    }
+
     // Recovery sweep first (RFC-004 §D3): classify any interrupted graph
     // operation before observation/verification so a rolled-forward outcome
     // is what those passes see.
@@ -1753,7 +1852,11 @@ async fn write_resource_payload(
 /// state's own schema/query components. Without this, an applied query change
 /// would leave the prior composite digest in state and `graph.<id>` would show
 /// a phantom update in every later plan — apply could never converge.
-fn recompute_state_graph_digests(state: &mut ClusterState, desired: &DesiredCluster) {
+fn recompute_state_graph_digests(
+    state: &mut ClusterState,
+    desired: &DesiredCluster,
+    changes: &[PlanChange],
+) {
     for graph in &desired.graphs {
         let graph_address = graph_address(&graph.id);
         if !state
@@ -1773,12 +1876,33 @@ fn recompute_state_graph_digests(state: &mut ClusterState, desired: &DesiredClus
         let embedding_provider_digest = embedding_provider
             .and_then(|address| state.applied_revision.resources.get(address))
             .map(|resource| resource.digest.clone());
-        let digest = graph_digest(
+        // A graph composite is normally derived from desired graph metadata
+        // after its executable changes settle. A blocked graph/schema change
+        // is different: that run did not apply the desired graph authority, so
+        // keep the policy already recorded in the applied ledger. Otherwise a
+        // failed schema migration could still broaden Deny to Allow (or revoke
+        // an existing Allow) for the next serving process.
+        let graph_change_blocked = changes.iter().any(|change| {
+            change.disposition == Some(ApplyDisposition::Blocked)
+                && match resource_kind(&change.resource) {
+                    ResourceKind::Graph(graph_id) | ResourceKind::Schema(graph_id) => {
+                        graph_id == graph.id
+                    }
+                    _ => false,
+                }
+        });
+        let external_blob_policy = if graph_change_blocked {
+            state_graph_external_blob_policy(state, &graph.id)
+        } else {
+            graph.external_blob_policy.clone()
+        };
+        let digest = graph_digest_with_external_blob_policy(
             &graph.id,
             schema_digest.as_ref(),
             Some(&query_digests),
             embedding_provider,
             embedding_provider_digest.as_ref(),
+            &external_blob_policy,
         );
         state.applied_revision.resources.insert(
             graph_address,
@@ -1787,6 +1911,7 @@ fn recompute_state_graph_digests(state: &mut ClusterState, desired: &DesiredClus
                 applies_to: None,
                 embedding_provider: graph.embedding_provider.clone(),
                 embedding_profile: None,
+                external_blob_policy: persisted_external_blob_policy(&external_blob_policy),
             },
         );
     }
@@ -1817,9 +1942,32 @@ fn duplicate_key_diagnostics(text: &str) -> Vec<Diagnostic> {
             .take_while(|ch| *ch == ' ')
             .count() as isize;
         let trimmed = line_without_comment.trim_start();
-        if trimmed.starts_with('-') {
-            continue;
-        }
+        let trimmed = if trimmed == "-" || trimmed.starts_with("- ") {
+            while stack.last().is_some_and(|frame| indent <= frame.indent) {
+                stack.pop();
+            }
+            let parent = stack.last().expect("root frame is always present");
+            let item_path = if parent.path.is_empty() {
+                "[]".to_string()
+            } else {
+                format!("{}[]", parent.path)
+            };
+            stack.push(Frame {
+                indent,
+                path: item_path,
+                keys: BTreeSet::new(),
+            });
+            let item = trimmed.strip_prefix('-').unwrap().trim_start();
+            if item.is_empty() {
+                continue;
+            }
+            item
+        } else {
+            while stack.last().is_some_and(|frame| indent <= frame.indent) {
+                stack.pop();
+            }
+            trimmed
+        };
         let Some((raw_key, raw_value)) = trimmed.split_once(':') else {
             continue;
         };
@@ -1828,9 +1976,6 @@ fn duplicate_key_diagnostics(text: &str) -> Vec<Diagnostic> {
             continue;
         }
 
-        while stack.last().is_some_and(|frame| indent <= frame.indent) {
-            stack.pop();
-        }
         let parent = stack.last_mut().expect("root frame is always present");
         let full_path = if parent.path.is_empty() {
             key.to_string()
@@ -1900,6 +2045,74 @@ fn state_graph_embedding_provider(state: &ClusterState, graph_id: &str) -> Optio
         .and_then(|resource| resource.embedding_provider.clone())
 }
 
+fn state_graph_external_blob_policy(
+    state: &ClusterState,
+    graph_id: &str,
+) -> omnigraph::ExternalBlobPolicy {
+    state
+        .applied_revision
+        .resources
+        .get(&graph_address(graph_id))
+        .and_then(|resource| resource.external_blob_policy.clone())
+        .unwrap_or_default()
+}
+
+fn expected_state_graph_resource_digest(
+    state: &ClusterState,
+    graph_id: &str,
+    graph_resource: &StateResource,
+) -> String {
+    let schema_digest = state
+        .applied_revision
+        .resources
+        .get(&schema_address(graph_id))
+        .map(|resource| resource.digest.clone());
+    let query_digests = state_query_digests_for_graph(state, graph_id);
+    let embedding_provider_digest =
+        state_embedding_provider_digest(state, graph_resource.embedding_provider.as_deref());
+    // Historical state predates this field. Absence therefore has exactly the
+    // old/default Deny meaning, rather than becoming an unbound wildcard.
+    let external_blob_policy = graph_resource
+        .external_blob_policy
+        .as_ref()
+        .cloned()
+        .unwrap_or_default();
+    graph_digest_with_external_blob_policy(
+        graph_id,
+        schema_digest.as_ref(),
+        Some(&query_digests),
+        graph_resource.embedding_provider.as_deref(),
+        embedding_provider_digest.as_ref(),
+        &external_blob_policy,
+    )
+}
+
+fn validate_state_graph_resource_digests(
+    state: &ClusterState,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> bool {
+    let before = count_errors(diagnostics);
+    for (address, resource) in &state.applied_revision.resources {
+        let ResourceKind::Graph(graph_id) = resource_kind(address) else {
+            continue;
+        };
+        if expected_state_graph_resource_digest(state, &graph_id, resource) != resource.digest {
+            diagnostics.push(Diagnostic::error(
+                "external_blob_policy_digest_mismatch",
+                address.clone(),
+                "the applied graph resource metadata is not bound by its composite digest; restore the cluster state ledger from a trusted copy before retrying",
+            ));
+        }
+    }
+    count_errors(diagnostics) == before
+}
+
+fn persisted_external_blob_policy(
+    policy: &omnigraph::ExternalBlobPolicy,
+) -> Option<omnigraph::ExternalBlobPolicy> {
+    (!matches!(policy, omnigraph::ExternalBlobPolicy::Deny)).then(|| policy.clone())
+}
+
 fn state_embedding_provider_digest(
     state: &ClusterState,
     embedding_provider: Option<&str>,
@@ -1937,12 +2150,13 @@ fn set_resource_status(
     );
 }
 
-fn graph_digest(
+fn graph_digest_with_external_blob_policy(
     graph_id: &str,
     schema_digest: Option<&String>,
     query_digests: Option<&BTreeMap<String, String>>,
     embedding_provider: Option<&str>,
     embedding_provider_digest: Option<&String>,
+    external_blob_policy: &omnigraph::ExternalBlobPolicy,
 ) -> String {
     let mut input = format!(
         "graph\0{graph_id}\0schema\0{}\0",
@@ -1964,7 +2178,36 @@ fn graph_digest(
         input.push_str(embedding_provider_digest.map_or("", String::as_str));
         input.push('\0');
     }
+    // `Deny` is the historical/default graph meaning, so omitting its marker
+    // keeps pre-policy graph digests stable. Any allow-list is normalized
+    // before reaching this function and therefore has one deterministic hash.
+    if !matches!(external_blob_policy, omnigraph::ExternalBlobPolicy::Deny) {
+        input.push_str("external_blob_policy\0");
+        input.push_str(
+            &serde_json::to_string(external_blob_policy)
+                .expect("external Blob policy must serialize deterministically"),
+        );
+        input.push('\0');
+    }
     sha256_hex(input.as_bytes())
+}
+
+#[cfg(test)]
+fn graph_digest(
+    graph_id: &str,
+    schema_digest: Option<&String>,
+    query_digests: Option<&BTreeMap<String, String>>,
+    embedding_provider: Option<&str>,
+    embedding_provider_digest: Option<&String>,
+) -> String {
+    graph_digest_with_external_blob_policy(
+        graph_id,
+        schema_digest,
+        query_digests,
+        embedding_provider,
+        embedding_provider_digest,
+        &omnigraph::ExternalBlobPolicy::Deny,
+    )
 }
 
 fn embedding_provider_digest(profile: &EmbeddingProviderConfig) -> String {

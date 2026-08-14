@@ -23,26 +23,66 @@
 //! Functions decorated `#[tokio::test]` actually run; they construct real
 //! values and assert field shapes / types.
 
+mod helpers;
+
+use std::collections::HashSet;
 use std::sync::Arc;
 
-use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray};
+use arrow_array::cast::AsArray;
+use arrow_array::{Array, Int32Array, RecordBatch, RecordBatchIterator, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
-use lance::Dataset;
+use futures::TryStreamExt;
+use lance::dataset::BlobRangeRequest;
 use lance::dataset::builder::DatasetBuilder;
+use lance::dataset::cleanup::{CleanupPolicy, cleanup_old_versions};
 use lance::dataset::optimize::{CompactionOptions, compact_files};
-use lance::dataset::transaction::Operation;
+use lance::dataset::refs::BranchIdentifier;
+use lance::dataset::transaction::{Operation, Transaction};
 use lance::dataset::write::delete::DeleteResult;
+use lance::dataset::write::merge_insert::UncommittedMergeInsert;
+use lance::dataset::write::merge_insert::inserted_rows::{FilterType, KeyExistenceFilter};
 use lance::dataset::{
     CommitBuilder, InsertBuilder, MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode,
     WriteParams,
 };
+use lance::datatypes::LANCE_UNENFORCED_PRIMARY_KEY;
 use lance::index::DatasetIndexExt;
+use lance::session::Session;
+use lance::{BlobArrayBuilder, Dataset};
+use lance_core::datatypes::BlobHandling;
+use lance_core::{
+    ROW_ADDR, ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION, ROW_OFFSET,
+    is_system_column,
+};
 use lance_file::version::LanceFileVersion;
 use lance_index::IndexType;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::ScalarIndexParams;
+use lance_io::object_store::ObjectStoreRegistry;
 use lance_namespace::LanceNamespace;
-use lance_table::io::commit::ManifestNamingScheme;
+use lance_table::io::commit::{ManifestLocation, ManifestNamingScheme};
+use omnigraph_compiler::schema::parser::parse_schema;
+
+use helpers::{init_and_load, open_dataset_head, snapshot_main};
+
+#[test]
+fn compiler_rejects_five_surveyed_lance_virtual_system_columns() {
+    let names = [
+        ROW_ID,
+        ROW_ADDR,
+        ROW_OFFSET,
+        ROW_CREATED_AT_VERSION,
+        ROW_LAST_UPDATED_AT_VERSION,
+    ];
+    for name in names {
+        assert!(is_system_column(name), "Lance no longer reserves {name}");
+        let error = parse_schema(&format!("node N {{ {name}: String }}"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("reserved"), "unexpected error: {error}");
+        assert!(error.contains(name), "unexpected error: {error}");
+    }
+}
 
 /// Helper: build a small fresh dataset in a tempdir. Pinned at V2_2 to match
 /// production write paths (blob v2 requires V2_2; see `docs/dev/lance.md`).
@@ -67,6 +107,299 @@ async fn fresh_dataset(uri: &str) -> Dataset {
         ..Default::default()
     };
     Dataset::write(reader, uri, Some(params)).await.unwrap()
+}
+
+/// Append one uniquely keyed row while preserving the V2_2/stable-row-id shape
+/// used by the production tables. Tag/cleanup guards use this to create exact,
+/// distinguishable versions without introducing a graph-level writer.
+async fn append_guard_row(dataset: &mut Dataset, id: &str, value: i32) {
+    let schema = Arc::new(Schema::from(dataset.schema()));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec![id])),
+            Arc::new(Int32Array::from(vec![value])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    dataset
+        .append(
+            reader,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                enable_stable_row_ids: true,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+}
+
+/// RFC-024 Gate A candidate built exclusively from public Lance surfaces.
+///
+/// `BranchIdentifier` distinguishes named-ref lifetimes, the current
+/// transaction UUID distinguishes main-dataset replacement where main's
+/// identifier is necessarily empty, and the manifest e_tag gives object stores
+/// an independent physical-object witness. The e_tag remains optional at the
+/// type level for backends that omit it; the pinned Lance local filesystem backend
+/// resolves a metadata-derived e_tag, and the local guards below require it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PublicPhysicalRefIncarnation {
+    branch_identifier: BranchIdentifier,
+    transaction_uuid: String,
+    manifest_e_tag: Option<String>,
+}
+
+async fn public_physical_ref_incarnation(dataset: &Dataset) -> PublicPhysicalRefIncarnation {
+    let branch_identifier = dataset
+        .branch_identifier()
+        .await
+        .expect("the current dataset/ref must expose its public BranchIdentifier");
+    let transaction = dataset
+        .read_transaction()
+        .await
+        .expect("the current manifest transaction must be readable")
+        .expect("a heads-format candidate cannot admit a manifest without a transaction UUID");
+    assert!(
+        !transaction.uuid.is_empty(),
+        "a heads-format candidate cannot admit an empty transaction UUID"
+    );
+    let manifest_e_tag = dataset.manifest_location().e_tag.clone();
+    let revalidated_branch_identifier = dataset
+        .branch_identifier()
+        .await
+        .expect("the current dataset/ref must re-expose its public BranchIdentifier");
+    assert_eq!(
+        branch_identifier, revalidated_branch_identifier,
+        "physical-ref capture must reject branch movement while reading manifest authority"
+    );
+    PublicPhysicalRefIncarnation {
+        branch_identifier,
+        transaction_uuid: transaction.uuid,
+        manifest_e_tag,
+    }
+}
+
+async fn recreate_named_branch_and_assert_token_changes(main: &mut Dataset, require_etag: bool) {
+    let base_version = main.version().version;
+    let first = main
+        .create_branch("rfc024-physical-token", base_version, None)
+        .await
+        .expect("first named-ref incarnation must be created");
+    let first_version = first.version().version;
+    let first_token = public_physical_ref_incarnation(&first).await;
+
+    main.force_delete_branch("rfc024-physical-token")
+        .await
+        .expect("first named-ref incarnation must be deleted completely");
+    let second = main
+        .create_branch("rfc024-physical-token", base_version, None)
+        .await
+        .expect("same-name named ref must be recreatable");
+    let second_version = second.version().version;
+    let second_token = public_physical_ref_incarnation(&second).await;
+
+    assert_eq!(
+        first_version, second_version,
+        "the ABA fixture must recreate the named ref at the same numeric version"
+    );
+    assert_ne!(
+        first_token.branch_identifier, second_token.branch_identifier,
+        "a same-name/same-version named-ref recreation must mint a new BranchIdentifier"
+    );
+    assert_ne!(
+        first_token.transaction_uuid, second_token.transaction_uuid,
+        "the recreated named ref's current manifest must carry a new transaction UUID"
+    );
+    assert_ne!(
+        first_token, second_token,
+        "the complete public physical-ref token must reject named-ref ABA"
+    );
+    if require_etag {
+        let first_etag = first_token
+            .manifest_e_tag
+            .as_deref()
+            .expect("the selected backend must expose the first named-ref manifest e_tag");
+        let second_etag = second_token
+            .manifest_e_tag
+            .as_deref()
+            .expect("the selected backend must expose the recreated named-ref manifest e_tag");
+        assert_ne!(
+            first_etag, second_etag,
+            "the selected backend must distinguish the recreated named-ref manifest object by e_tag"
+        );
+    }
+}
+
+/// RFC-023 substrate fixture: a V2_2 table whose internal `id` is Lance's
+/// unenforced primary key. `note` is nullable so the matched-only partial-schema
+/// guard can omit it without testing an unrelated nullability rejection.
+async fn fresh_pk_dataset(uri: &str) -> Dataset {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false).with_metadata(
+            [(LANCE_UNENFORCED_PRIMARY_KEY.to_string(), "true".to_string())]
+                .into_iter()
+                .collect(),
+        ),
+        Field::new("value", DataType::Int32, false),
+        Field::new("note", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["alice", "bob"])),
+            Arc::new(Int32Array::from(vec![1, 2])),
+            Arc::new(StringArray::from(vec![Some("a"), Some("b")])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let params = WriteParams {
+        mode: WriteMode::Create,
+        enable_stable_row_ids: true,
+        data_storage_version: Some(LanceFileVersion::V2_2),
+        ..Default::default()
+    };
+    Dataset::write(reader, uri, Some(params)).await.unwrap()
+}
+
+fn pk_full_row(dataset: &Dataset, id: &str, value: i32) -> RecordBatch {
+    let schema = Arc::new(Schema::from(dataset.schema()));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec![id])),
+            Arc::new(Int32Array::from(vec![value])),
+            Arc::new(StringArray::from(vec![Some("guard")])),
+        ],
+    )
+    .unwrap()
+}
+
+async fn stage_pk_merge(
+    dataset: Arc<Dataset>,
+    batch: RecordBatch,
+    on: &str,
+    when_matched: WhenMatched,
+    when_not_matched: WhenNotMatched,
+    use_index: Option<bool>,
+) -> UncommittedMergeInsert {
+    let schema = batch.schema();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let mut builder = MergeInsertBuilder::try_new(dataset, vec![on.to_string()]).unwrap();
+    builder
+        .when_matched(when_matched)
+        .when_not_matched(when_not_matched)
+        .conflict_retries(0);
+    if let Some(use_index) = use_index {
+        builder.use_index(use_index);
+    }
+    builder
+        .try_build()
+        .unwrap()
+        .execute_uncommitted(reader)
+        .await
+        .unwrap()
+}
+
+fn transaction_inserted_rows_filter(transaction: &Transaction) -> Option<&KeyExistenceFilter> {
+    match &transaction.operation {
+        Operation::Update {
+            inserted_rows_filter,
+            ..
+        } => inserted_rows_filter.as_ref(),
+        other => panic!("expected merge_insert to stage Operation::Update, got {other:?}"),
+    }
+}
+
+fn staged_inserted_rows_filter(staged: &UncommittedMergeInsert) -> Option<&KeyExistenceFilter> {
+    let transaction_filter = transaction_inserted_rows_filter(&staged.transaction);
+    assert_eq!(
+        staged.inserted_rows_filter.as_ref(),
+        transaction_filter,
+        "the public uncommitted result and its transaction must expose the same key filter"
+    );
+    transaction_filter
+}
+
+fn assert_bloom_empty(filter: &KeyExistenceFilter, expected_empty: bool, case: &str) {
+    let FilterType::Bloom { bitmap, .. } = &filter.filter else {
+        panic!("{case}: pinned Lance should emit a Bloom key filter")
+    };
+    assert_eq!(
+        bitmap.iter().all(|byte| *byte == 0),
+        expected_empty,
+        "{case}: unexpected Bloom-filter population state"
+    );
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ConflictMatrixTxn {
+    Filtered { id: &'static str, value: i32 },
+    UnfilteredUpdate { id: &'static str, value: i32 },
+    Append { id: &'static str, value: i32 },
+}
+
+async fn stage_conflict_matrix_txn(dataset: Arc<Dataset>, kind: ConflictMatrixTxn) -> Transaction {
+    let (id, value) = match kind {
+        ConflictMatrixTxn::Filtered { id, value }
+        | ConflictMatrixTxn::UnfilteredUpdate { id, value }
+        | ConflictMatrixTxn::Append { id, value } => (id, value),
+    };
+    let batch = pk_full_row(dataset.as_ref(), id, value);
+
+    let transaction = match kind {
+        ConflictMatrixTxn::Filtered { .. } => {
+            stage_pk_merge(
+                dataset,
+                batch,
+                "id",
+                WhenMatched::UpdateAll,
+                WhenNotMatched::InsertAll,
+                Some(false),
+            )
+            .await
+            .transaction
+        }
+        ConflictMatrixTxn::UnfilteredUpdate { .. } => {
+            stage_pk_merge(
+                dataset,
+                batch,
+                "value",
+                WhenMatched::UpdateAll,
+                WhenNotMatched::InsertAll,
+                Some(false),
+            )
+            .await
+            .transaction
+        }
+        ConflictMatrixTxn::Append { .. } => InsertBuilder::new(dataset)
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            })
+            .execute_uncommitted(vec![batch])
+            .await
+            .unwrap(),
+    };
+
+    match kind {
+        ConflictMatrixTxn::Filtered { .. } => assert!(
+            transaction_inserted_rows_filter(&transaction).is_some(),
+            "filtered matrix fixture must carry the PK filter"
+        ),
+        ConflictMatrixTxn::UnfilteredUpdate { .. } => assert!(
+            transaction_inserted_rows_filter(&transaction).is_none(),
+            "non-PK merge matrix fixture must be an unfiltered Update"
+        ),
+        ConflictMatrixTxn::Append { .. } => assert!(
+            matches!(&transaction.operation, Operation::Append { .. }),
+            "append matrix fixture must stage Operation::Append"
+        ),
+    }
+    transaction
 }
 
 // --- Guard 1: LanceError::TooMuchWriteContention variant exists ------------
@@ -130,6 +463,354 @@ async fn manifest_location_field_shape() {
     // Runtime sanity — naming_scheme should produce a Debug string we use
     // verbatim in `TableVersionMetadata::naming_scheme`.
     assert!(!format!("{:?}", loc.naming_scheme).is_empty());
+}
+
+// --- Guard 2a: shared client pool with cache-isolated Sessions ---------------
+//
+// OmniGraph uses a cached data Session and a zero-cache control Session. They
+// must reuse the same object-store client pool without turning mutable-tip
+// control metadata into a second shared cache. This exercises the public Lance
+// construction with real Dataset opens: the second Session hits the first
+// Session's live object store, while its own zero-sized metadata cache remains
+// empty.
+
+#[tokio::test]
+async fn cached_and_zero_cache_sessions_share_store_registry_not_metadata_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("shared-registry-isolated-caches.lance");
+    let uri = path.to_str().unwrap();
+    drop(fresh_dataset(uri).await);
+
+    let registry = Arc::new(ObjectStoreRegistry::default());
+    let cached_session = Arc::new(Session::new(
+        16 * 1024 * 1024,
+        16 * 1024 * 1024,
+        Arc::clone(&registry),
+    ));
+    let control_session = Arc::new(Session::new(0, 0, Arc::clone(&registry)));
+
+    let before = registry.stats();
+    let cached = DatasetBuilder::from_uri(uri)
+        .with_session(Arc::clone(&cached_session))
+        .load()
+        .await
+        .expect("the cached data Session must open the dataset");
+    let after_cached = registry.stats();
+    assert!(
+        after_cached.misses > before.misses,
+        "the first Session open must create an object-store client"
+    );
+    let cached_metadata_items = cached_session.metadata_cache_stats().await.num_entries;
+    assert!(
+        cached_metadata_items > 0,
+        "a real data-Session open must populate its metadata cache"
+    );
+    assert_eq!(
+        control_session.metadata_cache_stats().await.num_entries,
+        0,
+        "the control Session must not observe the data Session's metadata entries"
+    );
+
+    // Keep `cached` alive so the registry's weak entry still has a live store
+    // for the control Session to reuse.
+    let control = DatasetBuilder::from_uri(uri)
+        .with_session(Arc::clone(&control_session))
+        .load()
+        .await
+        .expect("the zero-cache control Session must open the dataset");
+    let after_control = registry.stats();
+    assert!(
+        after_control.hits > after_cached.hits,
+        "the control Session must reuse the data Session's live object-store client"
+    );
+    assert_eq!(
+        after_control.misses, after_cached.misses,
+        "the second Session must not build a duplicate client for identical store parameters"
+    );
+    assert_eq!(
+        control_session.metadata_cache_stats().await.num_entries,
+        0,
+        "a control-plane open must leave the zero-sized metadata cache empty"
+    );
+    assert_eq!(cached.version().version, control.version().version);
+}
+
+// --- Guard 2b: RFC-024 public physical-ref incarnation surfaces -----------
+//
+// RFC-024 may activate durable table heads only if a public, backend-portable
+// token rejects delete/recreate ABA at an unchanged URI/ref name and numeric
+// version. Pin all three candidate components at compile time, then exercise
+// them against real local and object-store datasets below.
+
+#[allow(
+    dead_code,
+    unreachable_code,
+    unused_variables,
+    unused_mut,
+    clippy::diverging_sub_expression
+)]
+async fn _compile_public_physical_ref_incarnation_surfaces() -> lance::Result<()> {
+    let ds: &Dataset = unimplemented!();
+    let _branch_identifier: BranchIdentifier = ds.branch_identifier().await?;
+    let transaction: Option<Transaction> = ds.read_transaction().await?;
+    if let Some(transaction) = transaction {
+        let _transaction_uuid: String = transaction.uuid;
+    }
+    let location: &ManifestLocation = ds.manifest_location();
+    let _manifest_e_tag: Option<String> = location.e_tag.clone();
+    Ok(())
+}
+
+#[tokio::test]
+async fn public_physical_ref_token_rejects_local_same_version_aba() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rfc024-physical-token.lance");
+    let uri = path.to_str().unwrap();
+
+    let first = fresh_dataset(uri).await;
+    let first_version = first.version().version;
+    let first_token = public_physical_ref_incarnation(&first).await;
+    drop(first);
+
+    std::fs::remove_dir_all(&path).expect("the first local dataset must be deleted completely");
+    let mut second = fresh_dataset(uri).await;
+    let second_version = second.version().version;
+    let second_token = public_physical_ref_incarnation(&second).await;
+
+    assert_eq!(
+        first_version, second_version,
+        "the ABA fixture must recreate main at the same numeric version"
+    );
+    assert_eq!(
+        first_token.branch_identifier, second_token.branch_identifier,
+        "main's BranchIdentifier is intentionally stable/empty and cannot detect replacement"
+    );
+    assert_eq!(
+        first_token.branch_identifier,
+        BranchIdentifier::main(),
+        "main must expose Lance's canonical empty BranchIdentifier"
+    );
+    assert_ne!(
+        first_token.transaction_uuid, second_token.transaction_uuid,
+        "the public current-transaction UUID must distinguish local main replacement"
+    );
+    let first_etag = first_token
+        .manifest_e_tag
+        .as_deref()
+        .expect("pinned Lance must expose the first local main manifest's metadata-derived e_tag");
+    let second_etag = second_token.manifest_e_tag.as_deref().expect(
+        "pinned Lance must expose the recreated local main manifest's metadata-derived e_tag",
+    );
+    assert_ne!(
+        first_etag, second_etag,
+        "pinned Lance's local e_tag must distinguish the recreated main manifest object"
+    );
+    assert_ne!(
+        first_token, second_token,
+        "the complete public physical-ref token must reject local main ABA"
+    );
+
+    recreate_named_branch_and_assert_token_changes(&mut second, true).await;
+}
+
+/// Exercise the production-shaped shared-Session case. "Stable" here means
+/// stable across an unchanged reopen: an ordinary commit must rotate the
+/// current transaction/e_tag witness while preserving the branch identifier.
+/// Once the canonical first incarnation is cached, deleting and recreating
+/// main at the same URI/version must still resolve the second incarnation
+/// rather than reuse the cached transaction UUID. A fresh public DatasetBuilder
+/// open is the cache-bypass fallback and must agree with the shared-Session
+/// result.
+#[tokio::test]
+async fn local_physical_ref_token_is_stable_and_survives_shared_session_aba() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rfc024-shared-session-token.lance");
+    let uri = path.to_str().unwrap();
+
+    let first_committed = fresh_dataset(uri).await;
+    let first_version = first_committed.version().version;
+    let first_committed_token = public_physical_ref_incarnation(&first_committed).await;
+    assert!(
+        first_committed_token.manifest_e_tag.is_some(),
+        "pinned Lance's public Dataset result must expose the local manifest's metadata-derived e_tag"
+    );
+    drop(first_committed);
+
+    let shared_session = Arc::new(Session::default());
+    let mut first = DatasetBuilder::from_uri(uri)
+        .with_session(shared_session.clone())
+        .load()
+        .await
+        .expect("the first local incarnation must reopen through the shared Session");
+    let first_token = public_physical_ref_incarnation(&first).await;
+    assert_eq!(
+        first_committed_token, first_token,
+        "the public token must be stable from the commit result through a shared-Session reopen"
+    );
+
+    let first_again = DatasetBuilder::from_uri(uri)
+        .with_session(shared_session.clone())
+        .load()
+        .await
+        .expect("the unchanged first incarnation must reopen from the shared Session");
+    assert_eq!(
+        first_token,
+        public_physical_ref_incarnation(&first_again).await,
+        "a canonical token must be stable across unchanged shared-Session reopens"
+    );
+    drop(first_again);
+
+    append_guard_row(&mut first, "ordinary-head-advance", 3).await;
+    let advanced_token = public_physical_ref_incarnation(&first).await;
+    assert_eq!(
+        advanced_token.branch_identifier, first_token.branch_identifier,
+        "an ordinary main commit must preserve the native branch identifier"
+    );
+    assert_ne!(
+        advanced_token.transaction_uuid, first_token.transaction_uuid,
+        "the public composite is a current-HEAD witness: an ordinary commit must rotate its transaction UUID"
+    );
+    assert_ne!(
+        advanced_token.manifest_e_tag, first_token.manifest_e_tag,
+        "the public composite is a current-HEAD witness: an ordinary commit must rotate its manifest e_tag"
+    );
+    assert_ne!(
+        advanced_token, first_token,
+        "the current-HEAD witness must not be mistaken for an immutable dataset-incarnation token"
+    );
+    drop(first);
+
+    std::fs::remove_dir_all(&path).expect("the first local dataset must be deleted completely");
+    let second_committed = fresh_dataset(uri).await;
+    let second_version = second_committed.version().version;
+    assert_eq!(
+        first_version, second_version,
+        "the shared-Session ABA fixture must recreate main at the same numeric version"
+    );
+    drop(second_committed);
+
+    let second = DatasetBuilder::from_uri(uri)
+        .with_session(shared_session)
+        .load()
+        .await
+        .expect("the recreated local incarnation must reopen through the original Session");
+    let second_token = public_physical_ref_incarnation(&second).await;
+    assert_ne!(
+        first_token.transaction_uuid, second_token.transaction_uuid,
+        "the shared Session must not return the deleted incarnation's cached transaction"
+    );
+    let first_etag = first_token
+        .manifest_e_tag
+        .as_deref()
+        .expect("pinned Lance must retain the first local manifest's metadata-derived e_tag");
+    let second_etag = second_token
+        .manifest_e_tag
+        .as_deref()
+        .expect("pinned Lance must expose the recreated local manifest's metadata-derived e_tag");
+    assert_ne!(
+        first_etag, second_etag,
+        "the shared Session must resolve the recreated local manifest's distinct e_tag"
+    );
+    assert_ne!(
+        first_token, second_token,
+        "the canonical public token must distinguish shared-Session local main ABA"
+    );
+
+    let fresh = DatasetBuilder::from_uri(uri)
+        .load()
+        .await
+        .expect("a fresh public Session must reopen the recreated incarnation");
+    assert_eq!(
+        second_token,
+        public_physical_ref_incarnation(&fresh).await,
+        "fresh-session cache bypass must agree with the canonical shared-Session token"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn public_physical_ref_token_rejects_s3_same_version_aba() {
+    let Ok(bucket) = std::env::var("OMNIGRAPH_S3_TEST_BUCKET") else {
+        eprintln!(
+            "SKIP public_physical_ref_token_rejects_s3_same_version_aba: \
+             OMNIGRAPH_S3_TEST_BUCKET unset"
+        );
+        return;
+    };
+    let prefix = std::env::var("OMNIGRAPH_S3_TEST_PREFIX")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "omnigraph-itests".to_string());
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock must be after the Unix epoch")
+        .as_nanos();
+    let uri = format!(
+        "s3://{bucket}/{prefix}/rfc024-physical-token/{}-{unique}.lance",
+        std::process::id()
+    );
+
+    let first = fresh_dataset(&uri).await;
+    let first_version = first.version().version;
+    let first_token = public_physical_ref_incarnation(&first).await;
+    let first_again = DatasetBuilder::from_uri(&uri)
+        .load()
+        .await
+        .expect("the unchanged first S3/RustFS incarnation must reopen");
+    assert_eq!(
+        first_token,
+        public_physical_ref_incarnation(&first_again).await,
+        "the S3/RustFS token must be stable across an unchanged reopen"
+    );
+    drop(first_again);
+    let (store, path) = lance_io::object_store::ObjectStore::from_uri(&uri)
+        .await
+        .expect("configured S3/RustFS dataset URI must resolve");
+    drop(first);
+
+    store
+        .remove_dir_all(path.clone())
+        .await
+        .expect("the first S3/RustFS dataset must be deleted completely");
+    let mut second = fresh_dataset(&uri).await;
+    let second_version = second.version().version;
+    let second_token = public_physical_ref_incarnation(&second).await;
+
+    assert_eq!(
+        first_version, second_version,
+        "the ABA fixture must recreate S3/RustFS main at the same numeric version"
+    );
+    assert_eq!(
+        first_token.branch_identifier, second_token.branch_identifier,
+        "main's BranchIdentifier is intentionally stable/empty and cannot detect replacement"
+    );
+    assert_ne!(
+        first_token.transaction_uuid, second_token.transaction_uuid,
+        "the public current-transaction UUID must distinguish S3/RustFS main replacement"
+    );
+    let first_etag = first_token
+        .manifest_e_tag
+        .as_deref()
+        .expect("S3/RustFS must expose the first main manifest e_tag");
+    let second_etag = second_token
+        .manifest_e_tag
+        .as_deref()
+        .expect("S3/RustFS must expose the recreated main manifest e_tag");
+    assert_ne!(
+        first_etag, second_etag,
+        "S3/RustFS must distinguish the recreated main manifest object by e_tag"
+    );
+    assert_ne!(
+        first_token, second_token,
+        "the complete public physical-ref token must reject S3/RustFS main ABA"
+    );
+
+    recreate_named_branch_and_assert_token_changes(&mut second, true).await;
+
+    drop(second);
+    store
+        .remove_dir_all(path)
+        .await
+        .expect("configured S3/RustFS test prefix cleanup must succeed");
 }
 
 // --- Guard 3: checkout_version + restore async chain -----------------------
@@ -307,6 +988,39 @@ async fn _compile_uncommitted_delete_field_shape() -> lance::Result<()> {
     Ok(())
 }
 
+// --- Guard 8a: full-table vector indexing exposes uncommitted metadata -----
+//
+// EnsureIndices batches BTREE, FTS, and the current one-segment full-table
+// vector shape into one exact `Operation::CreateIndex`. This requires the
+// pinned Lance builder to return complete public `IndexMetadata` without committing
+// HEAD. Compile-only: a Lance bump that removes or narrows the surface must
+// turn the compatibility smoke test red.
+#[allow(
+    dead_code,
+    unreachable_code,
+    unused_variables,
+    unused_mut,
+    clippy::diverging_sub_expression
+)]
+async fn _compile_uncommitted_full_table_vector_index_shape() -> lance::Result<()> {
+    use lance::index::vector::VectorIndexParams;
+    use lance_linalg::distance::MetricType;
+    use lance_table::format::IndexMetadata;
+
+    let mut ds: Dataset = unimplemented!();
+    let params = VectorIndexParams::ivf_flat(1, MetricType::L2);
+    let metadata: IndexMetadata = ds
+        .create_index_builder(&["embedding"], IndexType::Vector, &params)
+        .replace(true)
+        .execute_uncommitted()
+        .await?;
+    let _transaction_shape = Operation::CreateIndex {
+        new_indices: vec![metadata],
+        removed_indices: Vec::new(),
+    };
+    Ok(())
+}
+
 // --- Guard 8b: MergeInsertJob::execute_uncommitted returns
 //     UncommittedMergeInsert { transaction, affected_rows, stats, inserted_rows_filter } ---
 //
@@ -324,8 +1038,12 @@ async fn _compile_uncommitted_merge_insert_field_shape() -> lance::Result<()> {
     use lance_select::mask::RowAddrTreeMap;
     let ds: Arc<Dataset> = unimplemented!();
     let source: Box<dyn arrow_array::RecordBatchReader + Send> = unimplemented!();
-    let job = MergeInsertBuilder::try_new(ds, vec!["x".to_string()])?.try_build()?;
+    let builder = MergeInsertBuilder::try_new(ds, vec!["x".to_string()])?;
+    let job = builder.try_build()?;
     let staged = job.execute_uncommitted(source).await?;
+    let Operation::Update { .. } = &staged.transaction.operation else {
+        unreachable!()
+    };
     let _txn: lance::dataset::transaction::Transaction = staged.transaction;
     let _affected: Option<RowAddrTreeMap> = staged.affected_rows;
     let _stats = staged.stats;
@@ -338,16 +1056,24 @@ async fn _compile_uncommitted_merge_insert_field_shape() -> lance::Result<()> {
 // The branch-delete reconciler (`db/omnigraph/optimize.rs::reconcile_orphaned_branches`)
 // and the eager best-effort reclaim in `cleanup_deleted_branch_tables` call
 // `force_delete_branch` to drop orphaned branch refs. The single-authority
-// design relies on three facts pinned here:
+// design relies on six facts pinned here:
 //   1. plain `delete_branch` errors on a missing ref (so the design uses the
 //      force variant instead);
 //   2. `force_delete_branch` removes an existing (forked) branch — the orphan
 //      case, where a `tree/{branch}/` exists;
-//   3. `force_delete_branch` on a *fully-absent* branch (no tree dir) still
-//      errors on the local store, because `remove_dir_all`'s NotFound is not
-//      caught for Lance's native error variant. `TableStore::force_delete_branch`
-//      wraps this to be fully idempotent. Pin the raw quirk so a future Lance
-//      fix (which would let us simplify the wrapper) is noticed.
+//   3. `force_delete_branch` on a *fully-absent* branch (no tree dir) is
+//      idempotent. Beta.18 maps object-store absence to Lance `NotFound`, and
+//      branch cleanup now treats that as success. Pin the positive contract;
+//   4. a clone-only zombie (branch dataset present, BranchContents absent)
+//      blocks raw create and is reclaimed by `force_delete_branch`. Lance's
+//      create is explicitly two-phase, so this is the crash state OmniGraph's
+//      native branch-control wrapper must heal before retrying;
+//   5. a live slash-name path-child makes force delete remove an ancestor's
+//      BranchContents but intentionally retain its dataset files. OmniGraph's
+//      prefix-disjoint live-name invariant prevents this false-success shape.
+//   6. a tag targeting a named branch does not retain `tree/{branch}`. RFC-025
+//      must therefore refuse graph-branch deletion while checkpoint authority
+//      names that branch; the Lance tag alone is not a deletion fence.
 
 #[tokio::test]
 async fn force_delete_branch_semantics() {
@@ -365,115 +1091,487 @@ async fn force_delete_branch_semantics() {
 
     // (2) force_delete_branch removes an existing (forked) branch.
     let base = ds.version().version;
-    ds.create_branch("feature", base, None).await.unwrap();
+    let feature = ds.create_branch("feature", base, None).await.unwrap();
+    let feature_version = feature.version().version;
+    let branch_delete_tag = concat!(
+        "ogcp_v1_01J00000000000000000000000_t_",
+        "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+    );
+    ds.tags()
+        .create(branch_delete_tag, ("feature", feature_version))
+        .await
+        .expect("the RFC-025 deterministic internal spelling must be a valid Lance tag");
     ds.force_delete_branch("feature").await.unwrap();
     assert!(
         !ds.list_branches().await.unwrap().contains_key("feature"),
         "force_delete_branch should remove an existing branch ref"
     );
-
-    // (3) Quirk: force_delete on a fully-absent branch errors on the local
-    // store (worked around by TableStore::force_delete_branch).
     assert!(
-        ds.force_delete_branch("never").await.is_err(),
-        "force_delete_branch on a fully-absent branch no longer errors — \
-         TableStore::force_delete_branch's NotFound tolerance can be simplified."
+        !std::path::Path::new(uri)
+            .join("tree")
+            .join("feature")
+            .exists(),
+        "a tag targeting a named branch must not retain its physical branch tree"
+    );
+    assert_eq!(
+        ds.tags().get(branch_delete_tag).await.unwrap().version,
+        feature_version,
+        "branch deletion must not be mistaken for tag deletion"
+    );
+    assert!(
+        ds.checkout_version(branch_delete_tag).await.is_err(),
+        "the surviving tag must not make a deleted branch version readable; \
+         OmniGraph's checkpoint-aware branch-delete guard is load-bearing"
+    );
+    ds.tags().delete(branch_delete_tag).await.unwrap();
+
+    // (3) Force delete is idempotent even when both the ref and tree are absent.
+    ds.force_delete_branch("never").await.unwrap();
+
+    // (4) Exact phase-1-only create state: create the shallow-cloned branch
+    // dataset, then remove only its authoritative BranchContents ref. This is
+    // the same fixture Lance's own dataset-versioning test uses for a zombie.
+    ds.create_branch("zombie", base, None).await.unwrap();
+    std::fs::remove_file(
+        std::path::Path::new(uri)
+            .join("_refs")
+            .join("branches")
+            .join("zombie.json"),
+    )
+    .unwrap();
+    assert!(
+        !ds.list_branches().await.unwrap().contains_key("zombie"),
+        "BranchContents is the authority; the clone-only tree must not list as a branch"
+    );
+    assert!(
+        ds.create_branch("zombie", base, None).await.is_err(),
+        "the clone-only tree should block an unclassified raw create"
+    );
+    ds.force_delete_branch("zombie").await.unwrap();
+    assert!(
+        !std::path::Path::new(uri)
+            .join("tree")
+            .join("zombie")
+            .exists(),
+        "force_delete_branch must reclaim the clone-only tree"
+    );
+
+    // (5) Slash-separated names overlap physically. A path-child created from
+    // main is not a lineage descendant of its lexical ancestor, so raw force
+    // delete removes the ancestor ref but deliberately leaves its dataset
+    // files to avoid recursively deleting the child.
+    ds.create_branch("ancestor/child", base, None)
+        .await
+        .unwrap();
+    ds.create_branch("ancestor", base, None).await.unwrap();
+    ds.force_delete_branch("ancestor").await.unwrap();
+    assert!(
+        !ds.list_branches().await.unwrap().contains_key("ancestor"),
+        "raw force delete still removes authoritative ancestor metadata"
+    );
+    assert!(
+        std::path::Path::new(uri)
+            .join("tree")
+            .join("ancestor")
+            .join("_versions")
+            .exists(),
+        "Lance must retain ancestor dataset files while a physical path-child is live"
+    );
+}
+
+// --- Guard 9b: RFC-025 tag targets and sparse cleanup protection -----------
+//
+// This is deliberately a substrate-only activation gate: it writes no
+// OmniGraph checkpoint rows and changes no graph format. It pins the Lance
+// facts RFC-025 would consume:
+//   * the proposed deterministic `ogcp_v1_...` spellings are valid tag names;
+//   * exact main and named-branch targets remain distinct even at overlapping
+//     numeric versions;
+//   * a sparse tagged old version survives cleanup while adjacent eligible
+//     versions are reclaimed; and
+//   * deleting the tag makes that last old version reclaimable.
+#[tokio::test]
+async fn native_tags_pin_exact_main_and_named_branch_versions_through_cleanup() {
+    const MAIN_TAG: &str = concat!(
+        "ogcp_v1_01J00000000000000000000000_m_",
+        "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+    );
+    const TABLE_TAG: &str = concat!(
+        "ogcp_v1_01J00000000000000000000000_t_",
+        "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("guard9b.lance");
+    let uri = uri.to_str().unwrap();
+    let mut main = fresh_dataset(uri).await;
+
+    let main_v1 = main.version().version;
+    append_guard_row(&mut main, "main-only", 10).await;
+    let main_v2 = main.version().version;
+    assert_eq!(
+        main_v2,
+        main_v1 + 1,
+        "the main fixture must have two versions"
+    );
+
+    // Fork from main v1 after main has advanced. The branch deliberately
+    // reuses numeric v1 so the tag's branch component is load-bearing.
+    let mut feature = main
+        .create_branch("checkpoint-feature", main_v1, None)
+        .await
+        .unwrap();
+    let feature_v1 = feature.version().version;
+    assert_eq!(feature_v1, main_v1);
+    append_guard_row(&mut feature, "feature-v2", 20).await;
+    let feature_v2 = feature.version().version;
+    append_guard_row(&mut feature, "feature-v3", 30).await;
+    let feature_v3 = feature.version().version;
+    append_guard_row(&mut feature, "feature-v4", 40).await;
+    let feature_v4 = feature.version().version;
+    assert_eq!((feature_v2, feature_v3, feature_v4), (2, 3, 4));
+
+    let main_head_before_tags = main.version().version;
+    let feature_head_before_tags = feature.version().version;
+    main.tags()
+        .create(MAIN_TAG, (None::<&str>, Some(main_v1)))
+        .await
+        .expect("RFC-025's deterministic manifest-tag spelling must be accepted");
+    main.tags()
+        .create(TABLE_TAG, ("checkpoint-feature", feature_v2))
+        .await
+        .expect("RFC-025's deterministic table-tag spelling must be accepted");
+
+    let main_contents = main.tags().get(MAIN_TAG).await.unwrap();
+    assert_eq!(main_contents.branch, None);
+    assert_eq!(main_contents.version, main_v1);
+    let table_contents = main.tags().get(TABLE_TAG).await.unwrap();
+    assert_eq!(table_contents.branch.as_deref(), Some("checkpoint-feature"));
+    assert_eq!(table_contents.version, feature_v2);
+    assert_eq!(
+        main.version().version,
+        main_head_before_tags,
+        "tag creation is auxiliary metadata and must not advance main"
+    );
+    assert_eq!(
+        feature.version().version,
+        feature_head_before_tags,
+        "tag creation is auxiliary metadata and must not advance the named branch"
+    );
+
+    let tagged_main = main.checkout_version(MAIN_TAG).await.unwrap();
+    assert_eq!(tagged_main.version().version, main_v1);
+    assert_eq!(tagged_main.count_rows(None).await.unwrap(), 2);
+    let tagged_feature = main.checkout_version(TABLE_TAG).await.unwrap();
+    assert_eq!(tagged_feature.version().version, feature_v2);
+    assert_eq!(tagged_feature.count_rows(None).await.unwrap(), 3);
+
+    let cleanup_policy = CleanupPolicy {
+        before_version: Some(feature_v4),
+        error_if_tagged_old_versions: false,
+        ..Default::default()
+    };
+    let removed = cleanup_old_versions(&feature, cleanup_policy.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        removed.old_versions, 2,
+        "branch v1 and v3 are eligible and untagged; sparse tagged v2 must survive"
+    );
+    assert!(feature.checkout_version(feature_v1).await.is_err());
+    assert!(feature.checkout_version(feature_v3).await.is_err());
+    assert!(feature.checkout_version(feature_v2).await.is_ok());
+    assert!(feature.checkout_version(feature_v4).await.is_ok());
+    assert!(
+        main.checkout_version(MAIN_TAG).await.is_ok(),
+        "branch cleanup must not confuse an overlapping main-version tag with a branch tag"
+    );
+
+    main.tags().delete(TABLE_TAG).await.unwrap();
+    let removed = cleanup_old_versions(&feature, cleanup_policy)
+        .await
+        .unwrap();
+    assert_eq!(
+        removed.old_versions, 1,
+        "deleting the tag must make the formerly pinned branch v2 reclaimable"
+    );
+    assert!(feature.checkout_version(feature_v2).await.is_err());
+    assert!(
+        main.checkout_version(MAIN_TAG).await.is_ok(),
+        "deleting one deterministic tag must not disturb a different checkpoint target"
     );
 }
 
 // --- Guard 10: blob-column compaction works in this Lance ------------------
 //
-// Historical: through Lance 7.0.0, `compact_files` forced
-// `BlobHandling::AllBinary` and the blob-v2 struct decoder mis-counted columns,
-// failing even a pristine uniform-V2_2 multi-fragment blob table; `optimize`
-// skipped blob-bearing tables behind `LANCE_SUPPORTS_BLOB_COMPACTION = false`.
-// Lance 8.0.0 shipped full blob-v2 compaction (upstream PR #7017; hardened by
-// #7618 in 9.0.0-beta.15 after a beta.13 regression), so the gate, the skip
-// branch, and the `BlobColumnsUnsupportedByLance` skip reason were removed at
-// the 9.0.0-beta.15 bump. This guard pins the POSITIVE behavior `optimize` now
-// relies on: a multi-fragment blob table compacts, preserving every row. If it
-// turns red on a future bump, blob compaction regressed — restore the skip
-// machinery from git history.
+// Historical: Lance 8 fixed the first blob-v2 compaction failure, but Lance 9
+// still misclassified a valid empty inline blob at the start of a fragment as
+// null during compaction (lance#7965); the blob-v1 form could also damage a
+// neighbouring payload. Lance 10 fixes that defect and makes the planned blob
+// selectors total: every requested stable row id produces one result, null is
+// `None`, and valid empty is `Some(empty)`. This is the exact positive guard for
+// the Lance 10 prerequisite. A future Lance bump that turns it red is blocked;
+// if that bump must proceed, it must carry an upstream fix or a tested
+// per-table compaction skip in the same change.
 
 #[tokio::test]
 async fn compact_files_succeeds_on_blob_columns() {
-    use arrow_array::{LargeBinaryArray, StructArray};
+    use arrow_array::types::{Int32Type, UInt64Type};
 
-    fn blob_batch(start: i32, n: i32) -> RecordBatch {
-        let ids: Vec<String> = (start..start + n).map(|i| format!("n{i}")).collect();
-        let data =
-            LargeBinaryArray::from_iter_values((start..start + n).map(|i| format!("blob{i}")));
-        let blob_uri = StringArray::from(vec![None::<&str>; n as usize]);
-        let DataType::Struct(fields) = lance::blob::blob_field("content", true).data_type().clone()
-        else {
-            unreachable!("blob_field is always a Struct");
-        };
-        let content = StructArray::new(
-            fields,
-            vec![Arc::new(data) as _, Arc::new(blob_uri) as _],
-            None,
+    async fn assert_exact_blob_contract(
+        dataset: &Arc<Dataset>,
+        expected: &[(i32, Option<Vec<u8>>)],
+    ) -> Vec<u64> {
+        let mut scanner = dataset.scan();
+        scanner.with_row_id();
+        scanner.blob_handling(BlobHandling::AllBinary);
+        let batch = scanner
+            .project(&["id", "content"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_primitive::<Int32Type>();
+        let contents = batch.column_by_name("content").unwrap().as_binary::<i64>();
+        let row_ids = batch
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_primitive::<UInt64Type>()
+            .values()
+            .to_vec();
+
+        let arrow_values = (0..batch.num_rows())
+            .map(|row| {
+                (
+                    ids.value(row),
+                    contents.is_valid(row).then(|| contents.value(row).to_vec()),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            arrow_values, expected,
+            "AllBinary scan must preserve null validity, valid empty, and exact neighbouring bytes"
         );
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Utf8, false),
-            lance::blob::blob_field("content", true),
-        ]));
-        RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(StringArray::from(ids)) as _,
-                Arc::new(content) as _,
-            ],
-        )
-        .unwrap()
+        assert!(contents.is_null(1), "the null blob must remain Arrow-null");
+        assert!(
+            contents.is_valid(2) && contents.value(2).is_empty(),
+            "the valid empty blob must remain non-null"
+        );
+
+        // Deliberately request row 3 twice and scramble the order. Every
+        // selection API below must preserve both request order and duplicates.
+        let request_order = [3_usize, 2, 3, 1, 0];
+        let requested_row_ids = request_order
+            .iter()
+            .map(|&index| row_ids[index])
+            .collect::<Vec<_>>();
+        let requested_values = request_order
+            .iter()
+            .map(|&index| &expected[index].1)
+            .collect::<Vec<_>>();
+        let planned = dataset
+            .read_blobs("content")
+            .unwrap()
+            .with_row_ids(requested_row_ids.clone())
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(
+            planned.len(),
+            requested_values.len(),
+            "read_blobs must return one result per stable-row-id selection"
+        );
+        for (actual, expected_bytes) in planned.iter().zip(&requested_values) {
+            assert_eq!(
+                actual.data.as_deref(),
+                expected_bytes.as_deref(),
+                "read_blobs must preserve order/duplicates and distinguish null from valid empty"
+            );
+        }
+
+        let files = dataset
+            .take_blobs(&requested_row_ids, "content")
+            .await
+            .unwrap();
+        assert_eq!(
+            files.len(),
+            requested_values.len(),
+            "take_blobs must return one result per stable-row-id selection"
+        );
+        for (actual, expected_bytes) in files.iter().zip(&requested_values) {
+            match (actual, *expected_bytes) {
+                (None, None) => {}
+                (Some(file), Some(expected_bytes)) => {
+                    assert_eq!(file.size(), expected_bytes.len() as u64);
+                    assert_eq!(file.read().await.unwrap().as_ref(), expected_bytes);
+                }
+                _ => panic!(
+                    "take_blobs must preserve order/duplicates and distinguish null from valid empty"
+                ),
+            }
+        }
+
+        let requests = [
+            BlobRangeRequest::new(row_ids[3], 0, 4),
+            BlobRangeRequest::new(row_ids[2], 0, 0),
+            BlobRangeRequest::new(row_ids[3], 4, 4),
+            // Blob-local bounds are not evaluated for null values.
+            BlobRangeRequest::new(row_ids[1], 128, 64),
+        ];
+        let ranges = dataset
+            .read_blob_ranges("content")
+            .unwrap()
+            .with_row_ids(requests)
+            .execute()
+            .await
+            .unwrap();
+        let expected_ranges: [Option<&[u8]>; 4] = [
+            Some(&expected[3].1.as_ref().unwrap()[..4]),
+            Some(&[]),
+            Some(&expected[3].1.as_ref().unwrap()[4..8]),
+            None,
+        ];
+        assert_eq!(ranges.len(), expected_ranges.len());
+        for (request_index, (actual, expected_bytes)) in
+            ranges.iter().zip(expected_ranges).enumerate()
+        {
+            assert_eq!(actual.request_index, request_index);
+            assert_eq!(actual.data.as_deref(), expected_bytes);
+        }
+
+        row_ids
     }
 
-    async fn write(uri: &str, batch: RecordBatch, mode: WriteMode) {
-        let schema = batch.schema();
-        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
-        // Blob v2 requires file version >= 2.2; without the pin the *write*
-        // would fail with a different error, masking the guard's intent.
-        let params = WriteParams {
-            mode,
-            enable_stable_row_ids: true,
-            data_storage_version: Some(LanceFileVersion::V2_2),
-            ..Default::default()
-        };
-        Dataset::write(reader, uri, Some(params)).await.unwrap();
+    async fn assert_stable_row_id_failure(
+        dataset: &Arc<Dataset>,
+        valid_row_id: u64,
+        rejected_row_id: u64,
+        case: &str,
+    ) {
+        let row_ids = [valid_row_id, rejected_row_id, valid_row_id];
+        let error = dataset
+            .take_blobs(&row_ids, "content")
+            .await
+            .expect_err("take_blobs must reject the complete selection");
+        assert!(
+            matches!(error, lance::Error::InvalidInput { .. }),
+            "take_blobs {case} stable row id must be a typed InvalidInput, got {error:?}"
+        );
+
+        let error = dataset
+            .read_blobs("content")
+            .unwrap()
+            .with_row_ids(row_ids)
+            .execute()
+            .await
+            .expect_err("read_blobs must reject the complete selection");
+        assert!(
+            matches!(error, lance::Error::InvalidInput { .. }),
+            "read_blobs {case} stable row id must be a typed InvalidInput, got {error:?}"
+        );
+
+        let requests = row_ids.map(|row_id| BlobRangeRequest::new(row_id, 0, 0));
+        let error = dataset
+            .read_blob_ranges("content")
+            .unwrap()
+            .with_row_ids(requests)
+            .execute()
+            .await
+            .expect_err("read_blob_ranges must reject the complete selection");
+        assert!(
+            matches!(error, lance::Error::InvalidInput { .. }),
+            "read_blob_ranges {case} stable row id must be a typed InvalidInput, got {error:?}"
+        );
     }
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().join("guard10-blob.lance");
     let uri = uri.to_str().unwrap();
 
-    // Uniform V2_2, two fragments → forces compaction to actually rewrite.
-    write(uri, blob_batch(0, 2), WriteMode::Create).await;
-    write(uri, blob_batch(100, 2), WriteMode::Append).await;
-
-    let mut ds = Dataset::open(uri).await.unwrap();
-    assert!(
-        ds.get_fragments().len() >= 2,
-        "guard needs a multi-fragment table to trigger a real compaction rewrite"
+    let expected = vec![
+        (0, Some(vec![b'0'; 80])),
+        (1, None),
+        // `max_rows_per_file = 2`: valid empty leads the second fragment.
+        (2, Some(Vec::new())),
+        (3, Some(vec![b'3'; 80])),
+        (4, Some(vec![b'4'; 80])),
+        (5, Some(vec![b'5'; 80])),
+    ];
+    let mut content = BlobArrayBuilder::new(expected.len());
+    for (_, value) in &expected {
+        match value {
+            Some(value) => content.push_bytes(value).unwrap(),
+            None => content.push_null().unwrap(),
+        }
+    }
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        lance::blob::blob_field("content", true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(0..expected.len() as i32)),
+            content.finish().unwrap(),
+        ],
+    )
+    .unwrap();
+    let mut ds = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        uri,
+        Some(WriteParams {
+            mode: WriteMode::Create,
+            enable_stable_row_ids: true,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        ds.get_fragments().len(),
+        3,
+        "guard requires the empty blob to lead the second of three fragments"
     );
 
-    let rows_before = ds.count_rows(None).await.unwrap();
+    let row_ids_before = assert_exact_blob_contract(&Arc::new(ds.clone()), &expected).await;
     let metrics = compact_files(&mut ds, CompactionOptions::default(), None)
         .await
         .expect(
-            "compact_files FAILED on a blob table — the Lance blob-v2 compaction \
-             fix (present since 8.0.0, hardened by lance#7618) regressed. If this \
-             is a Lance downgrade, restore the pre-9 blob-skip branch in \
-             db/omnigraph/optimize.rs (see git history + docs/dev/lance.md).",
+            "compact_files failed the Lance 10 null/empty blob prerequisite; block the \
+             dependency bump unless it carries an upstream fix or a tested compaction skip",
         );
     assert!(
-        metrics.fragments_removed >= 2 && metrics.fragments_added >= 1,
+        metrics.fragments_removed >= 3 && metrics.fragments_added >= 1,
         "expected a real rewrite of the multi-fragment blob table, got {metrics:?}"
     );
-    let ds = Dataset::open(uri).await.unwrap();
     assert_eq!(
-        ds.count_rows(None).await.unwrap(),
-        rows_before,
-        "compaction must preserve every blob row"
+        ds.get_fragments().len(),
+        1,
+        "compaction must coalesce the three-fragment reproducer"
     );
+    let compacted = Arc::new(ds.clone());
+    let row_ids_after = assert_exact_blob_contract(&compacted, &expected).await;
+    assert_eq!(
+        row_ids_after, row_ids_before,
+        "compaction must preserve stable row ids as well as blob values"
+    );
+    assert_stable_row_id_failure(&compacted, row_ids_after[0], u64::MAX, "unknown").await;
+
+    let deleted_row_id = row_ids_after[4];
+    let deleted = ds.delete("id = 4").await.unwrap();
+    assert_eq!(deleted.num_deleted_rows, 1);
+    assert_stable_row_id_failure(
+        &deleted.new_dataset,
+        row_ids_after[0],
+        deleted_row_id,
+        "deleted",
+    )
+    .await;
 }
 
 // --- Guard 11: scalar-index coverage surface (physical_rows + index details) ---
@@ -515,6 +1613,251 @@ async fn _compile_scalar_index_coverage_surface() -> lance::Result<()> {
         let _covered: Option<bool> = index.fragment_bitmap.as_ref().map(|b| b.contains(0u32));
     }
     Ok(())
+}
+
+// --- CDC C0 guards: exact-end deltas and production row-version shape -------
+//
+// Lance's explicit delta range controls the version-column predicate, but the
+// row images are scanned from the `Dataset` handle used to build the delta. A
+// historical interval therefore needs a handle checked out at its exact end:
+// asking a later HEAD for the same interval can lose a row that changed again.
+// Keep this regression beside the other Lance surface probes so a dependency
+// bump cannot silently invalidate RFC-030's candidate-pruning contract.
+
+#[tokio::test]
+async fn dataset_delta_historical_images_require_the_exact_end_handle() {
+    async fn commit_alice_value(dataset: Dataset, value: i32) -> Dataset {
+        let batch = pk_full_row(&dataset, "alice", value);
+        let staged = stage_pk_merge(
+            Arc::new(dataset.clone()),
+            batch,
+            "id",
+            WhenMatched::UpdateAll,
+            WhenNotMatched::InsertAll,
+            Some(false),
+        )
+        .await;
+        CommitBuilder::new(Arc::new(dataset))
+            .with_skip_auto_cleanup(true)
+            .execute(staged.transaction)
+            .await
+            .expect("the guard update must commit")
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("cdc-exact-end-delta.lance");
+    let initial = fresh_pk_dataset(uri.to_str().unwrap()).await;
+    let begin_version = initial.version().version;
+
+    let exact_end = commit_alice_value(initial, 20).await;
+    let end_version = exact_end.version().version;
+    assert_eq!(
+        end_version,
+        begin_version + 1,
+        "the exact-end fixture needs one adjacent update"
+    );
+
+    let current_head = commit_alice_value(exact_end.clone(), 30).await;
+    assert_eq!(
+        current_head.version().version,
+        end_version + 1,
+        "the negative control needs the same row updated after the selected end"
+    );
+
+    let exact_delta = exact_end
+        .delta()
+        .with_begin_version(begin_version)
+        .with_end_version(end_version)
+        .build()
+        .unwrap();
+    let exact_batches: Vec<RecordBatch> = exact_delta
+        .get_updated_rows()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let exact_rows = exact_batches
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum::<usize>();
+    assert_eq!(
+        exact_rows, 1,
+        "the exact-end delta must retain the one row changed in the interval"
+    );
+    let exact_batch = exact_batches
+        .iter()
+        .find(|batch| batch.num_rows() == 1)
+        .expect("the one changed row must be materialized");
+    let exact_ids = exact_batch["id"]
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let exact_values = exact_batch["value"]
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    let exact_updated_versions = exact_batch[ROW_LAST_UPDATED_AT_VERSION]
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+    assert_eq!(exact_ids.value(0), "alice");
+    assert_eq!(
+        exact_values.value(0),
+        20,
+        "the delta must return the image at the selected end, not a later image"
+    );
+    assert_eq!(exact_updated_versions.value(0), end_version);
+
+    let stale_interval_on_head = current_head
+        .delta()
+        .with_begin_version(begin_version)
+        .with_end_version(end_version)
+        .build()
+        .unwrap();
+    let head_batches: Vec<RecordBatch> = stale_interval_on_head
+        .get_updated_rows()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        head_batches
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>(),
+        0,
+        "pinned Lance scans row images from the builder's handle: a later HEAD is \
+         not a valid source for an older interval whose row changed again; RFC-030 \
+         must check out the exact end version before constructing DatasetDelta"
+    );
+}
+
+#[tokio::test]
+async fn omnigraph_graph_tables_enable_stable_row_ids_and_version_columns() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let snapshot = snapshot_main(&db).await.unwrap();
+    let entries = snapshot
+        .entries()
+        .map(|entry| {
+            (
+                entry.table_key.clone(),
+                entry.table_path.clone(),
+                entry.table_version,
+                entry.table_branch.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        entries.len(),
+        4,
+        "the shared fixture must exercise every declared node and edge table"
+    );
+
+    for (table_key, table_path, table_version, table_branch) in entries {
+        let table_uri = dir.path().join(table_path);
+        let head = open_dataset_head(table_uri.to_str().unwrap(), table_branch.as_deref()).await;
+        let table = if head.version().version == table_version {
+            head
+        } else {
+            head.checkout_version(table_version).await.unwrap()
+        };
+
+        assert!(
+            table.manifest().uses_stable_row_ids(),
+            "OmniGraph-created graph table {table_key} must keep Lance stable row IDs enabled"
+        );
+
+        let selected_version = table.version().version;
+        let mut scanner = table.scan();
+        scanner
+            .project(&[
+                "id",
+                ROW_ID,
+                ROW_CREATED_AT_VERSION,
+                ROW_LAST_UPDATED_AT_VERSION,
+            ])
+            .expect("stable row-id and row-version columns must be projectable");
+        let batches: Vec<RecordBatch> = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let row_count = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+        assert_ne!(
+            row_count, 0,
+            "the shared loaded fixture must contain rows in {table_key}"
+        );
+
+        let mut row_ids = HashSet::new();
+        for batch in &batches {
+            let ids = batch[ROW_ID]
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .expect("_rowid must retain Lance's UInt64 surface");
+            let created = batch[ROW_CREATED_AT_VERSION]
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .expect("_row_created_at_version must retain Lance's UInt64 surface");
+            let updated = batch[ROW_LAST_UPDATED_AT_VERSION]
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .expect("_row_last_updated_at_version must retain Lance's UInt64 surface");
+            assert_eq!(
+                ids.null_count(),
+                0,
+                "live {table_key} rows need concrete stable row IDs"
+            );
+            assert_eq!(
+                created.null_count(),
+                0,
+                "live {table_key} rows need a creation version"
+            );
+            assert_eq!(
+                updated.null_count(),
+                0,
+                "live {table_key} rows need an update version"
+            );
+            for row in 0..batch.num_rows() {
+                assert!(
+                    row_ids.insert(ids.value(row)),
+                    "stable row IDs must be unique within {table_key}"
+                );
+                assert!(created.value(row) <= updated.value(row));
+                assert!(updated.value(row) <= selected_version);
+            }
+        }
+
+        let version_predicate = format!(
+            "{ROW_CREATED_AT_VERSION} <= {ROW_LAST_UPDATED_AT_VERSION} AND \
+             {ROW_LAST_UPDATED_AT_VERSION} <= {selected_version}"
+        );
+        let mut predicate_probe = table.scan();
+        predicate_probe
+            .project(&["id"])
+            .expect("the predicate probe must project a logical column");
+        predicate_probe
+            .filter(&version_predicate)
+            .expect("row-version columns must be usable in a scan predicate");
+        let filtered_rows = predicate_probe
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_fold(
+                0usize,
+                |rows, batch| async move { Ok(rows + batch.num_rows()) },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            filtered_rows, row_count,
+            "the row-version predicate must retain every validated live row in {table_key}"
+        );
+    }
 }
 
 // --- Guard 12: can a scalar BTREE be built on a system version column? --------
@@ -711,6 +2054,260 @@ async fn value_index_uncovered_count(ds: &Dataset) -> usize {
     // No `value` index found — treat as fully uncovered so a missing index
     // is never mistaken for full coverage.
     frag_ids.len()
+}
+
+/// Create the deterministic flat-vector shape shared by the two Lance 10
+/// regressions below.  The vector for logical row `i` is `[i, 0, ...]`, so an
+/// exact L2 search from the origin has one unambiguous result order.  Keeping
+/// construction here avoids two copies of the raw Lance fixture while still
+/// letting each guard choose the fragment shape that triggers its own bug.
+async fn linear_vector_dataset(
+    uri: &str,
+    rows: usize,
+    dimension: usize,
+    rows_per_fragment: usize,
+) -> Dataset {
+    use arrow_array::{FixedSizeListArray, Float32Array};
+
+    let item = Arc::new(Field::new("item", DataType::Float32, true));
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new(
+            "vector",
+            DataType::FixedSizeList(item.clone(), dimension as i32),
+            false,
+        ),
+    ]));
+    let mut vector_values = vec![0.0_f32; rows * dimension];
+    for (row, vector) in vector_values.chunks_exact_mut(dimension).enumerate() {
+        vector[0] = row as f32;
+    }
+    let vectors = FixedSizeListArray::new(
+        item,
+        dimension as i32,
+        Arc::new(Float32Array::from(vector_values)),
+        None,
+    );
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(0..rows as i32)),
+            Arc::new(vectors),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    Dataset::write(
+        reader,
+        uri,
+        Some(WriteParams {
+            mode: WriteMode::Create,
+            enable_stable_row_ids: true,
+            max_rows_per_file: rows_per_fragment,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap()
+}
+
+// --- Lance 10 regression: stable IDs stay aligned through IVF reshuffle ----
+//
+// lance#7704 fixed `filter_deleted_ids` returning an ID list longer than its
+// address list on stable-row-ID datasets.  The deterministic upstream split
+// reproducer is load-bearing here: one 20K-row IVF_FLAT partition, a scattered
+// delete, then `optimize_indices`.  The partition is large enough that optimize
+// must split/reshuffle it, which is the path that calls the fixed helper.  On
+// Lance 9 this fails before publication; merely asserting success would still
+// miss a future ID/address permutation, so the indexed result is checked all
+// the way back to logical IDs, stable IDs, and physical addresses.
+
+#[tokio::test]
+async fn vector_optimize_after_delete_keeps_stable_ids_and_addresses_aligned() {
+    use arrow_array::types::{Float32Type, Int32Type, UInt64Type};
+    use datafusion::physical_plan::displayable;
+    use lance::index::vector::VectorIndexParams;
+    use lance_linalg::distance::MetricType;
+
+    const ROWS: usize = 20_000;
+    const DIMENSION: usize = 32;
+    const INDEX_NAME: &str = "vector_idx";
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("stable_id_vector_optimize.lance");
+    let uri = uri.to_str().unwrap();
+    let mut dataset = linear_vector_dataset(uri, ROWS, DIMENSION, ROWS).await;
+
+    let params = VectorIndexParams::ivf_flat(1, MetricType::L2);
+    dataset
+        .create_index_builder(&["vector"], IndexType::Vector, &params)
+        .name(INDEX_NAME.to_string())
+        .replace(true)
+        .await
+        .unwrap();
+
+    let deleted = dataset.delete("id % 5 = 0").await.unwrap();
+    assert_eq!(deleted.num_deleted_rows, (ROWS / 5) as u64);
+    let mut dataset = (*deleted.new_dataset).clone();
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+
+    let stats: serde_json::Value = serde_json::from_str(
+        &dataset
+            .index_statistics(INDEX_NAME)
+            .await
+            .expect("the optimized IVF_FLAT index must expose statistics"),
+    )
+    .unwrap();
+    let partition_count = stats["indices"][0]["num_partitions"]
+        .as_u64()
+        .expect("IVF statistics must expose num_partitions") as usize;
+    assert!(
+        partition_count > 1,
+        "the guard must exercise the split/reshuffle path fixed by lance#7704; stats: {stats}"
+    );
+
+    let expected_ids = (0..ROWS as i32)
+        .filter(|id| id % 5 != 0)
+        .collect::<Vec<_>>();
+    let query = arrow_array::Float32Array::from(vec![0.0_f32; DIMENSION]);
+    let mut scanner = dataset.scan();
+    scanner
+        .nearest("vector", &query, expected_ids.len())
+        .unwrap();
+    scanner.nprobes(partition_count);
+    scanner.target_parallelism(1);
+    scanner.with_row_id().with_row_address();
+
+    let plan = scanner.create_plan().await.unwrap();
+    let plan = format!("{}", displayable(plan.as_ref()).indent(true));
+    assert!(
+        plan.contains("ANNIvfPartition"),
+        "the alignment check must read through the optimized vector index, got:\n{plan}"
+    );
+
+    let batch = scanner.try_into_batch().await.unwrap();
+    assert_eq!(batch.num_rows(), expected_ids.len());
+    let ids = batch["id"].as_primitive::<Int32Type>();
+    let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+    let row_addresses = batch[ROW_ADDR].as_primitive::<UInt64Type>();
+    let distances = batch["_distance"].as_primitive::<Float32Type>();
+    for (position, expected_id) in expected_ids.iter().copied().enumerate() {
+        assert_eq!(ids.value(position), expected_id, "logical ID at {position}");
+        assert_eq!(
+            row_ids.value(position),
+            expected_id as u64,
+            "stable row ID must stay paired with logical ID {expected_id}"
+        );
+        assert_eq!(
+            row_addresses.value(position),
+            expected_id as u64,
+            "single-fragment physical address must stay paired with stable ID {expected_id}"
+        );
+    }
+    for pair in distances.values().windows(2) {
+        assert!(
+            pair[0] <= pair[1],
+            "indexed results must remain globally distance-ordered: {} before {}",
+            pair[0],
+            pair[1]
+        );
+    }
+}
+
+// --- Lance 10 compatibility: fence late-hydrated KNN ordering --------------
+//
+// lance#7868 makes execute_plan preserve order when the plan still advertises
+// its sorted KNN candidate stream. An ordinary projected payload adds a late
+// `LanceRead` that drops that metadata in Lance 10, so the parallel final
+// coalesce can still scramble large-k results. OmniGraph temporarily requests
+// one output partition for nearest scans. This full-payload stable-row-ID guard
+// pins both the residual and the fence's exact globally ordered result.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn flat_knn_late_payload_order_is_fenced_to_one_output_partition() {
+    use arrow_array::types::{Float32Type, Int32Type};
+    use datafusion::physical_plan::ExecutionPlanProperties;
+
+    const DIMENSION: usize = 16;
+    const FRAGMENTS: usize = 4;
+    const ROWS_PER_FRAGMENT: usize = 5_000;
+    const K: usize = 8_193;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("flat_knn_global_order.lance");
+    let uri = uri.to_str().unwrap();
+    let dataset = linear_vector_dataset(
+        uri,
+        FRAGMENTS * ROWS_PER_FRAGMENT,
+        DIMENSION,
+        ROWS_PER_FRAGMENT,
+    )
+    .await;
+    assert_eq!(
+        dataset.fragments().len(),
+        FRAGMENTS,
+        "the guard needs four independently scheduled scan partitions"
+    );
+    let query = arrow_array::Float32Array::from(vec![0.0_f32; DIMENSION]);
+
+    let mut unfenced = dataset.scan();
+    unfenced.nearest("vector", &query, K).unwrap();
+    unfenced.use_index(false);
+    unfenced.target_parallelism(8);
+    let unfenced_plan = unfenced.create_plan().await.unwrap();
+    assert!(
+        unfenced_plan.properties().partitioning.partition_count() > 1,
+        "the compatibility tripwire must exercise parallel late hydration"
+    );
+    assert!(
+        unfenced_plan.output_ordering().is_none(),
+        "Lance now preserves KNN ordering through late payload hydration; remove the \
+         target_parallelism(1) compatibility fence and replace this residual assertion"
+    );
+
+    let mut fenced_plan_scanner = dataset.scan();
+    fenced_plan_scanner.nearest("vector", &query, K).unwrap();
+    fenced_plan_scanner.use_index(false);
+    fenced_plan_scanner.target_parallelism(1);
+    let fenced_plan = fenced_plan_scanner.create_plan().await.unwrap();
+    assert_eq!(
+        fenced_plan.properties().partitioning.partition_count(),
+        1,
+        "the compatibility fence must leave no scheduling-ordered final coalesce"
+    );
+
+    // Keep repeated execution even behind the fence: a future optimizer may
+    // silently reintroduce partitions above the plan node asserted above.
+    for iteration in 0..10 {
+        let mut scanner = dataset.scan();
+        scanner.nearest("vector", &query, K).unwrap();
+        scanner.use_index(false);
+        scanner.target_parallelism(1);
+        let batch = scanner.try_into_batch().await.unwrap();
+        assert_eq!(batch.num_rows(), K, "iteration {iteration}");
+
+        let ids = batch["id"].as_primitive::<Int32Type>();
+        for position in 0..K {
+            assert_eq!(
+                ids.value(position),
+                position as i32,
+                "flat KNN lost exact global order at result {position}, iteration {iteration}"
+            );
+        }
+        let distances = batch["_distance"].as_primitive::<Float32Type>();
+        for pair in distances.values().windows(2) {
+            assert!(
+                pair[0] <= pair[1],
+                "flat KNN results must be globally sorted at iteration {iteration}: {} before {}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
 }
 
 // --- Guard 16: scalar index use requires a literal matching the column type ---
@@ -1071,6 +2668,500 @@ async fn unenforced_primary_key_is_immutable_once_set() {
     );
 }
 
+// --- Guard 19b: pinned Lance merge_insert PK-filter shape ------------------
+//
+// RFC-023 can rely on Lance's key-conflict fencing only when every keyed
+// insert produces an `Operation::Update.inserted_rows_filter`. On the pinned
+// Lance revision that
+// is a route-dependent contract: the v2 plan emits a filter when the ordered
+// ON field ids exactly match the unenforced PK, while the scalar-index v1 path
+// and non-PK ON shapes emit `None`. A matched-only v2 update still emits
+// `Some(empty Bloom)`, which is important because `Some` selects the strict
+// conflict-resolver branch even though this attempt inserted no key.
+#[tokio::test]
+async fn unenforced_pk_filter_shape_is_route_dependent() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("rfc023_filter_v2.lance");
+    let dataset = Arc::new(fresh_pk_dataset(uri.to_str().unwrap()).await);
+    let id_field_id = dataset.schema().field("id").unwrap().id;
+
+    // Exact PK ON + forced non-index plan: a real insert produces a populated
+    // Bloom filter over exactly the PK field id.
+    let upsert = stage_pk_merge(
+        dataset.clone(),
+        pk_full_row(dataset.as_ref(), "fresh-upsert", 10),
+        "id",
+        WhenMatched::UpdateAll,
+        WhenNotMatched::InsertAll,
+        Some(false),
+    )
+    .await;
+    assert_eq!(upsert.stats.num_inserted_rows, 1);
+    assert_eq!(upsert.stats.num_updated_rows, 0);
+    let filter = staged_inserted_rows_filter(&upsert)
+        .expect("exact PK v2 upsert must carry a key-existence filter");
+    assert_eq!(filter.field_ids, vec![id_field_id]);
+    assert_bloom_empty(filter, false, "exact-PK upsert");
+
+    // Strict insert uses the same filter-bearing v2 route. The source
+    // key must be fresh: `WhenMatched::Fail` correctly errors during staging
+    // if the key already exists.
+    let strict_create = stage_pk_merge(
+        dataset.clone(),
+        pk_full_row(dataset.as_ref(), "fresh-strict", 11),
+        "id",
+        WhenMatched::Fail,
+        WhenNotMatched::InsertAll,
+        Some(false),
+    )
+    .await;
+    let filter = staged_inserted_rows_filter(&strict_create)
+        .expect("strict create on the PK must retain the key-existence filter");
+    assert_eq!(filter.field_ids, vec![id_field_id]);
+    assert_bloom_empty(filter, false, "strict PK create");
+
+    // A valid but non-PK ON column still uses v2 when indices are disabled,
+    // yet it must not claim PK conflict coverage.
+    let mismatched_on = stage_pk_merge(
+        dataset.clone(),
+        pk_full_row(dataset.as_ref(), "fresh-non-pk", 12),
+        "value",
+        WhenMatched::UpdateAll,
+        WhenNotMatched::InsertAll,
+        Some(false),
+    )
+    .await;
+    assert!(
+        staged_inserted_rows_filter(&mismatched_on).is_none(),
+        "v2 merge on a non-PK field must not emit a PK filter"
+    );
+
+    // Matched-only partial-schema v2 update: no Insert action touches the
+    // filter builder, but pinned Lance deliberately retains `Some(empty Bloom)`.
+    let partial_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("value", DataType::Int32, false),
+    ]));
+    let partial_batch = RecordBatch::try_new(
+        partial_schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["alice"])),
+            Arc::new(Int32Array::from(vec![42])),
+        ],
+    )
+    .unwrap();
+    let matched_only = stage_pk_merge(
+        dataset,
+        partial_batch,
+        "id",
+        WhenMatched::UpdateAll,
+        WhenNotMatched::DoNothing,
+        Some(false),
+    )
+    .await;
+    assert_eq!(matched_only.stats.num_updated_rows, 1);
+    assert_eq!(matched_only.stats.num_inserted_rows, 0);
+    let filter = staged_inserted_rows_filter(&matched_only)
+        .expect("matched-only PK v2 update must emit Some(empty filter)");
+    assert_eq!(filter.field_ids, vec![id_field_id]);
+    assert_bloom_empty(filter, true, "matched-only partial-schema PK update");
+
+    // With a scalar index on every ON column and the default `use_index=true`,
+    // pinned Lance selects v1. That route hardcodes `inserted_rows_filter=None`.
+    let indexed_uri = dir.path().join("rfc023_filter_indexed_v1.lance");
+    let mut indexed = fresh_pk_dataset(indexed_uri.to_str().unwrap()).await;
+    indexed
+        .create_index_builder(&["id"], IndexType::BTree, &ScalarIndexParams::default())
+        .replace(true)
+        .await
+        .unwrap();
+    let indexed = Arc::new(indexed);
+    let indexed_route = stage_pk_merge(
+        indexed.clone(),
+        pk_full_row(indexed.as_ref(), "fresh-indexed", 13),
+        "id",
+        WhenMatched::UpdateAll,
+        WhenNotMatched::InsertAll,
+        None, // preserve MergeInsertBuilder's default use_index=true
+    )
+    .await;
+    assert!(
+        staged_inserted_rows_filter(&indexed_route).is_none(),
+        "the pinned Lance all-keys-indexed v1 route must remain visibly unfenced"
+    );
+}
+
+/// The indexed v1 matched-only route is safe for OmniGraph's update-only merge
+/// adapter only if it leaves rewritten fragments outside every stale index's
+/// coverage. A future Lance change that over-claims those fragments could
+/// silently return stale indexed values.
+#[tokio::test]
+async fn indexed_update_only_route_leaves_rewritten_fragments_uncovered() {
+    use arrow_array::types::Int32Type;
+    use arrow_array::{FixedSizeListArray, Float32Array, ListArray};
+    use lance::index::vector::VectorIndexParams;
+    use lance_index::scalar::InvertedIndexParams;
+    use lance_linalg::distance::MetricType;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("indexed-update-coverage.lance");
+    let vector_item = Arc::new(Field::new("item", DataType::Float32, true));
+    let list_item = Arc::new(Field::new("item", DataType::Int32, true));
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false).with_metadata(
+            [(LANCE_UNENFORCED_PRIMARY_KEY.to_string(), "true".to_string())]
+                .into_iter()
+                .collect(),
+        ),
+        Field::new("text", DataType::Utf8, false),
+        Field::new("score", DataType::Int32, false),
+        Field::new("tags", DataType::List(list_item), true),
+        Field::new(
+            "embedding",
+            DataType::FixedSizeList(vector_item.clone(), 8),
+            false,
+        ),
+    ]));
+    let row_count = 256_usize;
+    let ids = (0..row_count)
+        .map(|row| {
+            if row == 0 {
+                "alice".to_string()
+            } else {
+                format!("row-{row}")
+            }
+        })
+        .collect::<Vec<_>>();
+    let texts = (0..row_count)
+        .map(|row| format!("searchable document {row}"))
+        .collect::<Vec<_>>();
+    let tags = ListArray::from_iter_primitive::<Int32Type, _, _>(
+        (0..row_count).map(|row| Some(vec![Some(row as i32), Some(row as i32 + 1)])),
+    );
+    let vectors = FixedSizeListArray::try_new(
+        vector_item.clone(),
+        8,
+        Arc::new(Float32Array::from(
+            (0..row_count * 8)
+                .map(|value| value as f32)
+                .collect::<Vec<_>>(),
+        )),
+        None,
+    )
+    .unwrap();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(ids)),
+            Arc::new(StringArray::from(texts)),
+            Arc::new(Int32Array::from((0..row_count as i32).collect::<Vec<_>>())),
+            Arc::new(tags),
+            Arc::new(vectors),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    let mut dataset = Dataset::write(
+        reader,
+        uri.to_str().unwrap(),
+        Some(WriteParams {
+            mode: WriteMode::Create,
+            enable_stable_row_ids: true,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index_builder(&["id"], IndexType::BTree, &ScalarIndexParams::default())
+        .replace(true)
+        .await
+        .unwrap();
+    dataset
+        .create_index_builder(
+            &["text"],
+            IndexType::Inverted,
+            &InvertedIndexParams::default(),
+        )
+        .replace(true)
+        .await
+        .unwrap();
+    dataset
+        .create_index_builder(
+            &["embedding"],
+            IndexType::Vector,
+            &VectorIndexParams::ivf_flat(1, MetricType::L2),
+        )
+        .replace(true)
+        .await
+        .unwrap();
+    let dataset = Arc::new(dataset);
+    let top_level_fields = dataset
+        .schema()
+        .fields
+        .iter()
+        .map(|field| field.id as u32)
+        .collect::<Vec<_>>();
+    assert!(
+        dataset.schema().fields_pre_order().count() > top_level_fields.len(),
+        "list property must contribute a nested field id"
+    );
+    let indices_before = dataset.load_indices().await.unwrap();
+    assert_eq!(indices_before.len(), 3);
+    for index in indices_before.iter() {
+        assert!(
+            index
+                .fields
+                .iter()
+                .all(|field_id| top_level_fields.contains(&(*field_id as u32))),
+            "index '{}' unexpectedly targets nested fields {:?}",
+            index.name,
+            index.fields
+        );
+    }
+    let old_fragments = dataset
+        .get_fragments()
+        .iter()
+        .map(|fragment| fragment.id() as u64)
+        .collect::<HashSet<_>>();
+
+    let update_tags =
+        ListArray::from_iter_primitive::<Int32Type, _, _>([Some(vec![Some(7), Some(8)])]);
+    let update_vectors = FixedSizeListArray::try_new(
+        vector_item,
+        8,
+        Arc::new(Float32Array::from(
+            (0..8)
+                .map(|value| 10_000.0 + value as f32)
+                .collect::<Vec<_>>(),
+        )),
+        None,
+    )
+    .unwrap();
+    let update_batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec!["alice"])),
+            Arc::new(StringArray::from(vec!["updated searchable document"])),
+            Arc::new(Int32Array::from(vec![999])),
+            Arc::new(update_tags),
+            Arc::new(update_vectors),
+        ],
+    )
+    .unwrap();
+    let staged = stage_pk_merge(
+        dataset.clone(),
+        update_batch,
+        "id",
+        WhenMatched::UpdateAll,
+        WhenNotMatched::DoNothing,
+        None,
+    )
+    .await;
+    assert_eq!(staged.stats.num_inserted_rows, 0);
+    assert_eq!(staged.stats.num_updated_rows, 1);
+    assert!(staged.inserted_rows_filter.is_none(), "fixture must use v1");
+    assert!(staged.affected_rows.is_some());
+    let Operation::Update {
+        fields_for_preserving_frag_bitmap,
+        update_mode,
+        ..
+    } = &staged.transaction.operation
+    else {
+        panic!("indexed update-only route must stage Operation::Update");
+    };
+    assert_eq!(fields_for_preserving_frag_bitmap, &top_level_fields);
+    assert_eq!(
+        update_mode,
+        &Some(lance::dataset::transaction::UpdateMode::RewriteRows)
+    );
+
+    let mut commit = CommitBuilder::new(dataset.clone());
+    if let Some(affected_rows) = staged.affected_rows {
+        commit = commit.with_affected_rows(affected_rows);
+    }
+    let committed = commit.execute(staged.transaction).await.unwrap();
+    let new_fragments = committed
+        .get_fragments()
+        .iter()
+        .map(|fragment| fragment.id() as u64)
+        .filter(|fragment_id| !old_fragments.contains(fragment_id))
+        .collect::<Vec<_>>();
+    assert!(!new_fragments.is_empty());
+    let indices = committed.load_indices().await.unwrap();
+    assert_eq!(
+        indices.len(),
+        3,
+        "fixture must exercise BTREE, FTS, and vector index coverage together"
+    );
+    for index in indices.iter() {
+        assert!(
+            index
+                .fragment_bitmap
+                .as_ref()
+                .is_none_or(|bitmap| new_fragments
+                    .iter()
+                    .all(|fragment_id| !bitmap.contains(*fragment_id as u32))),
+            "index '{}' falsely claimed rewritten fragments {new_fragments:?}",
+            index.name
+        );
+    }
+}
+
+// --- Guard 19c: pinned Lance key-filter conflicts are directional ----------
+//
+// Lance evaluates compatibility from the transaction currently being rebased
+// against the transaction already committed. Pinned Lance is deliberately strict
+// for `filtered current / unfiltered committed`, but the reverse order is
+// accepted. RFC-023 must not assume a symmetric conflict matrix until the
+// upstream resolver actually supplies one.
+#[tokio::test]
+async fn unenforced_pk_conflict_matrix_is_directional() {
+    struct Case {
+        name: &'static str,
+        committed: ConflictMatrixTxn,
+        current: ConflictMatrixTxn,
+        current_succeeds: bool,
+        assert_disjoint_filters: bool,
+    }
+
+    let cases = [
+        Case {
+            name: "same-key filtered current / filtered committed",
+            committed: ConflictMatrixTxn::Filtered {
+                id: "same-fresh-key",
+                value: 10,
+            },
+            current: ConflictMatrixTxn::Filtered {
+                id: "same-fresh-key",
+                value: 11,
+            },
+            current_succeeds: false,
+            assert_disjoint_filters: false,
+        },
+        Case {
+            name: "disjoint filtered current / filtered committed",
+            committed: ConflictMatrixTxn::Filtered {
+                id: "left-fresh-key",
+                value: 10,
+            },
+            current: ConflictMatrixTxn::Filtered {
+                id: "right-fresh-key",
+                value: 11,
+            },
+            current_succeeds: true,
+            assert_disjoint_filters: true,
+        },
+        Case {
+            name: "filtered current / unfiltered Update committed",
+            committed: ConflictMatrixTxn::UnfilteredUpdate {
+                id: "same-mixed-update-key",
+                value: 10,
+            },
+            current: ConflictMatrixTxn::Filtered {
+                id: "same-mixed-update-key",
+                value: 11,
+            },
+            current_succeeds: false,
+            assert_disjoint_filters: false,
+        },
+        Case {
+            name: "unfiltered Update current / filtered committed",
+            committed: ConflictMatrixTxn::Filtered {
+                id: "same-mixed-update-key",
+                value: 10,
+            },
+            current: ConflictMatrixTxn::UnfilteredUpdate {
+                id: "same-mixed-update-key",
+                value: 11,
+            },
+            current_succeeds: true,
+            assert_disjoint_filters: false,
+        },
+        Case {
+            name: "filtered current / Append committed",
+            committed: ConflictMatrixTxn::Append {
+                id: "same-mixed-append-key",
+                value: 10,
+            },
+            current: ConflictMatrixTxn::Filtered {
+                id: "same-mixed-append-key",
+                value: 11,
+            },
+            current_succeeds: false,
+            assert_disjoint_filters: false,
+        },
+        Case {
+            name: "Append current / filtered Update committed",
+            committed: ConflictMatrixTxn::Filtered {
+                id: "same-mixed-append-key",
+                value: 10,
+            },
+            current: ConflictMatrixTxn::Append {
+                id: "same-mixed-append-key",
+                value: 11,
+            },
+            current_succeeds: true,
+            assert_disjoint_filters: false,
+        },
+    ];
+
+    let dir = tempfile::tempdir().unwrap();
+    for (case_index, case) in cases.into_iter().enumerate() {
+        let uri = dir
+            .path()
+            .join(format!("rfc023_conflict_{case_index}.lance"));
+        let base = Arc::new(fresh_pk_dataset(uri.to_str().unwrap()).await);
+
+        // Stage both operations from the exact same stale base. Staging the
+        // second after the first commit would avoid the rebase this guard owns.
+        let committed_tx = stage_conflict_matrix_txn(base.clone(), case.committed).await;
+        let current_tx = stage_conflict_matrix_txn(base.clone(), case.current).await;
+
+        if case.assert_disjoint_filters {
+            let committed_filter = transaction_inserted_rows_filter(&committed_tx).unwrap();
+            let current_filter = transaction_inserted_rows_filter(&current_tx).unwrap();
+            assert_eq!(
+                committed_filter.intersects(current_filter).unwrap(),
+                (false, false),
+                "{}: chosen Bloom-filter fixtures must be definitively disjoint",
+                case.name
+            );
+        }
+
+        CommitBuilder::new(base.clone())
+            .with_max_retries(0)
+            .execute(committed_tx)
+            .await
+            .unwrap_or_else(|error| panic!("{}: first commit failed: {error}", case.name));
+
+        // This is the raw commit/rebase result. `MergeInsertJob::execute`
+        // wraps an exhausted semantic retry as TooMuchWriteContention; the
+        // substrate contract exposed here is RetryableCommitConflict.
+        let current_result = CommitBuilder::new(base)
+            .with_max_retries(0)
+            .execute(current_tx)
+            .await;
+        if case.current_succeeds {
+            assert!(
+                current_result.is_ok(),
+                "{}: pinned Lance should accept this direction, got {current_result:?}",
+                case.name
+            );
+        } else {
+            assert!(
+                matches!(
+                    &current_result,
+                    Err(lance::Error::RetryableCommitConflict { .. })
+                ),
+                "{}: expected pinned Lance RetryableCommitConflict, got {current_result:?}",
+                case.name
+            );
+        }
+    }
+}
+
 // --- Guard 20: camelCase @index equality routes to the scalar index (#283) ----
 //
 // The #283 read-pushdown fix builds the filter column with datafusion `ident()`
@@ -1153,8 +3244,8 @@ async fn camelcase_index_equality_routes_to_scalar_index() {
 }
 
 // --- Guard: filtered scans tolerate merge_insert's overlapping row-id ranges
-//     (lance#7444, fixed by lance#7480; consumed via the vendored lance-table
-//     patch) -------------------------------------------------------------
+//     (lance#7444, fixed upstream by lance#7480 and shipped since Lance 9)
+//     --------------------------------------------------------------------
 //
 // An update-style merge_insert over a fragment that was itself merge-written
 // reuses the updated rows' stable row ids in its rewritten fragments (row-id
@@ -1166,8 +3257,7 @@ async fn camelcase_index_equality_routes_to_scalar_index() {
 // debug assert, "all columns in a record batch must have the same length" (or
 // a silently-wrong batch) in release. Faithful transcription of lance#7444's
 // minimal repro: merge-seed → merge-update → delete → filter + with_row_id.
-// This guard turns red if a Lance bump regresses the fix, or if the vendored
-// patch is dropped before the pinned lance-table ships lance#7480.
+// This guard turns red if a future Lance bump regresses the upstream fix.
 #[tokio::test]
 async fn filtered_scan_tolerates_merge_update_row_id_overlap() {
     use futures::TryStreamExt;
@@ -1255,5 +3345,448 @@ async fn filtered_scan_tolerates_merge_update_row_id_overlap() {
             .unwrap();
         let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(rows, expected, "filtered read for {slug}");
+    }
+}
+
+// --- Guard 21: starts_with routes to the BTREE (LikePrefix) and stays literal --
+//
+// The .gq `starts_with` predicate lowers to the DataFusion `starts_with`
+// scalar function pushed via `Scanner::filter_expr`. Lance's scalar-index
+// expression parser rewrites it to `SargableQuery::LikePrefix`, answered
+// exactly by a covering BTREE (range [prefix, next_prefix), unicode-safe
+// successor, no recheck). Two load-bearing behaviors are pinned:
+//
+//   1. The plan uses the scalar index (a result-only assertion would also
+//      pass on a silent full-scan fallback).
+//   2. The prefix is treated LITERALLY: `_`/`%` in the needle are plain
+//      bytes, never LIKE metacharacters ("a_b" must not match "axb").
+#[tokio::test]
+async fn starts_with_filter_routes_to_btree_and_is_literal() {
+    use datafusion::functions::expr_fn::starts_with;
+    use datafusion::physical_plan::displayable;
+    use datafusion::prelude::{ident, lit};
+    use futures::TryStreamExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("guard21.lance");
+    let uri = uri.to_str().unwrap();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["1", "2", "3", "4", "5"])),
+            Arc::new(StringArray::from(vec![
+                Some("alice"),
+                Some("alps"),
+                Some("a_b"),
+                Some("axb"),
+                None,
+            ])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let params = WriteParams {
+        mode: WriteMode::Create,
+        enable_stable_row_ids: true,
+        data_storage_version: Some(LanceFileVersion::V2_2),
+        ..Default::default()
+    };
+    let mut ds = Dataset::write(reader, uri, Some(params)).await.unwrap();
+    ds.create_index_builder(&["name"], IndexType::BTree, &ScalarIndexParams::default())
+        .replace(true)
+        .await
+        .unwrap();
+
+    async fn ids_for(ds: &Dataset, filter: datafusion::prelude::Expr) -> Vec<String> {
+        let mut scanner = ds.scan();
+        scanner.filter_expr(filter);
+        let batches: Vec<RecordBatch> = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut ids: Vec<String> = Vec::new();
+        for b in &batches {
+            let col = b
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for i in 0..col.len() {
+                ids.push(col.value(i).to_string());
+            }
+        }
+        ids.sort();
+        ids
+    }
+
+    // Plan shape: the starts_with function expr must reach the scalar index.
+    let mut scanner = ds.scan();
+    scanner.filter_expr(starts_with(ident("name"), lit("al")));
+    let plan = scanner.create_plan().await.unwrap();
+    let plan_str = format!("{}", displayable(plan.as_ref()).indent(true));
+    assert!(
+        plan_str.contains("ScalarIndexQuery"),
+        "starts_with on a BTREE'd column must plan a scalar-index probe \
+         (LikePrefix); a red here means the Lance expression parser no longer \
+         maps the DataFusion `starts_with` function. plan:\n{plan_str}"
+    );
+
+    // Exact prefix semantics, NULL excluded.
+    assert_eq!(
+        ids_for(&ds, starts_with(ident("name"), lit("al"))).await,
+        vec!["1", "2"],
+        "prefix 'al' must match alice+alps only (never the NULL row)"
+    );
+    // Literal treatment of LIKE metacharacters: 'a_' matches only 'a_b'.
+    assert_eq!(
+        ids_for(&ds, starts_with(ident("name"), lit("a_"))).await,
+        vec!["3"],
+        "starts_with must treat '_' as a literal byte, not a LIKE wildcard \
+         ('a_' must not match 'axb')"
+    );
+}
+
+// --- Guard 22: contains routes to an NGRAM index and rechecks to exact results --
+//
+// The .gq String `contains` predicate lowers to the DataFusion `contains`
+// scalar function. With an NGRAM index on the column, Lance's expression
+// parser maps it to `TextQuery::StringContains` — an inexact (AtMost)
+// trigram-intersection probe followed by an automatic recheck, so final
+// results are exact. Pins: NGram index creation through the same
+// `create_index_builder` surface the engine uses, the plan probing the
+// index, exact substring semantics across token boundaries, and the
+// below-trigram-width needle (< 3 chars) degrading to a correct recheck-all
+// rather than an error or a wrong result.
+#[tokio::test]
+async fn contains_filter_routes_to_ngram_index_and_rechecks_exactly() {
+    use datafusion::functions::expr_fn::contains;
+    use datafusion::physical_plan::displayable;
+    use datafusion::prelude::{ident, lit};
+    use futures::TryStreamExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("guard22.lance");
+    let uri = uri.to_str().unwrap();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("text", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["1", "2", "3", "4"])),
+            Arc::new(StringArray::from(vec![
+                Some("this ramen recipe simmers"),
+                Some("the beta ray shines"),
+                Some("nothing here"),
+                None,
+            ])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let params = WriteParams {
+        mode: WriteMode::Create,
+        enable_stable_row_ids: true,
+        data_storage_version: Some(LanceFileVersion::V2_2),
+        ..Default::default()
+    };
+    let mut ds = Dataset::write(reader, uri, Some(params)).await.unwrap();
+    ds.create_index_builder(&["text"], IndexType::NGram, &ScalarIndexParams::default())
+        .replace(true)
+        .await
+        .unwrap();
+
+    async fn ids_for(ds: &Dataset, filter: datafusion::prelude::Expr) -> Vec<String> {
+        let mut scanner = ds.scan();
+        scanner.filter_expr(filter);
+        let batches: Vec<RecordBatch> = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut ids: Vec<String> = Vec::new();
+        for b in &batches {
+            let col = b
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for i in 0..col.len() {
+                ids.push(col.value(i).to_string());
+            }
+        }
+        ids.sort();
+        ids
+    }
+
+    // Plan shape: the contains function expr must reach the NGRAM index.
+    let mut scanner = ds.scan();
+    scanner.filter_expr(contains(ident("text"), lit("ramen")));
+    let plan = scanner.create_plan().await.unwrap();
+    let plan_str = format!("{}", displayable(plan.as_ref()).indent(true));
+    assert!(
+        plan_str.contains("ScalarIndexQuery"),
+        "contains on an NGRAM'd column must plan a scalar-index probe \
+         (StringContains); a red here means the Lance expression parser no \
+         longer maps the DataFusion `contains` function. plan:\n{plan_str}"
+    );
+
+    // Exact substring semantics (recheck applied), NULL excluded.
+    assert_eq!(
+        ids_for(&ds, contains(ident("text"), lit("ramen"))).await,
+        vec!["1"]
+    );
+    // Substring crossing a token boundary — substring, not FTS token match.
+    assert_eq!(
+        ids_for(&ds, contains(ident("text"), lit("ta ray"))).await,
+        vec!["2"]
+    );
+    // KNOWN UPSTREAM BUG (pinned; lance-format/lance#7841; re-confirmed on Lance
+    // 9.0.0 stable + DataFusion 54): a needle below the trigram width (3)
+    // should degrade to a recheck-everything scan — the NGram index returns
+    // an `at_least(empty)` lower bound for it — but the scan planner treats
+    // the empty probe as authoritative and returns ZERO rows: silent row
+    // loss, not an error. Both rows here contain "ra" (the unindexed scan
+    // path returns them, proven by the in-memory-arm tests), so a red on
+    // this assertion means Lance FIXED sub-trigram containment: flip it to
+    // expect ["1", "2"] and lift the sub-trigram caveat before shipping the
+    // NGRAM `@index` kind — .gq String `contains` must never silently drop
+    // rows on short needles.
+    assert_eq!(
+        ids_for(&ds, contains(ident("text"), lit("ra"))).await,
+        Vec::<String>::new(),
+        "sub-trigram contains on an NGRAM'd column currently drops all rows \
+         (upstream bug); a non-empty result means Lance fixed it — update \
+         this guard and the NGRAM rollout caveat"
+    );
+}
+
+// --- Guard 23: a second index on a column requires an explicit distinct name ---
+//
+// Lance derives the default index name `{column}_idx` and `.replace(true)`
+// removes existing indexes BY NAME. So an unnamed second-index build on an
+// already-indexed column either replaces the first index or refuses — it
+// never yields two coexisting indexes. The engine therefore MUST pass an
+// explicit `.name(...)` whenever it adds a second index kind to one column
+// (dual BTREE beside FTS; opt-in NGRAM). Pins both halves: distinctly-named
+// indexes of different types coexist, and the unnamed path never silently
+// coexists. If Lance changes its naming/replace semantics, this turns red —
+// re-validate the engine's index-naming strategy in stage_create_indices.
+#[tokio::test]
+async fn second_index_on_column_requires_explicit_distinct_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("guard23.lance");
+    let uri = uri.to_str().unwrap();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("text", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["1", "2"])),
+            Arc::new(StringArray::from(vec!["hello world", "beta ray"])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let params = WriteParams {
+        mode: WriteMode::Create,
+        enable_stable_row_ids: true,
+        data_storage_version: Some(LanceFileVersion::V2_2),
+        ..Default::default()
+    };
+    let mut ds = Dataset::write(reader, uri, Some(params)).await.unwrap();
+
+    fn type_urls(indices: &[lance_table::format::IndexMetadata]) -> Vec<String> {
+        let mut v: Vec<String> = indices
+            .iter()
+            .filter_map(|m| m.index_details.as_ref().map(|d| d.type_url.clone()))
+            .collect();
+        v.sort();
+        v.dedup();
+        v
+    }
+
+    // Baseline: an unnamed FTS build lands under the default `text_idx` name.
+    ds.create_index_builder(
+        &["text"],
+        IndexType::Inverted,
+        &lance_index::scalar::InvertedIndexParams::default(),
+    )
+    .replace(true)
+    .await
+    .unwrap();
+    let after_fts = ds.load_indices().await.unwrap();
+    assert_eq!(after_fts.len(), 1);
+    assert_eq!(after_fts[0].name, "text_idx");
+
+    // The trap: an unnamed BTREE build on the same column must never leave
+    // BOTH indexes standing (today it replaces the FTS under the shared
+    // default name; an error would also satisfy the pin).
+    let unnamed = ds
+        .create_index_builder(&["text"], IndexType::BTree, &ScalarIndexParams::default())
+        .replace(true)
+        .await;
+    ds.checkout_latest().await.unwrap();
+    let after_unnamed = ds.load_indices().await.unwrap();
+    let distinct_types = type_urls(&after_unnamed).len();
+    assert!(
+        unnamed.is_err() || distinct_types == 1,
+        "an unnamed second-index build must replace or refuse, never coexist \
+         (got {} indexes with types {:?}) — if Lance now auto-uniquifies \
+         same-field names, re-validate the engine's explicit-naming strategy",
+        after_unnamed.len(),
+        type_urls(&after_unnamed),
+    );
+
+    // The contract the engine relies on: an explicitly-named second index of a
+    // different type coexists with the first.
+    ds.create_index_builder(
+        &["text"],
+        IndexType::Inverted,
+        &lance_index::scalar::InvertedIndexParams::default(),
+    )
+    .replace(true)
+    .await
+    .unwrap();
+    ds.create_index_builder(&["text"], IndexType::BTree, &ScalarIndexParams::default())
+        .name("text_btree_idx".to_string())
+        .replace(true)
+        .await
+        .unwrap();
+    ds.checkout_latest().await.unwrap();
+    let after_named = ds.load_indices().await.unwrap();
+    let names: Vec<&str> = {
+        let mut n: Vec<&str> = after_named.iter().map(|m| m.name.as_str()).collect();
+        n.sort();
+        n
+    };
+    assert_eq!(
+        names,
+        vec!["text_btree_idx", "text_idx"],
+        "distinctly-named indexes of different types must coexist on one column"
+    );
+    assert_eq!(
+        type_urls(&after_named).len(),
+        2,
+        "expected two distinct index types on the column, got {:?}",
+        type_urls(&after_named)
+    );
+}
+
+// --- Guard 24: second-generation shallow-clone index reads fail upstream ------
+//
+// Upstream tracking: lance-format/lance#7840. Re-confirmed still present on
+// Lance 9.0.0 stable (this guard passes on 9.0.0), so the free-text companion
+// BTREE stays deferred.
+//
+// PURE-LANCE repro of the fork-lineage index bug (no omnigraph code): a
+// dataset's index files are recorded via `base_paths` redirects when a branch
+// is shallow-cloned, but cloning a CLONE records the redirect against the
+// immediate source tree instead of composing the source's own redirect to
+// where the files actually live. Every index-consuming read through the
+// second-generation branch then hard-errors with `Not found:
+// …/tree/<parent>/_indices/…` instead of degrading.
+//
+// Omnigraph hits this whenever a branch-of-a-branch materializes its own
+// table fork (e.g. a fast-forward `branch_merge` into a non-main target) and
+// a query then probes ANY index — BTREE equality, FTS `search`. It is the
+// reason the free-text companion BTREE (equality/prefix acceleration) is
+// deferred: it would widen the exposure to every `@key` equality lookup.
+//
+// This guard asserts the BUG (like the former blob-compaction guard): it
+// turns RED when a Lance bump fixes second-generation clone index reads —
+// then (1) delete this guard, (2) re-land the companion-BTREE dispatch
+// (`plan_index_work_node`) with its tests, and (3) re-check
+// `branch_merge_into_non_main_target_works` against the dual-index truth.
+#[tokio::test]
+async fn second_generation_branch_index_reads_fail_upstream() {
+    use futures::TryStreamExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("guard24.lance");
+    let uri = uri.to_str().unwrap();
+
+    // Base dataset with a BTREE on `value` (the exact index-build call shape
+    // the engine uses).
+    let mut ds = fresh_dataset(uri).await;
+    ds.create_index_builder(&["value"], IndexType::BTree, &ScalarIndexParams::default())
+        .replace(true)
+        .await
+        .unwrap();
+
+    // First-generation branch (the engine's fork call shape), plus a write so
+    // the branch has its own commits.
+    let version = ds.version().version;
+    let mut feature = ds.create_branch("feature", version, None).await.unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("value", DataType::Int32, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["carol"])),
+            Arc::new(Int32Array::from(vec![3])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    feature.append(reader, None).await.unwrap();
+
+    // An indexed read through the FIRST-generation branch works: the clone's
+    // base-path redirect resolves the index files in the root tree.
+    async fn indexed_rows(ds: &Dataset) -> lance::Result<usize> {
+        let mut scanner = ds.scan();
+        scanner.filter("value = 1").unwrap();
+        let batches: Vec<RecordBatch> = scanner.try_into_stream().await?.try_collect().await?;
+        Ok(batches.iter().map(|b| b.num_rows()).sum())
+    }
+    assert_eq!(
+        indexed_rows(&feature).await.unwrap(),
+        1,
+        "first-generation clone must resolve parent index files"
+    );
+
+    // Second-generation branch: clone the clone.
+    let feature_version = feature.version().version;
+    let experiment = feature
+        .create_branch("experiment", feature_version, None)
+        .await
+        .unwrap();
+
+    // The indexed read through the second-generation clone currently fails
+    // with a Not-found on `tree/feature/_indices/...` — the redirect points at
+    // the immediate source tree, where the index files never lived.
+    let result = indexed_rows(&experiment).await;
+    match result {
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("Not found") && msg.contains("_indices"),
+                "expected the known index-file Not-found failure, got: {msg}"
+            );
+        }
+        Ok(n) => panic!(
+            "second-generation clone indexed read SUCCEEDED ({n} rows) — Lance fixed \
+             clone-of-clone index base paths. Delete this guard, re-land the free-text \
+             companion BTREE dispatch, and re-validate the branch-merge topology tests."
+        ),
     }
 }

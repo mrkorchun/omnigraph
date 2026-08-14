@@ -1,6 +1,6 @@
 [package]
 name = "omnigraph-policy"
-version = "0.8.1"
+version = "0.10.0"
 edition = "2024"
 description = "Policy / authorization layer for Omnigraph — Cedar-backed PolicyEngine, PolicyChecker trait, ResourceScope enum."
 license = "MIT"
@@ -18,3 +18,6 @@ serde_yaml = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+[lints]
+workspace = true

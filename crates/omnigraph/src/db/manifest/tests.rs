@@ -4,6 +4,7 @@ use std::sync::Arc;
 use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
+use futures::TryStreamExt;
 use lance::dataset::builder::DatasetBuilder;
 use lance_namespace::LanceNamespace;
 use lance_namespace::models::{
@@ -12,10 +13,16 @@ use lance_namespace::models::{
 use lance_namespace_impls::DirectoryNamespaceBuilder;
 use tokio::sync::Mutex;
 
-use super::publisher::{LineageIntent, ManifestBatchPublisher, PublishOutcome};
+use super::publisher::{
+    GraphHeadExpectation, LineageIntent, ManifestBatchPublisher, PublishOutcome,
+    PublishPrecondition,
+};
+use super::state::read_publish_scan;
 use super::*;
-use omnigraph_compiler::catalog::build_catalog;
 use omnigraph_compiler::schema::parser::parse_schema;
+use omnigraph_compiler::{
+    SchemaIdentityDomain, build_catalog_from_ir, compile_schema_shape, initialize_schema_ir,
+};
 
 fn test_schema_source() -> &'static str {
     r#"
@@ -37,7 +44,96 @@ edge WorksAt: Person -> Company {
 
 fn build_test_catalog() -> Catalog {
     let schema = parse_schema(test_schema_source()).unwrap();
-    build_catalog(&schema).unwrap()
+    let shape = compile_schema_shape(&schema).unwrap();
+    let domain = SchemaIdentityDomain::parse("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap();
+    let schema_ir = initialize_schema_ir(domain, &shape).unwrap().schema_ir;
+    build_catalog_from_ir(&schema_ir).unwrap()
+}
+
+fn build_same_name_node_edge_catalog() -> Catalog {
+    let schema = parse_schema(
+        r#"
+node Link {
+    name: String @key
+}
+edge Link: Link -> Link
+"#,
+    )
+    .unwrap();
+    let shape = compile_schema_shape(&schema).unwrap();
+    let domain = SchemaIdentityDomain::parse("01ARZ3NDEKTSV4RRFFQ69G5FAW").unwrap();
+    let schema_ir = initialize_schema_ir(domain, &shape).unwrap().schema_ir;
+    build_catalog_from_ir(&schema_ir).unwrap()
+}
+
+fn entity_batch(
+    schema: Arc<Schema>,
+    id: impl Into<String>,
+    name: impl Into<String>,
+    age: Option<i32>,
+) -> RecordBatch {
+    let id = id.into();
+    let name = name.into();
+    let columns = schema
+        .fields()
+        .iter()
+        .map(|field| -> Arc<dyn arrow_array::Array> {
+            match field.name().as_str() {
+                "id" => Arc::new(StringArray::from(vec![id.clone()])),
+                "name" => Arc::new(StringArray::from(vec![name.clone()])),
+                "age" => Arc::new(Int32Array::from(vec![age])),
+                _ => arrow_array::new_null_array(field.data_type(), 1),
+            }
+        })
+        .collect();
+    RecordBatch::try_new(schema, columns).unwrap()
+}
+
+#[test]
+fn table_identity_rejects_zero_and_drives_paths_and_object_ids() {
+    assert!(TableIdentity::new(0, 1).is_err());
+    assert!(TableIdentity::new(1, 0).is_err());
+
+    let identity = TableIdentity::new(0x2a, 0x7).unwrap();
+    assert_eq!(
+        table_path_for_identity("node:Person", identity).unwrap(),
+        "nodes/000000000000002a-0000000000000007"
+    );
+    assert_eq!(
+        table_path_for_identity("edge:Knows", identity).unwrap(),
+        "edges/000000000000002a-0000000000000007"
+    );
+    assert_eq!(
+        super::layout::table_object_id(identity),
+        "table:000000000000002a:0000000000000007"
+    );
+    assert_eq!(
+        super::layout::version_object_id(identity, 3),
+        "table_version:000000000000002a:0000000000000007:00000000000000000003"
+    );
+    assert_eq!(
+        super::layout::tombstone_object_id(identity, 4),
+        "table_tombstone:000000000000002a:0000000000000007:00000000000000000004"
+    );
+}
+
+#[tokio::test]
+async fn historical_alias_binding_keeps_same_name_node_and_edge_identities_distinct() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let catalog = build_same_name_node_edge_catalog();
+    let mut snapshot = ManifestCoordinator::init(uri, &catalog)
+        .await
+        .unwrap()
+        .snapshot();
+    let node_identity = snapshot.entry("node:Link").unwrap().identity;
+    let edge_identity = snapshot.entry("edge:Link").unwrap().identity;
+    assert_ne!(node_identity, edge_identity);
+
+    snapshot.bind_catalog_aliases(&catalog).unwrap();
+
+    assert_eq!(snapshot.entry("node:Link").unwrap().identity, node_identity);
+    assert_eq!(snapshot.entry("edge:Link").unwrap().identity, edge_identity);
 }
 
 #[tokio::test]
@@ -90,21 +186,14 @@ async fn test_commit_advances_version() {
         .await
         .unwrap();
     let person_schema = Arc::new(person_ds.schema().into());
-    let person_batch = RecordBatch::try_new(
-        Arc::clone(&person_schema),
-        vec![
-            Arc::new(StringArray::from(vec!["person-1"])),
-            Arc::new(StringArray::from(vec!["Alice"])),
-            Arc::new(Int32Array::from(vec![Some(30)])),
-        ],
-    )
-    .unwrap();
+    let person_batch = entity_batch(Arc::clone(&person_schema), "person-1", "Alice", Some(30));
     let reader = RecordBatchIterator::new(vec![Ok(person_batch)], person_schema);
     person_ds.append(reader, None).await.unwrap();
     let person_version = person_ds.version().version;
 
     let new_version = mc
         .commit(&[SubTableUpdate {
+            identity: person_entry.identity,
             table_key: "node:Person".to_string(),
             table_version: person_version,
             table_branch: None,
@@ -134,7 +223,7 @@ async fn test_commit_advances_version() {
 }
 
 #[tokio::test]
-async fn test_commit_changes_can_register_new_table_and_tombstone_old_one() {
+async fn test_drop_and_same_name_readd_uses_new_identity_and_path() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let catalog = build_test_catalog();
@@ -143,8 +232,9 @@ async fn test_commit_changes_can_register_new_table_and_tombstone_old_one() {
     let before_version = mc.version();
     let person_entry = mc.snapshot().entry("node:Person").unwrap().clone();
 
-    let table_key = "node:Human".to_string();
-    let table_path = table_path_for_table_key(&table_key).unwrap();
+    let table_key = "node:Person".to_string();
+    let identity = TableIdentity::new(10_000, 1).unwrap();
+    let table_path = table_path_for_identity(&table_key, identity).unwrap();
     let dataset_uri = format!("{}/{}", uri, table_path);
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Utf8, false),
@@ -154,17 +244,20 @@ async fn test_commit_changes_can_register_new_table_and_tombstone_old_one() {
     let ds = crate::table_store::TableStore::create_empty_dataset(&dataset_uri, &schema)
         .await
         .unwrap();
-    let state = crate::table_store::TableStore::new(uri, Arc::new(lance::session::Session::default()))
-        .table_state(&dataset_uri, &ds)
-        .await
-        .unwrap();
+    let state =
+        crate::table_store::TableStore::new(uri, Arc::new(lance::session::Session::default()))
+            .table_state(&dataset_uri, &ds)
+            .await
+            .unwrap();
 
     mc.commit_changes(&[
         ManifestChange::RegisterTable(TableRegistration {
+            identity,
             table_key: table_key.clone(),
             table_path: table_path.clone(),
         }),
         ManifestChange::Update(SubTableUpdate {
+            identity,
             table_key: table_key.clone(),
             table_version: state.version,
             table_branch: None,
@@ -172,6 +265,7 @@ async fn test_commit_changes_can_register_new_table_and_tombstone_old_one() {
             version_metadata: state.version_metadata,
         }),
         ManifestChange::Tombstone(TableTombstone {
+            identity: person_entry.identity,
             table_key: "node:Person".to_string(),
             tombstone_version: person_entry.table_version + 1,
         }),
@@ -180,14 +274,94 @@ async fn test_commit_changes_can_register_new_table_and_tombstone_old_one() {
     .unwrap();
 
     let head = mc.snapshot();
-    assert!(head.entry("node:Human").is_some());
-    assert!(head.entry("node:Person").is_none());
+    let replacement = head.entry("node:Person").unwrap();
+    assert_eq!(replacement.identity, identity);
+    assert_ne!(replacement.identity, person_entry.identity);
+    assert_ne!(replacement.table_path, person_entry.table_path);
+    assert_eq!(replacement.table_version, 1);
 
     let historical = ManifestCoordinator::snapshot_at(uri, None, before_version)
         .await
         .unwrap();
-    assert!(historical.entry("node:Person").is_some());
+    let historical_person = historical.entry("node:Person").unwrap();
+    assert_eq!(historical_person.identity, person_entry.identity);
+    assert_eq!(historical_person.table_path, person_entry.table_path);
+}
+
+#[tokio::test]
+async fn metadata_only_rename_preserves_identity_path_and_table_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let catalog = build_test_catalog();
+    let mut mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
+    let before_manifest_version = mc.version();
+    let before = mc.snapshot().entry("node:Person").unwrap().clone();
+
+    // A rename into another live identity's alias is rejected before the
+    // manifest advances.
+    let collision = mc
+        .commit_changes(&[ManifestChange::RenameTable(TableRename {
+            identity: before.identity,
+            expected_table_key: "node:Person".to_string(),
+            table_key: "node:Company".to_string(),
+            table_path: before.table_path.clone(),
+        })])
+        .await
+        .expect_err("two live table identities cannot share an alias");
+    assert!(collision.to_string().contains("two live table identities"));
+    assert_eq!(
+        mc.probe_latest_version().await.unwrap(),
+        before_manifest_version
+    );
+
+    mc.commit_changes(&[ManifestChange::RenameTable(TableRename {
+        identity: before.identity,
+        expected_table_key: "node:Person".to_string(),
+        table_key: "node:Human".to_string(),
+        table_path: before.table_path.clone(),
+    })])
+    .await
+    .unwrap();
+
+    let head = mc.snapshot();
+    assert!(head.entry("node:Person").is_none());
+    let renamed = head.entry("node:Human").unwrap();
+    assert_eq!(renamed.identity, before.identity);
+    assert_eq!(renamed.table_path, before.table_path);
+    assert_eq!(renamed.table_version, before.table_version);
+    assert_eq!(renamed.row_count, before.row_count);
+
+    let stale_binding = HashMap::from([(
+        before.identity,
+        TableVersionExpectation {
+            table_key: "node:Person".to_string(),
+            table_version: before.table_version,
+        },
+    )]);
+    let stale_error = mc
+        .commit_changes_with_expected(&[], &stale_binding)
+        .await
+        .expect_err("an identity expectation with a stale alias must fail");
+    assert!(
+        matches!(
+            &stale_error,
+            OmniError::Manifest(manifest)
+                if matches!(
+                    manifest.details.as_ref(),
+                    Some(crate::error::ManifestConflictDetails::ReadSetChanged { .. })
+                )
+        ),
+        "expected a typed stale-binding error, got {stale_error:?}"
+    );
+
+    let historical = ManifestCoordinator::snapshot_at(uri, None, before_manifest_version)
+        .await
+        .unwrap();
     assert!(historical.entry("node:Human").is_none());
+    let historical_person = historical.entry("node:Person").unwrap();
+    assert_eq!(historical_person.identity, before.identity);
+    assert_eq!(historical_person.table_path, before.table_path);
+    assert_eq!(historical_person.table_version, before.table_version);
 }
 
 #[tokio::test]
@@ -202,6 +376,46 @@ async fn test_snapshot_open_sub_table() {
 
     assert_eq!(person_ds.schema().fields.len(), 3);
     assert_eq!(person_ds.count_rows(None).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn snapshot_scanner_strict_rows_survive_byte_target_override() {
+    const ROWS: usize = 10_000;
+    const BATCH_ROWS: usize = 8_192;
+
+    let dir = tempfile::tempdir().unwrap();
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(StringArray::from_iter_values(
+            (0..ROWS).map(|row| format!("row-{row:05}")),
+        ))],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new([Ok(batch)], Arc::clone(&schema));
+    let dataset = Dataset::write(reader, dir.path().to_str().unwrap(), None)
+        .await
+        .unwrap();
+    let table = SnapshotTable::new(dataset);
+    let mut scanner = table.scan();
+    scanner.batch_size(BATCH_ROWS);
+    scanner.batch_size_bytes(32 * 1024 * 1024);
+    scanner.strict_batch_size(true);
+
+    let batches = scanner
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(
+        batches
+            .iter()
+            .map(RecordBatch::num_rows)
+            .collect::<Vec<_>>(),
+        vec![BATCH_ROWS, ROWS - BATCH_ROWS]
+    );
 }
 
 #[tokio::test]
@@ -245,15 +459,7 @@ async fn test_branch_namespace_lists_and_describes_versions() {
         .await
         .unwrap();
     let person_schema = Arc::new(person_ds.schema().into());
-    let person_batch = RecordBatch::try_new(
-        Arc::clone(&person_schema),
-        vec![
-            Arc::new(StringArray::from(vec!["person-1"])),
-            Arc::new(StringArray::from(vec!["Alice"])),
-            Arc::new(Int32Array::from(vec![Some(30)])),
-        ],
-    )
-    .unwrap();
+    let person_batch = entity_batch(Arc::clone(&person_schema), "person-1", "Alice", Some(30));
     let reader = RecordBatchIterator::new(vec![Ok(person_batch)], person_schema);
     person_ds.append(reader, None).await.unwrap();
     let person_version = person_ds.version().version;
@@ -266,7 +472,7 @@ async fn test_branch_namespace_lists_and_describes_versions() {
     let request =
         version_metadata.to_create_table_version_request("node:Person", person_version, 1, None);
     namespace.create_table_version(request).await.unwrap();
-    mc.refresh().await.unwrap();
+    let _ = mc.refresh_for_live_read().await.unwrap();
 
     let versions = namespace
         .list_table_versions(ListTableVersionsRequest {
@@ -309,22 +515,11 @@ async fn test_directory_namespace_direct_publish_cannot_replace_native_omnigraph
         .await
         .unwrap();
     let person_schema = Arc::new(person_ds.schema().into());
-    let person_batch = RecordBatch::try_new(
-        Arc::clone(&person_schema),
-        vec![
-            Arc::new(StringArray::from(vec!["person-1"])),
-            Arc::new(StringArray::from(vec!["Alice"])),
-            Arc::new(Int32Array::from(vec![Some(30)])),
-        ],
-    )
-    .unwrap();
+    let person_batch = entity_batch(Arc::clone(&person_schema), "person-1", "Alice", Some(30));
     let reader = RecordBatchIterator::new(vec![Ok(person_batch)], person_schema);
     person_ds.append(reader, None).await.unwrap();
     let person_version = person_ds.version().version;
-    let version_metadata =
-        table_version_metadata_for_state(uri, &person_entry.table_path, None, person_version)
-            .await
-            .unwrap();
+    let graph_manifest_version = mc.version();
 
     let namespace = DirectoryNamespaceBuilder::new(uri)
         .manifest_enabled(true)
@@ -335,86 +530,35 @@ async fn test_directory_namespace_direct_publish_cannot_replace_native_omnigraph
         .await
         .unwrap();
 
-    // Lance 9.0.0-beta.15 realignment: `table_version_storage_enabled` was
-    // removed upstream (the `__manifest` version-storage experiment was
-    // retired, PR #7222) and dir.rs no longer eagerly rewrites PK annotations —
-    // yet the guard's thesis holds unchanged: with dir-listing disabled the
-    // native namespace still reports omnigraph's manifest-tracked tables as
-    // TableNotFound and cannot publish over the manifest. The v7 mechanism
-    // notes below are retained as history.
-    //
-    // Lance 7: the native `DirectoryNamespace` no longer recognizes omnigraph's
-    // manifest-tracked tables, so list / describe / create_table_version all
-    // return `TableNotFound`. The mechanism is *contingent on omnigraph's legacy
-    // boolean PK key*, not an unconditional v7 property: v7's namespace eagerly
-    // rewrites any `__manifest` whose `object_id` lacks the new
-    // `lance-schema:unenforced-primary-key:position` key, omnigraph declares the
-    // PK with the legacy boolean key, and v7 forbids changing a PK once set — so
-    // `ensure_manifest_table_up_to_date` errors, the namespace silently falls
-    // back to directory listing (disabled here), and `check_table_status` reports
-    // the table absent. omnigraph keeps the boolean key deliberately: Lance
-    // honors it permanently (it maps to PK position 0) and one uniform on-disk
-    // format beats a new-vs-old split, since existing graphs can't be re-keyed to
-    // the position key under that same immutability rule. The decoupling is
-    // therefore an accepted, production-irrelevant tradeoff (omnigraph never uses
-    // the native namespace — its publisher writes `__manifest` via merge_insert
-    // and its reads go through its own `LanceNamespace` impls), and it only
-    // strengthens this guard's thesis: native tooling cannot enumerate, inspect,
-    // or publish over omnigraph's tables, let alone replace the write path.
-    let assert_table_not_found = |what: &str, dbg: String| {
-        assert!(
-            dbg.contains("TableNotFound") && dbg.contains("node:Person"),
-            "{what}: expected TableNotFound for node:Person, got: {dbg}"
-        );
-    };
-    assert_table_not_found(
-        "list_table_versions",
-        format!(
-            "{:?}",
-            namespace
-                .list_table_versions(ListTableVersionsRequest {
-                    id: Some(vec!["node:Person".to_string()]),
-                    descending: Some(true),
-                    ..Default::default()
-                })
-                .await
-                .unwrap_err()
-        ),
-    );
-    assert_table_not_found(
-        "describe_table_version",
-        format!(
-            "{:?}",
-            namespace
-                .describe_table_version(DescribeTableVersionRequest {
-                    id: Some(vec!["node:Person".to_string()]),
-                    version: Some(person_version as i64),
-                    ..Default::default()
-                })
-                .await
-                .unwrap_err()
-        ),
-    );
-    assert_table_not_found(
-        "create_table_version",
-        format!(
-            "{:?}",
-            namespace
-                .create_table_version(version_metadata.to_create_table_version_request(
-                    "node:Person",
-                    person_version,
-                    1,
-                    None,
-                ))
-                .await
-                .unwrap_err()
-        ),
-    );
+    // Manifest v5 keys rows by immutable table identity, not the mutable
+    // diagnostic alias understood by DirectoryNamespace. Native per-table
+    // namespace APIs therefore cannot address OmniGraph tables by alias, much
+    // less replace the graph-wide publisher.
+    let list_error = namespace
+        .list_table_versions(ListTableVersionsRequest {
+            id: Some(vec!["node:Person".to_string()]),
+            descending: Some(true),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert!(format!("{list_error:?}").contains("TableNotFound"));
+
+    let describe_error = namespace
+        .describe_table_version(DescribeTableVersionRequest {
+            id: Some(vec!["node:Person".to_string()]),
+            version: Some(person_version as i64),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert!(format!("{describe_error:?}").contains("TableNotFound"));
 
     // omnigraph's manifest stays authoritative: refresh ignores the direct
     // `person_ds.append` above (it was never manifest-published), so the row
     // count stays 0 and the version is unchanged.
-    mc.refresh().await.unwrap();
+    let _ = mc.refresh_for_live_read().await.unwrap();
+    assert_eq!(mc.version(), graph_manifest_version);
     assert_eq!(
         mc.snapshot().entry("node:Person").unwrap().table_version,
         person_entry.table_version
@@ -443,15 +587,7 @@ async fn test_snapshot_at_reads_branch_pinned_historical_state() {
         .unwrap();
     let mut feature_ds = person_ds.checkout_branch("feature").await.unwrap();
     let person_schema = Arc::new(feature_ds.schema().into());
-    let person_batch = RecordBatch::try_new(
-        Arc::clone(&person_schema),
-        vec![
-            Arc::new(StringArray::from(vec!["person-1"])),
-            Arc::new(StringArray::from(vec!["Alice"])),
-            Arc::new(Int32Array::from(vec![Some(30)])),
-        ],
-    )
-    .unwrap();
+    let person_batch = entity_batch(Arc::clone(&person_schema), "person-1", "Alice", Some(30));
     let reader = RecordBatchIterator::new(vec![Ok(person_batch)], person_schema);
     feature_ds.append(reader, None).await.unwrap();
     let feature_version = feature_ds.version().version;
@@ -534,15 +670,7 @@ async fn test_branch_manifest_namespace_uses_entry_owner_branch_for_latest_table
         .unwrap();
     let mut feature_person_ds = person_ds.checkout_branch("feature").await.unwrap();
     let person_schema = Arc::new(feature_person_ds.schema().into());
-    let person_batch = RecordBatch::try_new(
-        Arc::clone(&person_schema),
-        vec![
-            Arc::new(StringArray::from(vec!["person-1"])),
-            Arc::new(StringArray::from(vec!["Alice"])),
-            Arc::new(Int32Array::from(vec![Some(30)])),
-        ],
-    )
-    .unwrap();
+    let person_batch = entity_batch(Arc::clone(&person_schema), "person-1", "Alice", Some(30));
     let reader = RecordBatchIterator::new(vec![Ok(person_batch)], person_schema);
     feature_person_ds.append(reader, None).await.unwrap();
     let feature_person_version = feature_person_ds.version().version;
@@ -611,7 +739,10 @@ async fn test_branch_manifest_namespace_uses_entry_owner_branch_for_latest_table
     .with_branch("feature", None)
     .load()
     .await;
-    let err = format!("{:?}", mismatched.expect_err("branch-mismatched open must fail on v9"));
+    let err = format!(
+        "{:?}",
+        mismatched.expect_err("branch-mismatched open must fail on v9")
+    );
     assert!(
         err.contains("belonging to branch"),
         "expected the v9 branch-consistency error, got: {err}"
@@ -659,15 +790,7 @@ async fn test_refresh_observes_external_publish_without_mutating_existing_snapsh
         .await
         .unwrap();
     let person_schema = Arc::new(person_ds.schema().into());
-    let person_batch = RecordBatch::try_new(
-        Arc::clone(&person_schema),
-        vec![
-            Arc::new(StringArray::from(vec!["person-1"])),
-            Arc::new(StringArray::from(vec!["Alice"])),
-            Arc::new(Int32Array::from(vec![Some(30)])),
-        ],
-    )
-    .unwrap();
+    let person_batch = entity_batch(Arc::clone(&person_schema), "person-1", "Alice", Some(30));
     let reader_batch = RecordBatchIterator::new(vec![Ok(person_batch)], person_schema);
     person_ds.append(reader_batch, None).await.unwrap();
     let person_version = person_ds.version().version;
@@ -702,7 +825,7 @@ async fn test_refresh_observes_external_publish_without_mutating_existing_snapsh
         0
     );
 
-    reader.refresh().await.unwrap();
+    let _ = reader.refresh_for_live_read().await.unwrap();
     assert!(reader.version() > manifest_version);
     assert_eq!(
         reader
@@ -731,15 +854,7 @@ async fn test_batch_create_table_versions_is_atomic_on_conflict() {
         .await
         .unwrap();
     let person_schema = Arc::new(person_ds.schema().into());
-    let person_batch = RecordBatch::try_new(
-        Arc::clone(&person_schema),
-        vec![
-            Arc::new(StringArray::from(vec!["person-1"])),
-            Arc::new(StringArray::from(vec!["Alice"])),
-            Arc::new(Int32Array::from(vec![Some(30)])),
-        ],
-    )
-    .unwrap();
+    let person_batch = entity_batch(Arc::clone(&person_schema), "person-1", "Alice", Some(30));
     let reader = RecordBatchIterator::new(vec![Ok(person_batch)], person_schema);
     person_ds.append(reader, None).await.unwrap();
     let person_version = person_ds.version().version;
@@ -808,15 +923,7 @@ async fn test_batch_create_table_versions_rejects_duplicate_requests_without_adv
         .await
         .unwrap();
     let person_schema = Arc::new(person_ds.schema().into());
-    let person_batch = RecordBatch::try_new(
-        Arc::clone(&person_schema),
-        vec![
-            Arc::new(StringArray::from(vec!["person-1"])),
-            Arc::new(StringArray::from(vec!["Alice"])),
-            Arc::new(Int32Array::from(vec![Some(30)])),
-        ],
-    )
-    .unwrap();
+    let person_batch = entity_batch(Arc::clone(&person_schema), "person-1", "Alice", Some(30));
     let reader = RecordBatchIterator::new(vec![Ok(person_batch)], person_schema);
     person_ds.append(reader, None).await.unwrap();
     let person_version = person_ds.version().version;
@@ -869,15 +976,7 @@ async fn test_batch_create_table_versions_allows_owner_branch_handoff_at_same_ve
         .unwrap();
     let mut feature_ds = person_ds.checkout_branch("feature").await.unwrap();
     let person_schema = Arc::new(feature_ds.schema().into());
-    let person_batch = RecordBatch::try_new(
-        Arc::clone(&person_schema),
-        vec![
-            Arc::new(StringArray::from(vec!["person-1"])),
-            Arc::new(StringArray::from(vec!["Alice"])),
-            Arc::new(Int32Array::from(vec![Some(30)])),
-        ],
-    )
-    .unwrap();
+    let person_batch = entity_batch(Arc::clone(&person_schema), "person-1", "Alice", Some(30));
     let reader = RecordBatchIterator::new(vec![Ok(person_batch)], person_schema);
     feature_ds.append(reader, None).await.unwrap();
     let feature_version = feature_ds.version().version;
@@ -969,15 +1068,7 @@ async fn test_post_publish_fold_reflects_owner_branch_handoff() {
         .unwrap();
     let mut feature_ds = person_ds.checkout_branch("feature").await.unwrap();
     let person_schema = Arc::new(feature_ds.schema().into());
-    let person_batch = RecordBatch::try_new(
-        Arc::clone(&person_schema),
-        vec![
-            Arc::new(StringArray::from(vec!["person-1"])),
-            Arc::new(StringArray::from(vec!["Alice"])),
-            Arc::new(Int32Array::from(vec![Some(30)])),
-        ],
-    )
-    .unwrap();
+    let person_batch = entity_batch(Arc::clone(&person_schema), "person-1", "Alice", Some(30));
     let reader = RecordBatchIterator::new(vec![Ok(person_batch)], person_schema);
     feature_ds.append(reader, None).await.unwrap();
     let feature_version = feature_ds.version().version;
@@ -1034,6 +1125,7 @@ async fn test_post_publish_fold_reflects_owner_branch_handoff() {
     );
     experiment_mc
         .commit(&[SubTableUpdate {
+            identity: person_entry.identity,
             table_key: "node:Person".to_string(),
             table_version: feature_version,
             table_branch: Some("experiment".to_string()),
@@ -1087,15 +1179,7 @@ async fn test_staged_namespace_lists_native_table_versions_before_publish() {
         .await
         .unwrap();
     let person_schema = Arc::new(person_ds.schema().into());
-    let person_batch = RecordBatch::try_new(
-        Arc::clone(&person_schema),
-        vec![
-            Arc::new(StringArray::from(vec!["person-1"])),
-            Arc::new(StringArray::from(vec!["Alice"])),
-            Arc::new(Int32Array::from(vec![Some(30)])),
-        ],
-    )
-    .unwrap();
+    let person_batch = entity_batch(Arc::clone(&person_schema), "person-1", "Alice", Some(30));
     let reader = RecordBatchIterator::new(vec![Ok(person_batch)], person_schema);
     person_ds.append(reader, None).await.unwrap();
     let person_version = person_ds.version().version;
@@ -1148,22 +1232,25 @@ impl RecordingPublisher {
 
 #[async_trait]
 impl ManifestBatchPublisher for RecordingPublisher {
-    async fn publish(
+    async fn publish_with_precondition(
         &self,
         changes: &[ManifestChange],
-        expected_table_versions: &HashMap<String, u64>,
+        expected_table_versions: &ExpectedTableVersions,
         lineage: Option<&LineageIntent>,
+        precondition: &PublishPrecondition,
     ) -> Result<PublishOutcome> {
         let requests: Vec<CreateTableVersionRequest> = changes
             .iter()
             .filter_map(|change| match change {
                 ManifestChange::Update(update) => Some(update.to_create_table_version_request()),
-                ManifestChange::RegisterTable(_) | ManifestChange::Tombstone(_) => None,
+                ManifestChange::RegisterTable(_)
+                | ManifestChange::RenameTable(_)
+                | ManifestChange::Tombstone(_) => None,
             })
             .collect();
         self.requests.lock().await.extend_from_slice(&requests);
         self.inner
-            .publish(changes, expected_table_versions, lineage)
+            .publish_with_precondition(changes, expected_table_versions, lineage, precondition)
             .await
     }
 }
@@ -1172,11 +1259,12 @@ struct FailingPublisher;
 
 #[async_trait]
 impl ManifestBatchPublisher for FailingPublisher {
-    async fn publish(
+    async fn publish_with_precondition(
         &self,
         _changes: &[ManifestChange],
-        _expected_table_versions: &HashMap<String, u64>,
+        _expected_table_versions: &ExpectedTableVersions,
         _lineage: Option<&LineageIntent>,
+        _precondition: &PublishPrecondition,
     ) -> Result<PublishOutcome> {
         Err(OmniError::manifest(
             "injected batch publisher failure".to_string(),
@@ -1197,15 +1285,7 @@ async fn test_commit_routes_through_injected_batch_publisher() {
         .await
         .unwrap();
     let person_schema = Arc::new(person_ds.schema().into());
-    let person_batch = RecordBatch::try_new(
-        Arc::clone(&person_schema),
-        vec![
-            Arc::new(StringArray::from(vec!["person-1"])),
-            Arc::new(StringArray::from(vec!["Alice"])),
-            Arc::new(Int32Array::from(vec![Some(30)])),
-        ],
-    )
-    .unwrap();
+    let person_batch = entity_batch(Arc::clone(&person_schema), "person-1", "Alice", Some(30));
     let reader = RecordBatchIterator::new(vec![Ok(person_batch)], person_schema);
     person_ds.append(reader, None).await.unwrap();
     let person_version = person_ds.version().version;
@@ -1218,6 +1298,7 @@ async fn test_commit_routes_through_injected_batch_publisher() {
     mc = mc.with_batch_publisher(Arc::new(recording.clone()));
 
     mc.commit(&[SubTableUpdate {
+        identity: person_entry.identity,
         table_key: "node:Person".to_string(),
         table_version: person_version,
         table_branch: None,
@@ -1273,15 +1354,7 @@ async fn test_commit_failure_from_injected_batch_publisher_preserves_visible_sta
         .await
         .unwrap();
     let person_schema = Arc::new(person_ds.schema().into());
-    let person_batch = RecordBatch::try_new(
-        Arc::clone(&person_schema),
-        vec![
-            Arc::new(StringArray::from(vec!["person-1"])),
-            Arc::new(StringArray::from(vec!["Alice"])),
-            Arc::new(Int32Array::from(vec![Some(30)])),
-        ],
-    )
-    .unwrap();
+    let person_batch = entity_batch(Arc::clone(&person_schema), "person-1", "Alice", Some(30));
     let reader = RecordBatchIterator::new(vec![Ok(person_batch)], person_schema);
     person_ds.append(reader, None).await.unwrap();
     let person_version = person_ds.version().version;
@@ -1293,6 +1366,7 @@ async fn test_commit_failure_from_injected_batch_publisher_preserves_visible_sta
     mc = mc.with_batch_publisher(Arc::new(FailingPublisher));
     let err = mc
         .commit(&[SubTableUpdate {
+            identity: person_entry.identity,
             table_key: "node:Person".to_string(),
             table_version: person_version,
             table_branch: None,
@@ -1332,15 +1406,12 @@ async fn append_person_and_make_update(
         .await
         .unwrap();
     let person_schema = Arc::new(person_ds.schema().into());
-    let row = RecordBatch::try_new(
+    let row = entity_batch(
         Arc::clone(&person_schema),
-        vec![
-            Arc::new(StringArray::from(vec![format!("person-{name}")])),
-            Arc::new(StringArray::from(vec![Some(name.to_string())])),
-            Arc::new(Int32Array::from(vec![Some(30)])),
-        ],
-    )
-    .unwrap();
+        format!("person-{name}"),
+        name,
+        Some(30),
+    );
     let reader = RecordBatchIterator::new(vec![Ok(row)], person_schema);
     person_ds.append(reader, None).await.unwrap();
     let new_version = person_ds.version().version;
@@ -1349,6 +1420,7 @@ async fn append_person_and_make_update(
             .await
             .unwrap();
     SubTableUpdate {
+        identity: person_entry.identity,
         table_key: "node:Person".to_string(),
         table_version: new_version,
         table_branch: None,
@@ -1365,14 +1437,27 @@ async fn test_commit_with_expected_accepts_matching_versions() {
     let mut mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
     let snap = mc.snapshot();
     let person_entry = snap.entry("node:Person").unwrap().clone();
+    let company_entry = snap.entry("node:Company").unwrap().clone();
 
     let update = append_person_and_make_update(uri, &person_entry, "Alice").await;
     let mut expected = HashMap::new();
     // After init, every table is at table_version=1 — assert that.
-    expected.insert("node:Person".to_string(), 1);
-    expected.insert("node:Company".to_string(), 1);
+    expected.insert(
+        person_entry.identity,
+        TableVersionExpectation {
+            table_key: "node:Person".to_string(),
+            table_version: 1,
+        },
+    );
+    expected.insert(
+        company_entry.identity,
+        TableVersionExpectation {
+            table_key: "node:Company".to_string(),
+            table_version: 1,
+        },
+    );
 
-    mc.commit_with_expected(&[update.clone()], &expected)
+    mc.commit_with_expected(std::slice::from_ref(&update), &expected)
         .await
         .expect("matching expected versions should publish cleanly");
 
@@ -1402,7 +1487,13 @@ async fn test_commit_with_expected_rejects_stale_with_typed_details() {
     // Writer B then tries to commit, asserting Person is still at v=1.
     let update_b = append_person_and_make_update(uri, &person_entry, "Bob").await;
     let mut stale_expected = HashMap::new();
-    stale_expected.insert("node:Person".to_string(), 1);
+    stale_expected.insert(
+        person_entry.identity,
+        TableVersionExpectation {
+            table_key: "node:Person".to_string(),
+            table_version: 1,
+        },
+    );
 
     let err = mc
         .commit_with_expected(&[update_b], &stale_expected)
@@ -1443,14 +1534,7 @@ async fn test_commit_with_expected_catches_drift_on_untouched_table() {
         .await
         .unwrap();
     let company_schema = Arc::new(company_ds.schema().into());
-    let row = RecordBatch::try_new(
-        Arc::clone(&company_schema),
-        vec![
-            Arc::new(StringArray::from(vec!["company-1"])),
-            Arc::new(StringArray::from(vec!["Acme"])),
-        ],
-    )
-    .unwrap();
+    let row = entity_batch(Arc::clone(&company_schema), "company-1", "Acme", None);
     let reader = RecordBatchIterator::new(vec![Ok(row)], company_schema);
     company_ds.append(reader, None).await.unwrap();
     let company_version = company_ds.version().version;
@@ -1459,6 +1543,7 @@ async fn test_commit_with_expected_catches_drift_on_untouched_table() {
             .await
             .unwrap();
     mc.commit(&[SubTableUpdate {
+        identity: company_entry.identity,
         table_key: "node:Company".to_string(),
         table_version: company_version,
         table_branch: None,
@@ -1471,7 +1556,13 @@ async fn test_commit_with_expected_catches_drift_on_untouched_table() {
     // Writer B writes Person but asserts Company is still at v=1.
     let update_person = append_person_and_make_update(uri, &person_entry, "Bob").await;
     let mut expected = HashMap::new();
-    expected.insert("node:Company".to_string(), 1);
+    expected.insert(
+        company_entry.identity,
+        TableVersionExpectation {
+            table_key: "node:Company".to_string(),
+            table_version: 1,
+        },
+    );
 
     let err = mc
         .commit_with_expected(&[update_person], &expected)
@@ -1505,7 +1596,13 @@ async fn test_commit_with_expected_unknown_table_reports_actual_zero() {
     let mut mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
 
     let mut expected = HashMap::new();
-    expected.insert("node:DoesNotExist".to_string(), 7);
+    expected.insert(
+        TableIdentity::new(99_999, 1).unwrap(),
+        TableVersionExpectation {
+            table_key: "node:DoesNotExist".to_string(),
+            table_version: 7,
+        },
+    );
     let err = mc
         .commit_with_expected(&[], &expected)
         .await
@@ -1547,7 +1644,13 @@ async fn test_concurrent_publish_with_overlapping_expected_versions_one_succeeds
     let update = append_person_and_make_update(uri, &person_entry, "Alice").await;
 
     let mut expected = HashMap::new();
-    expected.insert("node:Person".to_string(), 1);
+    expected.insert(
+        person_entry.identity,
+        TableVersionExpectation {
+            table_key: "node:Person".to_string(),
+            table_version: 1,
+        },
+    );
 
     let publisher_a = GraphNamespacePublisher::new(uri, None);
     let publisher_b = GraphNamespacePublisher::new(uri, None);
@@ -1613,9 +1716,95 @@ async fn test_init_stamps_internal_schema_version() {
 
     let ds = open_manifest_dataset(uri, None).await.unwrap();
     assert_eq!(
+        ds.version().version,
+        1,
+        "fresh __manifest HEAD must be its Create commit; init must not append config or stamp commits",
+    );
+    assert_eq!(
         super::migrations::read_stamp(&ds),
-        super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION,
+        Some(super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION),
         "init should stamp the manifest at the current internal schema version",
+    );
+
+    // The stamp must ride the Create commit itself — checking out manifest
+    // version one (the genesis Create write) must already show it. This is the
+    // torn-init guarantee: there is no on-disk moment where `__manifest`
+    // exists unstamped.
+    let genesis = ds.checkout_version(1).await.unwrap();
+    assert_eq!(
+        super::migrations::read_stamp(&genesis),
+        Some(super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION),
+        "the stamp must land in the same Lance commit that creates __manifest",
+    );
+}
+
+// The absent-stamp arm of the open guard. An unstamped manifest that carries
+// the modern (v5+) identity columns cannot be a genuine pre-stamp v1 store,
+// but the remaining metadata cannot distinguish an init interrupted under a
+// pre-atomic-stamp binary from later metadata damage. The guard must name both
+// possibilities, fail closed, and make delete-and-re-init conditional on the
+// operator independently knowing that initialization never completed.
+#[tokio::test]
+async fn unstamped_modern_manifest_is_refused_as_interrupted_init_or_corruption() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let catalog = build_test_catalog();
+    ManifestCoordinator::init(uri, &catalog).await.unwrap();
+
+    let mut ds = open_manifest_dataset(uri, None).await.unwrap();
+    super::migrations::remove_stamp_for_test(&mut ds)
+        .await
+        .unwrap();
+
+    let ds = open_manifest_dataset(uri, None).await.unwrap();
+    assert_eq!(super::migrations::read_stamp(&ds), None);
+    let err = super::migrations::guard_stamp(&ds)
+        .expect_err("an unstamped manifest must be refused")
+        .to_string();
+    assert!(
+        err.contains("interrupted `omnigraph init`")
+            && err.contains("damaged or externally modified metadata"),
+        "the refusal must name both possible causes: {err}"
+    );
+    assert!(
+        err.contains("cannot safely distinguish those cases")
+            && err.contains("If you know initialization never completed")
+            && err.contains("Otherwise preserve the root"),
+        "the refusal must fail closed and make deletion conditional: {err}"
+    );
+    assert!(
+        !err.contains("holds no committed data") && !err.contains("0.3.1"),
+        "the refusal must neither assume an empty graph nor misdiagnose it as ancient: {err}"
+    );
+}
+
+// The unreadable-stamp arm: a stamp key that is present but not a version
+// number must be refused naming the raw value — never classified as absent,
+// because an explicitly corrupt value should not flow even into the modern
+// absent-stamp arm's conditional delete advice.
+#[tokio::test]
+async fn unreadable_stamp_is_refused_without_delete_advice() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let catalog = build_test_catalog();
+    ManifestCoordinator::init(uri, &catalog).await.unwrap();
+
+    let mut ds = open_manifest_dataset(uri, None).await.unwrap();
+    super::migrations::set_raw_stamp_for_test(&mut ds, "not-a-number")
+        .await
+        .unwrap();
+
+    let ds = open_manifest_dataset(uri, None).await.unwrap();
+    let err = super::migrations::guard_stamp(&ds)
+        .expect_err("an unreadable stamp must be refused")
+        .to_string();
+    assert!(
+        err.contains("not-a-number"),
+        "the refusal must name the raw value: {err}"
+    );
+    assert!(
+        !err.contains("Delete the graph root") && !err.contains("0.3.1"),
+        "corrupt metadata must not trigger delete advice or the ancient misdiagnosis: {err}"
     );
 }
 
@@ -1639,7 +1828,7 @@ async fn branch_inherits_main_internal_schema_stamp() {
     let feature_ds = open_manifest_dataset(uri, Some("feature")).await.unwrap();
     assert_eq!(
         super::migrations::read_stamp(&main_ds),
-        super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION,
+        Some(super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION),
         "fresh graph stamps main at CURRENT",
     );
     assert_eq!(
@@ -1654,7 +1843,8 @@ async fn test_publish_rejects_manifest_stamped_at_future_version() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let catalog = build_test_catalog();
-    ManifestCoordinator::init(uri, &catalog).await.unwrap();
+    let mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
+    let person_entry = mc.snapshot().entry("node:Person").unwrap().clone();
 
     // Stamp the manifest at a version higher than this binary knows about.
     let future = super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION + 99;
@@ -1669,7 +1859,13 @@ async fn test_publish_rejects_manifest_stamped_at_future_version() {
     }
 
     let mut expected = HashMap::new();
-    expected.insert("node:Person".to_string(), 1);
+    expected.insert(
+        person_entry.identity,
+        TableVersionExpectation {
+            table_key: "node:Person".to_string(),
+            table_version: 1,
+        },
+    );
     let err = GraphNamespacePublisher::new(uri, None)
         .publish(&[], &expected, None)
         .await
@@ -1716,7 +1912,7 @@ async fn future_stamp_is_refused_in_both_open_modes() {
         let mut ds = open_manifest_dataset(uri, None).await.unwrap();
         ds.update_schema_metadata([(
             "omnigraph:internal_schema_version".to_string(),
-            Some("5".to_string()),
+            Some((INTERNAL_MANIFEST_SCHEMA_VERSION + 1).to_string()),
         )])
         .await
         .unwrap();
@@ -1738,7 +1934,7 @@ async fn future_stamp_is_refused_in_both_open_modes() {
 }
 
 // A graph stamped below CURRENT (the strand floor: `MIN_SUPPORTED == CURRENT`,
-// so anything older than v4) is refused on open in BOTH modes, with the
+// so anything older than v5) is refused on open in BOTH modes, with the
 // rebuild-via-export/import hint — there is no in-place migration. This is the
 // floor twin of `future_stamp_is_refused_in_both_open_modes` (the ceiling). The
 // open path (`Omnigraph::open` read-write and `Omnigraph::open_read_only`) routes
@@ -1750,17 +1946,19 @@ async fn sub_current_graph_is_refused_on_open_with_rebuild_hint() {
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    // A full v4 graph (schema artifacts present) so the open path gets past its
+    // A full v5 graph (schema artifacts present) so the open path gets past its
     // schema read to the stamp check.
     Omnigraph::init(uri, "node Person { name: String }\n")
         .await
         .unwrap();
 
-    // Rewind main's stamp to v3 — a graph this binary's single served version
-    // (v4) cannot open, since `MIN_SUPPORTED == CURRENT == 4`.
+    // Rewind main's stamp to v4 — a graph this binary's single served version
+    // (v5) cannot open, since `MIN_SUPPORTED == CURRENT == 5`.
     {
         let mut ds = open_manifest_dataset(uri, None).await.unwrap();
-        super::migrations::set_stamp_for_test(&mut ds, 3).await.unwrap();
+        super::migrations::set_stamp_for_test(&mut ds, 4)
+            .await
+            .unwrap();
     }
 
     // Read-write open is refused with the rebuild hint.
@@ -1806,8 +2004,8 @@ async fn sub_current_graph_is_refused_then_rebuilt_via_export_import() {
     // before upgrading.
     let dir_old = tempfile::tempdir().unwrap();
     let uri_old = dir_old.path().to_str().unwrap();
-    let mut db_old = Omnigraph::init(uri_old, schema).await.unwrap();
-    load_jsonl(&mut db_old, seed, LoadMode::Overwrite)
+    let db_old = Omnigraph::init(uri_old, schema).await.unwrap();
+    load_jsonl(&db_old, seed, LoadMode::Overwrite)
         .await
         .unwrap();
     let exported = db_old.export_jsonl("main", &[], &[]).await.unwrap();
@@ -1820,7 +2018,9 @@ async fn sub_current_graph_is_refused_then_rebuilt_via_export_import() {
     // Make it look like a graph from an older release: rewind the stamp below CURRENT.
     {
         let mut ds = open_manifest_dataset(uri_old, None).await.unwrap();
-        super::migrations::set_stamp_for_test(&mut ds, 3).await.unwrap();
+        super::migrations::set_stamp_for_test(&mut ds, 4)
+            .await
+            .unwrap();
     }
     let err = match Omnigraph::open(uri_old).await {
         Ok(_) => panic!("a sub-CURRENT graph must be refused on open"),
@@ -1832,16 +2032,16 @@ async fn sub_current_graph_is_refused_then_rebuilt_via_export_import() {
         "the refusal must nudge the operator to `omnigraph export`, got: {err}",
     );
     assert!(
-        msg.contains("0.7.2"),
-        "the refusal must name the release that wrote this stamp (v3 → 0.6.2 to 0.7.2) so the \
+        msg.contains("0.8.x"),
+        "the refusal must name the release that wrote this stamp (v4 → 0.8.x) so the \
          operator knows which binary to use, got: {err}",
     );
 
     // Rebuild with this binary: fresh init + load the export.
     let dir_new = tempfile::tempdir().unwrap();
     let uri_new = dir_new.path().to_str().unwrap();
-    let mut db_new = Omnigraph::init(uri_new, schema).await.unwrap();
-    load_jsonl(&mut db_new, &exported, LoadMode::Overwrite)
+    let db_new = Omnigraph::init(uri_new, schema).await.unwrap();
+    load_jsonl(&db_new, &exported, LoadMode::Overwrite)
         .await
         .unwrap();
 
@@ -1866,12 +2066,11 @@ async fn sub_current_graph_is_refused_then_rebuilt_via_export_import() {
 // Two (or N) writers committing DISJOINT tables on the same branch still share
 // one mutable `graph_head:main` row (one `object_id`, `WhenMatched::UpdateAll`).
 // Their table-version rows never collide (distinct `object_id`s), so the *only*
-// row-level CAS contention is on `graph_head:main`. The contract under test:
-// exactly one writer wins each CAS round; the loser retries, re-resolves its
-// parent off the freshly-advanced head (inside the publisher's retry loop), and
-// re-commits — so every writer commits and the resulting graph_commit DAG is a
-// single LINEAR chain (no fork), not a tree. This is the cross-process
-// disjoint-table fork closed by the shared head row (invariants.md §7.1).
+// row-level CAS contention is on `graph_head:main`. Two contracts coexist:
+// legacy `Any` publishers retry, re-parent, and eventually form one linear DAG;
+// RFC-022 `ExactGraphHead` publishers instead reject the stale prepared write
+// after the first winner changes authority. Both rely on the same shared row to
+// prevent a fork; the tests below pin both behaviors explicitly.
 
 /// A microsecond UNIX timestamp for a `LineageIntent`, matching the genesis /
 /// commit-graph `created_at` unit.
@@ -1880,6 +2079,179 @@ fn lineage_now_micros() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_micros() as i64
+}
+
+/// Race two lineage-only publishes against the same exact named-branch head.
+/// Returns after proving exactly one committed and the loser surfaced a typed
+/// read-set change. `establish_head=false` exercises the load-bearing absent-row
+/// case on a fresh branch; `true` exercises ordinary head advancement.
+async fn assert_exact_named_head_race(establish_head: bool) {
+    use crate::error::ManifestConflictDetails;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let catalog = build_test_catalog();
+    let mut mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
+    mc.create_branch("feature").await.unwrap();
+
+    let publisher = GraphNamespacePublisher::new(uri, Some("feature"));
+    let empty = HashMap::new();
+    let expected_head = if establish_head {
+        let intent = LineageIntent {
+            graph_commit_id: ulid::Ulid::new().to_string(),
+            branch: Some("feature".to_string()),
+            actor_id: None,
+            merged_parent_commit_id: None,
+            created_at: lineage_now_micros(),
+        };
+        publisher
+            .publish(&[], &empty, Some(&intent))
+            .await
+            .expect("establish named-branch graph head");
+        Some(intent.graph_commit_id)
+    } else {
+        None
+    };
+
+    // The folded publish scan must preserve exact absence. In particular, the
+    // inferred lineage head inherited from main must not masquerade as a
+    // materialized `graph_head:feature` row.
+    let branch_manifest = open_manifest_dataset(uri, Some("feature")).await.unwrap();
+    let scan = read_publish_scan(&branch_manifest).await.unwrap();
+    assert_eq!(scan.graph_heads.get("feature").cloned(), expected_head);
+    let branch_identifier = branch_manifest.branch_identifier().await.unwrap();
+
+    let precondition = PublishPrecondition::ExactGraphHead(GraphHeadExpectation::new(
+        Some("feature"),
+        branch_identifier,
+        expected_head.clone(),
+    ));
+    let intent_a = LineageIntent {
+        graph_commit_id: ulid::Ulid::new().to_string(),
+        branch: Some("feature".to_string()),
+        actor_id: Some("act-a".to_string()),
+        merged_parent_commit_id: None,
+        created_at: lineage_now_micros(),
+    };
+    let intent_b = LineageIntent {
+        graph_commit_id: ulid::Ulid::new().to_string(),
+        branch: Some("feature".to_string()),
+        actor_id: Some("act-b".to_string()),
+        merged_parent_commit_id: None,
+        created_at: lineage_now_micros(),
+    };
+    let publisher_a = GraphNamespacePublisher::new(uri, Some("feature"));
+    let publisher_b = GraphNamespacePublisher::new(uri, Some("feature"));
+    let precondition_a = precondition.clone();
+    let precondition_b = precondition;
+
+    let (result_a, result_b) = tokio::join!(
+        async {
+            publisher_a
+                .publish_with_precondition(&[], &empty, Some(&intent_a), &precondition_a)
+                .await
+        },
+        async {
+            publisher_b
+                .publish_with_precondition(&[], &empty, Some(&intent_b), &precondition_b)
+                .await
+        }
+    );
+
+    let (winner_id, loser_error) = match (result_a, result_b) {
+        (Ok(_), Err(err)) => (intent_a.graph_commit_id.clone(), err),
+        (Err(err), Ok(_)) => (intent_b.graph_commit_id.clone(), err),
+        (Ok(_), Ok(_)) => panic!("exact-head race silently re-parented both writers"),
+        (Err(a), Err(b)) => panic!("both exact-head writers failed: {a:?} / {b:?}"),
+    };
+
+    let OmniError::Manifest(error) = loser_error else {
+        panic!("expected typed manifest conflict, got {loser_error:?}");
+    };
+    assert_eq!(
+        error.details,
+        Some(ManifestConflictDetails::ReadSetChanged {
+            member: "graph_head:feature".to_string(),
+            expected: expected_head,
+            actual: Some(winner_id.clone()),
+        })
+    );
+
+    let branch_manifest = open_manifest_dataset(uri, Some("feature")).await.unwrap();
+    let (commits, heads) = read_graph_lineage(&branch_manifest).await.unwrap();
+    assert_eq!(heads.get("feature"), Some(&winner_id));
+    assert_eq!(
+        commits
+            .iter()
+            .filter(|commit| {
+                commit.graph_commit_id == intent_a.graph_commit_id
+                    || commit.graph_commit_id == intent_b.graph_commit_id
+            })
+            .count(),
+        1,
+        "the rejected intent must not leave an immutable graph_commit row"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exact_head_publish_rejects_reparent_on_fresh_and_established_named_branch() {
+    assert_exact_named_head_race(false).await;
+    assert_exact_named_head_race(true).await;
+}
+
+#[tokio::test]
+async fn exact_publish_rejects_named_branch_delete_recreate_aba() {
+    use crate::error::ManifestConflictDetails;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let catalog = build_test_catalog();
+    let mut mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
+    mc.create_branch("feature").await.unwrap();
+
+    let old_branch = open_manifest_dataset(uri, Some("feature")).await.unwrap();
+    let old_identifier = old_branch.branch_identifier().await.unwrap();
+    assert!(
+        !read_publish_scan(&old_branch)
+            .await
+            .unwrap()
+            .graph_heads
+            .contains_key("feature"),
+        "fresh named branch starts without its own graph_head row"
+    );
+
+    // Recreate the same name at the same logical fork point. Numeric manifest
+    // version and exact graph-head absence can repeat; only Lance's native
+    // branch identifier distinguishes the incarnation.
+    mc.delete_branch("feature").await.unwrap();
+    mc.create_branch("feature").await.unwrap();
+    let recreated = open_manifest_dataset(uri, Some("feature")).await.unwrap();
+    let recreated_identifier = recreated.branch_identifier().await.unwrap();
+    assert_ne!(old_identifier, recreated_identifier);
+
+    let precondition = PublishPrecondition::ExactGraphHead(GraphHeadExpectation::new(
+        Some("feature"),
+        old_identifier,
+        None,
+    ));
+    let err = GraphNamespacePublisher::new(uri, Some("feature"))
+        .publish_with_precondition(&[], &HashMap::new(), None, &precondition)
+        .await
+        .expect_err("recreated branch must reject the old incarnation token");
+    let OmniError::Manifest(error) = err else {
+        panic!("expected typed manifest conflict, got {err:?}");
+    };
+    match error.details {
+        Some(ManifestConflictDetails::ReadSetChanged {
+            member,
+            expected: Some(expected),
+            actual: Some(actual),
+        }) => {
+            assert_eq!(member, "branch_identifier:feature");
+            assert_ne!(expected, actual);
+        }
+        other => panic!("expected branch-identifier ReadSetChanged, got {other:?}"),
+    }
 }
 
 /// Append one row to a two-column NODE table (`id`, `name`) and return the
@@ -1898,14 +2270,17 @@ async fn append_node_row_and_make_update(
         .unwrap();
     let schema = Arc::new(ds.schema().into());
     let arrow_schema: &Schema = &schema;
-    // Columns 0/1 are (id, name); a third column (Person.age) is filled null.
-    let mut columns: Vec<Arc<dyn arrow_array::Array>> = vec![
-        Arc::new(StringArray::from(vec![id.to_string()])),
-        Arc::new(StringArray::from(vec![name.to_string()])),
-    ];
-    for field in arrow_schema.fields().iter().skip(2) {
-        columns.push(arrow_array::new_null_array(field.data_type(), 1));
-    }
+    let columns: Vec<Arc<dyn arrow_array::Array>> = arrow_schema
+        .fields()
+        .iter()
+        .map(|field| match field.name().as_str() {
+            "id" => {
+                Arc::new(StringArray::from(vec![id.to_string()])) as Arc<dyn arrow_array::Array>
+            }
+            "name" => Arc::new(StringArray::from(vec![name.to_string()])),
+            _ => arrow_array::new_null_array(field.data_type(), 1),
+        })
+        .collect();
     let row = RecordBatch::try_new(Arc::clone(&schema), columns).unwrap();
     let reader = RecordBatchIterator::new(vec![Ok(row)], schema);
     ds.append(reader, None).await.unwrap();
@@ -1915,6 +2290,7 @@ async fn append_node_row_and_make_update(
             .await
             .unwrap();
     SubTableUpdate {
+        identity: entry.identity,
         table_key: entry.table_key.clone(),
         table_version: new_version,
         table_branch: None,
@@ -1943,8 +2319,10 @@ async fn assert_linear_chain(uri: &str, expected_total: usize) -> String {
     );
 
     // (1) exactly one genesis.
-    let genesis: Vec<&GraphLineageRow> =
-        rows.iter().filter(|r| r.parent_commit_id.is_none()).collect();
+    let genesis: Vec<&GraphLineageRow> = rows
+        .iter()
+        .filter(|r| r.parent_commit_id.is_none())
+        .collect();
     assert_eq!(
         genesis.len(),
         1,
@@ -2038,8 +2416,16 @@ async fn concurrent_disjoint_writes_share_head_and_form_linear_chain() {
     // version on the other's table; contention is purely the shared head row.
     let empty = HashMap::new();
     let (res_a, res_b) = tokio::join!(
-        async { publisher_a.publish(&changes_a, &empty, Some(&intent_a)).await },
-        async { publisher_b.publish(&changes_b, &empty, Some(&intent_b)).await }
+        async {
+            publisher_a
+                .publish(&changes_a, &empty, Some(&intent_a))
+                .await
+        },
+        async {
+            publisher_b
+                .publish(&changes_b, &empty, Some(&intent_b))
+                .await
+        }
     );
 
     // BOTH commit: disjoint tables → the head-row CAS loser retries within
@@ -2114,8 +2500,16 @@ async fn concurrent_disjoint_writes_form_linear_chain_on_s3() {
     };
     let empty = HashMap::new();
     let (res_a, res_b) = tokio::join!(
-        async { publisher_a.publish(&changes_a, &empty, Some(&intent_a)).await },
-        async { publisher_b.publish(&changes_b, &empty, Some(&intent_b)).await }
+        async {
+            publisher_a
+                .publish(&changes_a, &empty, Some(&intent_a))
+                .await
+        },
+        async {
+            publisher_b
+                .publish(&changes_b, &empty, Some(&intent_b))
+                .await
+        }
     );
     res_a.expect("writer A must commit on S3");
     res_b.expect("writer B must commit on S3");
@@ -2161,8 +2555,13 @@ async fn n_concurrent_disjoint_writers_converge_to_one_linear_chain() {
                 .await,
         );
         updates.push(
-            append_node_row_and_make_update(uri, &company_entry, &format!("c{i}"), &format!("C{i}"))
-                .await,
+            append_node_row_and_make_update(
+                uri,
+                &company_entry,
+                &format!("c{i}"),
+                &format!("C{i}"),
+            )
+            .await,
         );
     }
     assert_eq!(updates.len(), N);
@@ -2216,7 +2615,11 @@ async fn n_concurrent_disjoint_writers_converge_to_one_linear_chain() {
     // All 8 distinct writer ids committed (no lost commit, no duplicate id).
     committed_ids.sort();
     committed_ids.dedup();
-    assert_eq!(committed_ids.len(), N, "every writer must commit exactly once");
+    assert_eq!(
+        committed_ids.len(),
+        N,
+        "every writer must commit exactly once"
+    );
 
     // The final DAG is a single linear chain of genesis + 8 = 9, no fork.
     assert_linear_chain(uri, N + 1).await;

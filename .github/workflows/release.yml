@@ -1,30 +1,57 @@
 name: Release
 
+# Build per-platform binaries in a matrix, then publish the GitHub release ONCE
+# from a single job. The matrix used to call `softprops/action-gh-release`
+# concurrently — three jobs racing to create/finalize the same release, which
+# exhausted the action's finalize retries and dropped whole platforms' assets.
+# The matrix now only uploads workflow artifacts; `publish_release` is the sole
+# writer of the release (no race).
+#
+# Triggers:
+#   - push of a v* tag (normal release)
+#   - workflow_dispatch with an explicit `tag` (re-publish a past tag without
+#     re-cutting it; resolves the same `${{ inputs.tag || github.ref_name }}`)
+
 on:
   push:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to (re)publish (e.g. v0.7.0). Required for manual dispatches."
+        required: true
+        type: string
 
 jobs:
   build_release:
     name: Build ${{ matrix.asset_name }}
     runs-on: ${{ matrix.runner }}
     permissions:
-      contents: write
+      contents: read
     strategy:
       fail-fast: false
       matrix:
         include:
           - runner: ubuntu-latest
             asset_name: omnigraph-linux-x86_64
+          - runner: ubuntu-24.04-arm
+            asset_name: omnigraph-linux-arm64
           - runner: macos-14
             asset_name: omnigraph-macos-arm64
+            # OmniGraph's release text exceeds arm64's +/-128 MiB direct-branch
+            # range. Use long calls instead of relying on ld branch islands.
+            rustflags: -C code-model=large
+          - runner: windows-latest
+            asset_name: omnigraph-windows-x86_64
     env:
       CARGO_TERM_COLOR: always
+      RUSTFLAGS: ${{ matrix.rustflags || '' }}
     steps:
       - name: Checkout source
         uses: actions/checkout@v5.0.1
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
@@ -35,6 +62,10 @@ jobs:
       - name: Install macOS dependencies
         if: runner.os == 'macOS'
         run: brew install protobuf
+
+      - name: Install Windows dependencies
+        if: runner.os == 'Windows'
+        run: choco install protoc -y
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -50,7 +81,8 @@ jobs:
       - name: Build release binaries
         run: cargo build --release --locked -p omnigraph-cli -p omnigraph-server
 
-      - name: Package release archive
+      - name: Package Unix release archive
+        if: runner.os != 'Windows'
         run: |
           mkdir -p release
           install -m 0755 target/release/omnigraph release/omnigraph
@@ -58,21 +90,62 @@ jobs:
           tar -C release -czf "${{ matrix.asset_name }}.tar.gz" omnigraph omnigraph-server
           shasum -a 256 "${{ matrix.asset_name }}.tar.gz" > "${{ matrix.asset_name }}.sha256"
 
-      - name: Publish GitHub release assets
+      - name: Package Windows release archive
+        if: runner.os == 'Windows'
+        run: |
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          Copy-Item target/release/omnigraph.exe release/omnigraph.exe
+          Copy-Item target/release/omnigraph-server.exe release/omnigraph-server.exe
+          Compress-Archive -Path release/omnigraph.exe, release/omnigraph-server.exe -DestinationPath "${{ matrix.asset_name }}.zip" -Force
+          $hash = (Get-FileHash "${{ matrix.asset_name }}.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  ${{ matrix.asset_name }}.zip" | Out-File -FilePath "${{ matrix.asset_name }}.sha256" -Encoding ascii
+          New-Item -ItemType Directory -Force -Path verify | Out-Null
+          Expand-Archive -Path "${{ matrix.asset_name }}.zip" -DestinationPath verify -Force
+          $items = Get-ChildItem -Path verify -File
+          if ($items.Count -ne 2 -or !(Test-Path verify/omnigraph.exe) -or !(Test-Path verify/omnigraph-server.exe)) {
+            throw "Windows release archive is missing expected binaries"
+          }
+
+      # Upload artifacts only — the single `publish_release` job attaches them to
+      # the release, so no two jobs ever write the release concurrently.
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: |
+            ${{ matrix.asset_name }}.*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish_release:
+    name: Publish GitHub release
+    needs: build_release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release (single writer — no matrix race)
         uses: softprops/action-gh-release@v2.5.0
         with:
-          files: |
-            ${{ matrix.asset_name }}.tar.gz
-            ${{ matrix.asset_name }}.sha256
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: dist/**
+          overwrite_files: true
 
   update_homebrew_tap:
     name: Update Homebrew tap
-    needs: build_release
+    needs: publish_release
     runs-on: ubuntu-latest
     permissions:
       contents: read
     env:
       HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
     steps:
       - name: Skip if HOMEBREW_TAP_TOKEN is not configured
         if: env.HOMEBREW_TAP_TOKEN == ''
@@ -83,6 +156,8 @@ jobs:
       - name: Checkout source
         if: env.HOMEBREW_TAP_SKIP != '1'
         uses: actions/checkout@v5.0.1
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Checkout Homebrew tap
         if: env.HOMEBREW_TAP_SKIP != '1'
@@ -97,7 +172,32 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          ./scripts/update-homebrew-formula.sh "${GITHUB_REF_NAME}" homebrew-tap/Formula/omnigraph.rb
+          ./scripts/update-homebrew-formula.sh "${RELEASE_TAG}" homebrew-tap/Formula/omnigraph.rb
+
+      # Diagnostic only: brew is not on PATH on the ubuntu runner by default, so
+      # set it up explicitly. Both this setup and the audit below are best-effort
+      # canaries, not gates — continue-on-error on each keeps a failed/flaky brew
+      # (the action is pinned to a moving @master ref) from skipping the actual
+      # tap publish below. The formula is correct by construction
+      # (update-homebrew-formula.sh), so brew tooling must never block the push.
+      - name: Set up Homebrew
+        if: env.HOMEBREW_TAP_SKIP != '1'
+        continue-on-error: true
+        uses: Homebrew/actions/setup-homebrew@master
+
+      - name: Audit generated formula
+        if: env.HOMEBREW_TAP_SKIP != '1'
+        continue-on-error: true
+        run: |
+          # Audit the checked-out tap by name (brew audit rejects bare paths
+          # and needs tap context). Symlink the checkout into Homebrew's Taps
+          # tree so `modernrelay/tap/omnigraph` resolves to it. Offline audit
+          # (no --online) keeps it deterministic; it still catches the
+          # ComponentsOrder/structure class of problems.
+          tap_dir="$(brew --repository)/Library/Taps/modernrelay/homebrew-tap"
+          mkdir -p "$(dirname "$tap_dir")"
+          ln -sfn "$PWD/homebrew-tap" "$tap_dir"
+          brew audit --strict modernrelay/tap/omnigraph
 
       - name: Commit and push formula update
         if: env.HOMEBREW_TAP_SKIP != '1'
@@ -111,5 +211,28 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add Formula/omnigraph.rb
-          git commit -m "Update Omnigraph formula to ${GITHUB_REF_NAME}"
+          git commit -m "Update Omnigraph formula to ${RELEASE_TAG}"
           git push origin HEAD:main
+
+  smoke_windows_installer:
+    name: Smoke Windows installer
+    needs: publish_release
+    if: ${{ inputs.tag != '' || startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v5.0.1
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Install from tagged release
+        run: ./scripts/install.ps1 -Version "$env:RELEASE_TAG" -InstallDir "$env:RUNNER_TEMP/omnigraph-bin"
+
+      - name: Smoke installed binaries
+        run: |
+          & "$env:RUNNER_TEMP/omnigraph-bin/omnigraph.exe" version
+          & "$env:RUNNER_TEMP/omnigraph-bin/omnigraph-server.exe" --help

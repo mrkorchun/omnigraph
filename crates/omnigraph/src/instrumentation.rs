@@ -11,13 +11,17 @@
 //! - **omnigraph `StorageAdapter`** — [`CountingStorageAdapter`], a decorator that
 //!   counts per-method calls (the schema-contract reads on the query path).
 //!
-//! Nothing here changes runtime behavior: the wrappers only observe, and the
-//! decorator delegates every call. `IOTracker` (the concrete counter) lives in
-//! tests via the `lance-io` dev-dependency; this module stays generic over the
-//! `lance::io`-re-exported trait, so it adds no production dependency.
+//! The probes themselves only observe, and the decorator delegates every call.
+//! The shared dataset opener also supplies the process control session when a
+//! caller has no graph-scoped data session, so detached opens still reuse the
+//! process object-store registry without caching mutable metadata. `IOTracker`
+//! (the concrete counter) lives in tests via the `lance-io` dev-dependency; this
+//! module stays generic over the `lance::io`-re-exported trait, so it adds no
+//! production dependency.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use lance::Dataset;
@@ -25,7 +29,7 @@ use lance::dataset::builder::DatasetBuilder;
 use lance::io::{ObjectStoreParams, WrappingObjectStore};
 
 use crate::error::{OmniError, Result};
-use crate::storage::StorageAdapter;
+use crate::storage::{ListDirBounds, StorageAdapter};
 
 /// Per-query IO probes, installed for a query's task via [`with_query_io_probes`].
 ///
@@ -59,6 +63,10 @@ pub struct QueryIoProbes {
     /// Internal/system-table (`__manifest`) open CALLS — the complement of
     /// `data_open_count`, kept for symmetry and debugging.
     pub internal_open_count: Arc<AtomicU64>,
+    /// Full `__manifest` row-scan invocations. Counted at the shared state scan
+    /// and the dedicated lineage scan, so a coordinator that opens one handle
+    /// but scans state and lineage separately still reports two.
+    pub manifest_scan_count: Arc<AtomicU64>,
     /// Counts topology-index builds (the `RuntimeCache::graph_index` cache-miss
     /// path). A cost test asserts a fresh branch whose edge tables are unchanged
     /// from main reuses main's cached index (0 builds) rather than rebuilding it.
@@ -67,6 +75,15 @@ pub struct QueryIoProbes {
     /// invocations). A cost test asserts a query referencing one edge builds only
     /// that edge, not every catalog edge (the cold-build shrink A2 ships).
     pub graph_edges_built: Arc<AtomicU64>,
+    /// IR filters lowered into a scan-level DataFusion `filter_expr` (summed
+    /// over `build_lance_filter_expr` calls). Lets a test assert a standalone
+    /// string-match predicate was HOISTED into the NodeScan (where Lance can
+    /// probe a covering index) rather than silently degrading to the
+    /// in-memory arm — a result-only assertion passes either way.
+    pub pushed_filter_exprs: Arc<AtomicU64>,
+    /// Filters evaluated by the in-memory arm (`projection.rs::apply_filter`),
+    /// the complement of `pushed_filter_exprs` for hoist assertions.
+    pub in_memory_filters: Arc<AtomicU64>,
 }
 
 tokio::task_local! {
@@ -153,35 +170,130 @@ pub(crate) fn record_open(uri: &str) {
     });
 }
 
+/// Record one full `__manifest` row scan. No-op unless a cost probe is active.
+pub(crate) fn record_manifest_scan() {
+    let _ = current(|p| {
+        p.manifest_scan_count.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
 /// Record one topology-index build over `edges` edge tables (the
 /// `RuntimeCache::graph_index` cache-miss path). No-op when no probes are
 /// installed (production).
 pub(crate) fn record_graph_build(edges: usize) {
     let _ = current(|p| {
         p.graph_build_count.fetch_add(1, Ordering::Relaxed);
-        p.graph_edges_built.fetch_add(edges as u64, Ordering::Relaxed);
+        p.graph_edges_built
+            .fetch_add(edges as u64, Ordering::Relaxed);
     });
+}
+
+/// Record `n` IR filters lowered into a scan-level `filter_expr`. No-op when
+/// no probes are installed (production) and when nothing was pushed.
+pub(crate) fn record_pushed_filter_exprs(n: u64) {
+    if n > 0 {
+        let _ = current(|p| p.pushed_filter_exprs.fetch_add(n, Ordering::Relaxed));
+    }
+}
+
+/// Record one in-memory filter application (`apply_filter`). No-op when no
+/// probes are installed (production).
+pub(crate) fn record_in_memory_filter() {
+    let _ = current(|p| p.in_memory_filters.fetch_add(1, Ordering::Relaxed));
 }
 
 /// Per-operation staged-write counts, installed for a task via
 /// [`with_merge_write_probes`]. Lets a cost-budget test assert WHICH staged-write
 /// primitive an operation invokes — e.g. that an append-only fast-forward merge
-/// routes new rows through `stage_append` and does **zero** `stage_merge_insert`
-/// (the full-outer hash join). Counts the publish-path primitives only;
-/// merge-staging temp tables use `append_or_create_batch`, not these.
+/// routes new rows through the exact-id fenced merge adapter and does **zero**
+/// bare appends. Counts the publish-path primitives only; merge-staging temp
+/// tables use `append_or_create_batch`, not these.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum MergeTimingPhase {
+    OuterPrepare,
+    ProvenInsertHistory,
+    ProvenInsertPlanScan,
+    CandidateValidation,
+    FinalRevalidation,
+    RecoveryArm,
+    PhysicalPublish,
+    KeyedStage,
+    KeyedCommit,
+    RecoveryConfirm,
+    ManifestPublish,
+    RecoveryCleanup,
+    OuterRestoreRefresh,
+}
+
+impl MergeTimingPhase {
+    const COUNT: usize = 13;
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct MergeWriteProbes {
     pub stage_append_calls: Arc<AtomicU64>,
     pub stage_append_rows: Arc<AtomicU64>,
     pub stage_merge_insert_calls: Arc<AtomicU64>,
     pub stage_merge_insert_rows: Arc<AtomicU64>,
-    /// Inline vector-index (IVF) builds. The fast-forward adopt path defers
-    /// index coverage to the reconciler, so an adopt merge must do 0 of these.
-    pub create_vector_index_calls: Arc<AtomicU64>,
-    /// Times the merge materialized a staged delta into one in-memory batch
-    /// (`scan_staged_combined`). The append path streams instead, so an
-    /// append-only fast-forward merge must do 0 of these.
+    /// Update-only keyed stages whose ids were proven present by merge
+    /// classification. Kept separate from insertion-capable Upsert.
+    pub stage_known_present_update_calls: Arc<AtomicU64>,
+    pub stage_known_present_update_rows: Arc<AtomicU64>,
+    /// Strict-insert transactions that write new fragments directly and carry
+    /// Lance's inserted-row key filter without running a target merge join.
+    pub stage_fenced_insert_calls: Arc<AtomicU64>,
+    pub stage_fenced_insert_rows: Arc<AtomicU64>,
+    /// Exact target-absence probes performed before staging a strict insert.
+    /// Proven branch-merge inserts discharge this check from durable source
+    /// provenance; general strict writes must still invoke it.
+    pub strict_insert_preflight_calls: Arc<AtomicU64>,
+    /// Full-table vector-index (IVF) artifact builds. These count successful
+    /// staging, not HEAD publication; a stale prepared attempt may abandon the
+    /// immutable artifact before commit.
+    pub stage_vector_index_calls: Arc<AtomicU64>,
+    /// Legacy whole-delta materializations. RFC-023's bounded keyed path must
+    /// keep this at zero; retaining the probe makes regressions observable.
     pub scan_staged_combined_calls: Arc<AtomicU64>,
+    /// Blob payload reads performed while rebuilding descriptor rows into a
+    /// logical keyed-write source. Resource-limit tests use this to prove an
+    /// oversized descriptor is rejected from `BlobFile::size()` before the
+    /// payload allocation/read begins.
+    pub blob_payload_read_calls: Arc<AtomicU64>,
+    /// Payload reads issued against external sources specifically. Unlike the
+    /// aggregate Blob counter, this excludes managed Lance `BlobFile::read`
+    /// calls so normalized-alias GET deduplication is directly observable.
+    pub external_blob_payload_read_calls: Arc<AtomicU64>,
+    /// External Blob cells presented to one operation-wide preflight and the
+    /// distinct normalized object metadata probes that preflight performed.
+    /// Their difference is the observable de-duplication contract: repeated
+    /// cells and equivalent URI spellings must not create one HEAD per row.
+    pub external_blob_probe_inputs: Arc<AtomicU64>,
+    pub external_blob_probe_calls: Arc<AtomicU64>,
+    /// Ordered branch-merge cursor scans and the exact per-batch limits they
+    /// requested. These make the production row/byte scanner configuration a
+    /// structural test assertion instead of an inferred memory claim.
+    pub ordered_cursor_scan_calls: Arc<AtomicU64>,
+    pub ordered_cursor_batch_rows: Arc<AtomicU64>,
+    pub ordered_cursor_batch_bytes: Arc<AtomicU64>,
+    /// Projected scalar batches fetched by merge validation before the shared
+    /// aggregate-retention budget decides whether each one may be kept.
+    pub validation_scan_batches: Arc<AtomicU64>,
+    pub validation_scan_projected_bytes: Arc<AtomicU64>,
+    /// Raw batches returned by Lance before the proven-insert interval
+    /// normalizer copies/splits them. The byte maximum keeps the substrate's
+    /// approximate decode term visible instead of conflating it with the hard
+    /// normalized writer-chunk cap.
+    pub proven_insert_raw_batch_calls: Arc<AtomicU64>,
+    pub proven_insert_raw_batch_max_bytes: Arc<AtomicU64>,
+    /// Diagnostic-only elapsed-time buckets. They are non-overlapping at the
+    /// top level; `KeyedStage` and `KeyedCommit` are intentional sub-buckets of
+    /// `PhysicalPublish`. Production pays only the unset task-local probe.
+    merge_timing_total_ns: Arc<[AtomicU64; MergeTimingPhase::COUNT]>,
+    merge_timing_max_ns: Arc<[AtomicU64; MergeTimingPhase::COUNT]>,
 }
 
 impl MergeWriteProbes {
@@ -197,11 +309,113 @@ impl MergeWriteProbes {
     pub fn stage_merge_insert_rows(&self) -> u64 {
         self.stage_merge_insert_rows.load(Ordering::Relaxed)
     }
-    pub fn create_vector_index_calls(&self) -> u64 {
-        self.create_vector_index_calls.load(Ordering::Relaxed)
+    pub fn stage_known_present_update_calls(&self) -> u64 {
+        self.stage_known_present_update_calls
+            .load(Ordering::Relaxed)
+    }
+    pub fn stage_known_present_update_rows(&self) -> u64 {
+        self.stage_known_present_update_rows.load(Ordering::Relaxed)
+    }
+    pub fn stage_fenced_insert_calls(&self) -> u64 {
+        self.stage_fenced_insert_calls.load(Ordering::Relaxed)
+    }
+    pub fn stage_fenced_insert_rows(&self) -> u64 {
+        self.stage_fenced_insert_rows.load(Ordering::Relaxed)
+    }
+    pub fn strict_insert_preflight_calls(&self) -> u64 {
+        self.strict_insert_preflight_calls.load(Ordering::Relaxed)
+    }
+    pub fn stage_vector_index_calls(&self) -> u64 {
+        self.stage_vector_index_calls.load(Ordering::Relaxed)
     }
     pub fn scan_staged_combined_calls(&self) -> u64 {
         self.scan_staged_combined_calls.load(Ordering::Relaxed)
+    }
+    pub fn blob_payload_read_calls(&self) -> u64 {
+        self.blob_payload_read_calls.load(Ordering::Relaxed)
+    }
+    pub fn external_blob_payload_read_calls(&self) -> u64 {
+        self.external_blob_payload_read_calls
+            .load(Ordering::Relaxed)
+    }
+    pub fn external_blob_probe_inputs(&self) -> u64 {
+        self.external_blob_probe_inputs.load(Ordering::Relaxed)
+    }
+    pub fn external_blob_probe_calls(&self) -> u64 {
+        self.external_blob_probe_calls.load(Ordering::Relaxed)
+    }
+    pub fn ordered_cursor_scan_calls(&self) -> u64 {
+        self.ordered_cursor_scan_calls.load(Ordering::Relaxed)
+    }
+    pub fn ordered_cursor_batch_rows(&self) -> u64 {
+        self.ordered_cursor_batch_rows.load(Ordering::Relaxed)
+    }
+    pub fn ordered_cursor_batch_bytes(&self) -> u64 {
+        self.ordered_cursor_batch_bytes.load(Ordering::Relaxed)
+    }
+    pub fn validation_scan_batches(&self) -> u64 {
+        self.validation_scan_batches.load(Ordering::Relaxed)
+    }
+    pub fn validation_scan_projected_bytes(&self) -> u64 {
+        self.validation_scan_projected_bytes.load(Ordering::Relaxed)
+    }
+    pub fn proven_insert_raw_batch_calls(&self) -> u64 {
+        self.proven_insert_raw_batch_calls.load(Ordering::Relaxed)
+    }
+    pub fn proven_insert_raw_batch_max_bytes(&self) -> u64 {
+        self.proven_insert_raw_batch_max_bytes
+            .load(Ordering::Relaxed)
+    }
+    fn merge_timing_total_us(&self, phase: MergeTimingPhase) -> u64 {
+        self.merge_timing_total_ns[phase.index()].load(Ordering::Relaxed) / 1_000
+    }
+    fn merge_timing_max_us(&self, phase: MergeTimingPhase) -> u64 {
+        self.merge_timing_max_ns[phase.index()].load(Ordering::Relaxed) / 1_000
+    }
+    pub fn outer_prepare_us(&self) -> u64 {
+        self.merge_timing_total_us(MergeTimingPhase::OuterPrepare)
+    }
+    pub fn proven_insert_history_us(&self) -> u64 {
+        self.merge_timing_total_us(MergeTimingPhase::ProvenInsertHistory)
+    }
+    pub fn proven_insert_plan_scan_us(&self) -> u64 {
+        self.merge_timing_total_us(MergeTimingPhase::ProvenInsertPlanScan)
+    }
+    pub fn candidate_validation_us(&self) -> u64 {
+        self.merge_timing_total_us(MergeTimingPhase::CandidateValidation)
+    }
+    pub fn final_revalidation_us(&self) -> u64 {
+        self.merge_timing_total_us(MergeTimingPhase::FinalRevalidation)
+    }
+    pub fn recovery_arm_us(&self) -> u64 {
+        self.merge_timing_total_us(MergeTimingPhase::RecoveryArm)
+    }
+    pub fn physical_publish_us(&self) -> u64 {
+        self.merge_timing_total_us(MergeTimingPhase::PhysicalPublish)
+    }
+    pub fn keyed_stage_total_us(&self) -> u64 {
+        self.merge_timing_total_us(MergeTimingPhase::KeyedStage)
+    }
+    pub fn keyed_stage_max_us(&self) -> u64 {
+        self.merge_timing_max_us(MergeTimingPhase::KeyedStage)
+    }
+    pub fn keyed_commit_total_us(&self) -> u64 {
+        self.merge_timing_total_us(MergeTimingPhase::KeyedCommit)
+    }
+    pub fn keyed_commit_max_us(&self) -> u64 {
+        self.merge_timing_max_us(MergeTimingPhase::KeyedCommit)
+    }
+    pub fn recovery_confirm_us(&self) -> u64 {
+        self.merge_timing_total_us(MergeTimingPhase::RecoveryConfirm)
+    }
+    pub fn manifest_publish_us(&self) -> u64 {
+        self.merge_timing_total_us(MergeTimingPhase::ManifestPublish)
+    }
+    pub fn recovery_cleanup_us(&self) -> u64 {
+        self.merge_timing_total_us(MergeTimingPhase::RecoveryCleanup)
+    }
+    pub fn outer_restore_refresh_us(&self) -> u64 {
+        self.merge_timing_total_us(MergeTimingPhase::OuterRestoreRefresh)
     }
 }
 
@@ -220,6 +434,7 @@ where
 
 /// Record one `stage_append` of `rows` rows against the active probes. No-op in
 /// production (no probes installed).
+#[cfg(test)]
 pub(crate) fn record_stage_append(rows: u64) {
     let _ = MERGE_WRITE_PROBES.try_with(|p| {
         p.stage_append_calls.fetch_add(1, Ordering::Relaxed);
@@ -236,19 +451,120 @@ pub(crate) fn record_stage_merge_insert(rows: u64) {
     });
 }
 
-/// Record one inline vector-index build against the active probes. No-op in
-/// production (no probes installed).
-pub(crate) fn record_create_vector_index() {
+/// Record one update-only keyed stage whose ids were proven present by merge
+/// classification. No-op when no test or benchmark probe is installed.
+pub(crate) fn record_stage_known_present_update(rows: u64) {
     let _ = MERGE_WRITE_PROBES.try_with(|p| {
-        p.create_vector_index_calls.fetch_add(1, Ordering::Relaxed);
+        p.stage_known_present_update_calls
+            .fetch_add(1, Ordering::Relaxed);
+        p.stage_known_present_update_rows
+            .fetch_add(rows, Ordering::Relaxed);
     });
 }
 
-/// Record one `scan_staged_combined` materialization against the active probes.
-/// No-op in production (no probes installed).
-pub(crate) fn record_scan_staged_combined() {
+/// Record one join-free, filter-bearing strict insert of `rows` rows against
+/// the active probes. This is distinct from `stage_merge_insert`: both commit
+/// a fenced Lance `Operation::Update`, but only the latter runs a target join.
+pub(crate) fn record_stage_fenced_insert(rows: u64) {
     let _ = MERGE_WRITE_PROBES.try_with(|p| {
-        p.scan_staged_combined_calls.fetch_add(1, Ordering::Relaxed);
+        p.stage_fenced_insert_calls.fetch_add(1, Ordering::Relaxed);
+        p.stage_fenced_insert_rows
+            .fetch_add(rows, Ordering::Relaxed);
+    });
+}
+
+/// Record one exact target-absence preflight for a strict insert. No-op when
+/// no test or benchmark probe is installed.
+pub(crate) fn record_strict_insert_preflight() {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        p.strict_insert_preflight_calls
+            .fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+/// Record one successfully staged vector-index artifact build against the
+/// active probes. No-op in production (no probes installed).
+pub(crate) fn record_stage_vector_index() {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        p.stage_vector_index_calls.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+/// Record one impending `BlobFile::read` while logical blob arrays are rebuilt.
+/// No-op in production (no probes installed).
+pub(crate) fn record_blob_payload_read() {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        p.blob_payload_read_calls.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+/// Record one external object payload read. Call this alongside the aggregate
+/// Blob read probe at the exact object-store request site.
+pub(crate) fn record_external_blob_payload_read() {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        p.external_blob_payload_read_calls
+            .fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+/// Record the URI-bearing cells accepted by one bounded external-Blob
+/// admission pass. No-op unless a focused test or benchmark installed probes.
+pub(crate) fn record_external_blob_preflight_inputs(inputs: usize) {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        p.external_blob_probe_inputs
+            .fetch_add(inputs as u64, Ordering::Relaxed);
+    });
+}
+
+/// Record one metadata request actually issued for a normalized external Blob
+/// object. Counting at the request site keeps fail-fast concurrent preflights
+/// from reporting planned-but-never-polled probes.
+pub(crate) fn record_external_blob_probe() {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        p.external_blob_probe_calls.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+/// Record the explicit production bounds applied to one ordered merge cursor.
+/// No-op when no test probe is installed.
+pub(crate) fn record_ordered_cursor_scan(batch_rows: usize, batch_bytes: u64) {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        p.ordered_cursor_scan_calls.fetch_add(1, Ordering::Relaxed);
+        p.ordered_cursor_batch_rows
+            .store(batch_rows as u64, Ordering::Relaxed);
+        p.ordered_cursor_batch_bytes
+            .store(batch_bytes, Ordering::Relaxed);
+    });
+}
+
+/// Record one projected scalar validation batch before it is charged to the
+/// operation-wide retention budget. No-op when no test probe is installed.
+pub(crate) fn record_merge_validation_batch(projected_bytes: u64) {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        p.validation_scan_batches.fetch_add(1, Ordering::Relaxed);
+        p.validation_scan_projected_bytes
+            .fetch_add(projected_bytes, Ordering::Relaxed);
+    });
+}
+
+/// Record one raw Lance emission before the proven-insert interval normalizer.
+/// No-op when no test or benchmark probe is installed.
+pub(crate) fn record_proven_insert_raw_batch(bytes: u64) {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        p.proven_insert_raw_batch_calls
+            .fetch_add(1, Ordering::Relaxed);
+        p.proven_insert_raw_batch_max_bytes
+            .fetch_max(bytes, Ordering::Relaxed);
+    });
+}
+
+/// Add one elapsed interval to a diagnostic merge phase. No-op when no test or
+/// benchmark probe is installed.
+pub(crate) fn record_merge_timing(phase: MergeTimingPhase, elapsed: Duration) {
+    let nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        p.merge_timing_total_ns[phase.index()].fetch_add(nanos, Ordering::Relaxed);
+        p.merge_timing_max_ns[phase.index()].fetch_max(nanos, Ordering::Relaxed);
     });
 }
 
@@ -274,12 +590,12 @@ pub(crate) enum VersionResolution {
 ///    `ObjectStoreParams` on the builder, so the open itself is counted
 ///    (`Dataset::with_object_store_wrappers` only wraps an already-open
 ///    store). No wrapper (production) adds nothing.
-/// 3. The shared per-graph `Session` (LanceDB's one-session-per-connection
-///    pattern; warms Lance's metadata/index caches across opens) is attached
-///    whenever the caller has one. `None` is for genuinely session-less
-///    contexts (a `Snapshot` detached from its graph's read caches) — owners
-///    that hold a session (`TableStore`, the handle cache) pass it
-///    unconditionally, so it cannot be silently dropped on one path.
+/// 3. A caller-provided graph data `Session` warms Lance's metadata/index
+///    caches across data-table opens. When absent (for example a detached
+///    historical snapshot or recovery helper), the process-wide zero-cache
+///    control session is attached instead. Every open therefore reuses the
+///    shared object-store registry/client pool without letting mutable control
+///    metadata become stale in a session cache.
 pub(crate) async fn open_dataset(
     uri: &str,
     version: VersionResolution,
@@ -291,33 +607,52 @@ pub(crate) async fn open_dataset(
     if let VersionResolution::At(version) = version {
         builder = builder.with_version(version);
     }
-    if let Some(session) = session {
-        builder = builder.with_session(session.clone());
-    }
+    let session = session
+        .cloned()
+        .unwrap_or_else(crate::lance_access::control_session);
+    builder = builder.with_session(session);
     if let Some(wrapper) = wrapper {
         builder = builder.with_store_params(ObjectStoreParams {
             object_store_wrapper: Some(wrapper),
             ..Default::default()
         });
     }
-    builder
-        .load()
-        .await
-        .map_err(|e| OmniError::Lance(e.to_string()))
+    builder.load().await.map_err(|error| match error {
+        lance::Error::VersionNotFound { .. }
+        | lance::Error::DatasetNotFound { .. }
+        | lance::Error::NotFound { .. }
+            if matches!(version, VersionResolution::At(_)) =>
+        {
+            OmniError::HistoricalVersionReclaimed {
+                version: match version {
+                    VersionResolution::At(version) => version,
+                    VersionResolution::Latest => 0,
+                },
+            }
+        }
+        error => OmniError::Lance(error.to_string()),
+    })
 }
 
-/// Per-method read counts for [`CountingStorageAdapter`].
+/// Per-method call counts for [`CountingStorageAdapter`].
 #[derive(Debug, Default)]
 pub struct StorageReadCounts {
     pub read_text: AtomicU64,
+    pub read_text_if_exists: AtomicU64,
     pub exists: AtomicU64,
     pub read_text_versioned: AtomicU64,
     pub list_dir: AtomicU64,
+    pub mutation_calls: AtomicU64,
+    pub write_text: AtomicU64,
+    pub delete: AtomicU64,
 }
 
 impl StorageReadCounts {
     pub fn read_text(&self) -> u64 {
         self.read_text.load(Ordering::Relaxed)
+    }
+    pub fn read_text_if_exists(&self) -> u64 {
+        self.read_text_if_exists.load(Ordering::Relaxed)
     }
     pub fn exists(&self) -> u64 {
         self.exists.load(Ordering::Relaxed)
@@ -328,10 +663,19 @@ impl StorageReadCounts {
     pub fn list_dir(&self) -> u64 {
         self.list_dir.load(Ordering::Relaxed)
     }
+    pub fn mutation_calls(&self) -> u64 {
+        self.mutation_calls.load(Ordering::Relaxed)
+    }
+    pub fn write_text(&self) -> u64 {
+        self.write_text.load(Ordering::Relaxed)
+    }
+    pub fn delete(&self) -> u64 {
+        self.delete.load(Ordering::Relaxed)
+    }
 }
 
-/// Boundary decorator over a [`StorageAdapter`] that counts read-facing calls.
-/// Reads delegate after incrementing; writes delegate unchanged. Construct with
+/// Boundary decorator over a [`StorageAdapter`] that counts every method call.
+/// Calls delegate after incrementing. Construct with
 /// [`CountingStorageAdapter::new`] and open an engine via
 /// `Omnigraph::open_with_storage` to count its non-Lance storage IO.
 #[derive(Debug)]
@@ -342,7 +686,12 @@ pub struct CountingStorageAdapter {
 
 impl CountingStorageAdapter {
     /// Wrap `inner`, returning the adapter and a shared handle to its counts.
-    pub fn new(inner: Arc<dyn StorageAdapter>) -> (Arc<dyn StorageAdapter>, Arc<StorageReadCounts>) {
+    // Returns the erased `Arc<dyn StorageAdapter>` the engine consumes plus the
+    // counts handle; a bare `Self` would leave the caller unable to read them.
+    #[allow(clippy::new_ret_no_self)]
+    pub fn new(
+        inner: Arc<dyn StorageAdapter>,
+    ) -> (Arc<dyn StorageAdapter>, Arc<StorageReadCounts>) {
         let counts = Arc::new(StorageReadCounts::default());
         let adapter: Arc<dyn StorageAdapter> = Arc::new(Self {
             inner,
@@ -359,11 +708,32 @@ impl StorageAdapter for CountingStorageAdapter {
         self.inner.read_text(uri).await
     }
 
+    async fn read_text_if_exists(&self, uri: &str) -> Result<Option<String>> {
+        self.counts
+            .read_text_if_exists
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner.read_text_if_exists(uri).await
+    }
+
+    async fn read_text_if_exists_bounded(
+        &self,
+        uri: &str,
+        max_bytes: u64,
+    ) -> Result<Option<String>> {
+        self.counts
+            .read_text_if_exists
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner.read_text_if_exists_bounded(uri, max_bytes).await
+    }
+
     async fn write_text(&self, uri: &str, contents: &str) -> Result<()> {
+        self.counts.mutation_calls.fetch_add(1, Ordering::Relaxed);
+        self.counts.write_text.fetch_add(1, Ordering::Relaxed);
         self.inner.write_text(uri, contents).await
     }
 
     async fn write_text_if_absent(&self, uri: &str, contents: &str) -> Result<bool> {
+        self.counts.mutation_calls.fetch_add(1, Ordering::Relaxed);
         self.inner.write_text_if_absent(uri, contents).await
     }
 
@@ -373,10 +743,13 @@ impl StorageAdapter for CountingStorageAdapter {
     }
 
     async fn rename_text(&self, from_uri: &str, to_uri: &str) -> Result<()> {
+        self.counts.mutation_calls.fetch_add(1, Ordering::Relaxed);
         self.inner.rename_text(from_uri, to_uri).await
     }
 
     async fn delete(&self, uri: &str) -> Result<()> {
+        self.counts.mutation_calls.fetch_add(1, Ordering::Relaxed);
+        self.counts.delete.fetch_add(1, Ordering::Relaxed);
         self.inner.delete(uri).await
     }
 
@@ -385,8 +758,22 @@ impl StorageAdapter for CountingStorageAdapter {
         self.inner.list_dir(dir_uri).await
     }
 
+    async fn list_dir_bounded(
+        &self,
+        dir_uri: &str,
+        matching_suffix: &str,
+        bounds: ListDirBounds,
+    ) -> Result<Vec<String>> {
+        self.counts.list_dir.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .list_dir_bounded(dir_uri, matching_suffix, bounds)
+            .await
+    }
+
     async fn read_text_versioned(&self, uri: &str) -> Result<(String, String)> {
-        self.counts.read_text_versioned.fetch_add(1, Ordering::Relaxed);
+        self.counts
+            .read_text_versioned
+            .fetch_add(1, Ordering::Relaxed);
         self.inner.read_text_versioned(uri).await
     }
 
@@ -396,12 +783,14 @@ impl StorageAdapter for CountingStorageAdapter {
         contents: &str,
         expected_version: &str,
     ) -> Result<Option<String>> {
+        self.counts.mutation_calls.fetch_add(1, Ordering::Relaxed);
         self.inner
             .write_text_if_match(uri, contents, expected_version)
             .await
     }
 
     async fn delete_prefix(&self, prefix_uri: &str) -> Result<()> {
+        self.counts.mutation_calls.fetch_add(1, Ordering::Relaxed);
         self.inner.delete_prefix(prefix_uri).await
     }
 }

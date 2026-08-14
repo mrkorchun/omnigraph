@@ -1,15 +1,34 @@
 //! Stored-query registry boot, /queries listing, and invocation routes.
 //! Moved verbatim from tests/server.rs in the modularization.
 
-
 use axum::body::Body;
 use axum::http::StatusCode;
 use omnigraph_server::AppState;
-use serde_json::json;
-
+use serde_json::{Value, json};
 
 mod support;
 use support::*;
+
+async fn assert_receipt_commit_matches_get(app: &axum::Router, output: &Value, token: &str) {
+    let receipt = output
+        .get("commit")
+        .filter(|commit| !commit.is_null())
+        .expect("successful effectful stored mutation must return a commit receipt");
+    let commit_id = receipt["graph_commit_id"]
+        .as_str()
+        .expect("commit receipt must carry graph_commit_id")
+        .to_string();
+    let (status, shown) = json_response(
+        app,
+        get_request(&g(&format!("/commits/{commit_id}")), token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {shown}");
+    assert_eq!(
+        &shown, receipt,
+        "receipt must be the exact published commit"
+    );
+}
 
 #[tokio::test]
 async fn server_boots_with_a_valid_stored_query_registry() {
@@ -29,7 +48,11 @@ async fn server_boots_with_a_valid_stored_query_registry() {
         registry,
     )
     .await;
-    assert!(state.is_ok(), "valid registry should boot: {:?}", state.err());
+    assert!(
+        state.is_ok(),
+        "valid registry should boot: {:?}",
+        state.err()
+    );
 }
 
 #[tokio::test]
@@ -56,7 +79,10 @@ async fn server_refuses_boot_on_type_broken_stored_query() {
         Err(err) => err,
     };
     let msg = err.to_string();
-    assert!(msg.contains("ghost"), "error should name the broken query: {msg}");
+    assert!(
+        msg.contains("ghost"),
+        "error should name the broken query: {msg}"
+    );
     assert!(
         msg.contains("schema check"),
         "error should mention the schema check: {msg}"
@@ -73,13 +99,42 @@ async fn invoke_stored_read_returns_rows() {
     .await;
     let (status, body) = json_response(
         &app,
-        invoke_request("find_person", "t-invoke", json!({ "params": { "name": "Alice" } })),
+        invoke_request(
+            "find_person",
+            "t-invoke",
+            json!({ "params": { "name": "Alice" } }),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(body["query_name"], "find_person");
-    assert_eq!(body["row_count"], 1, "Alice is in the fixture; body: {body}");
+    assert_eq!(
+        body["row_count"], 1,
+        "Alice is in the fixture; body: {body}"
+    );
     assert!(body["rows"].is_array(), "read envelope shape; body: {body}");
+
+    // The graph-head precondition is mutation-only. A stored read must reject
+    // it instead of silently ignoring a caller's concurrency requirement.
+    let request = axum::http::Request::builder()
+        .uri(g("/queries/find_person"))
+        .method(axum::http::Method::POST)
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer t-invoke")
+        .header("omnigraph-if-graph-commit", "unused-on-reads")
+        .body(Body::from(
+            serde_json::to_vec(&json!({ "params": { "name": "Alice" } })).unwrap(),
+        ))
+        .unwrap();
+    let (status, body) = json_response(&app, request).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("requires the fail-closed conditional route"),
+        "mutation-only header must not be ignored by a stored read; body: {body}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -130,7 +185,11 @@ async fn invoke_with_matching_expected_kind_runs() {
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "matching kind should run; body: {body}");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "matching kind should run; body: {body}"
+    );
     assert_eq!(body["query_name"], "find_person");
 }
 
@@ -213,7 +272,11 @@ async fn invoke_stored_mutation_double_gates_on_change() {
     // Has invoke_query but NOT change → the inner change gate denies (403).
     let (status, body) = json_response(
         &app,
-        invoke_request("add_person", "t-invoke", json!({ "params": { "name": "Eve" } })),
+        invoke_request(
+            "add_person",
+            "t-invoke",
+            json!({ "params": { "name": "Eve" } }),
+        ),
     )
     .await;
     assert_eq!(
@@ -225,11 +288,16 @@ async fn invoke_stored_mutation_double_gates_on_change() {
     // Has invoke_query + change → applied.
     let (status, body) = json_response(
         &app,
-        invoke_request("add_person", "t-full", json!({ "params": { "name": "Eve" } })),
+        invoke_request(
+            "add_person",
+            "t-full",
+            json!({ "params": { "name": "Eve" } }),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(body["affected_nodes"], 1, "body: {body}");
+    assert_receipt_commit_matches_get(&app, &body, "t-full").await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -243,7 +311,11 @@ async fn invoke_stored_query_bad_param_is_400() {
     // `name` is declared String; pass a number.
     let (status, body) = json_response(
         &app,
-        invoke_request("find_person", "t-invoke", json!({ "params": { "name": 123 } })),
+        invoke_request(
+            "find_person",
+            "t-invoke",
+            json!({ "params": { "name": 123 } }),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
@@ -263,12 +335,19 @@ async fn invoke_unknown_query_and_denied_actor_return_identical_404() {
     .await;
 
     // Authorized actor, unknown query name → 404.
-    let (unknown_status, unknown_body) =
-        json_response(&app, invoke_request("does_not_exist", "t-invoke", json!({}))).await;
+    let (unknown_status, unknown_body) = json_response(
+        &app,
+        invoke_request("does_not_exist", "t-invoke", json!({})),
+    )
+    .await;
     // Denied actor (no invoke_query), real query name → 404.
     let (denied_status, denied_body) = json_response(
         &app,
-        invoke_request("find_person", "t-noinvoke", json!({ "params": { "name": "Alice" } })),
+        invoke_request(
+            "find_person",
+            "t-noinvoke",
+            json!({ "params": { "name": "Alice" } }),
+        ),
     )
     .await;
 
@@ -295,17 +374,28 @@ async fn invoke_query_holder_without_read_sees_403_not_404() {
     .await;
     let (exists_status, _) = json_response(
         &app,
-        invoke_request("find_person", "t-invokeonly", json!({ "params": { "name": "Alice" } })),
+        invoke_request(
+            "find_person",
+            "t-invokeonly",
+            json!({ "params": { "name": "Alice" } }),
+        ),
     )
     .await;
-    let (absent_status, _) =
-        json_response(&app, invoke_request("does_not_exist", "t-invokeonly", json!({}))).await;
+    let (absent_status, _) = json_response(
+        &app,
+        invoke_request("does_not_exist", "t-invokeonly", json!({})),
+    )
+    .await;
     assert_eq!(
         exists_status,
         StatusCode::FORBIDDEN,
         "an existing read query the holder can't read → inner-gate 403"
     );
-    assert_eq!(absent_status, StatusCode::NOT_FOUND, "unknown query still 404s");
+    assert_eq!(
+        absent_status,
+        StatusCode::NOT_FOUND,
+        "unknown query still 404s"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -318,7 +408,11 @@ async fn list_queries_returns_only_exposed_with_typed_params() {
                 "query add_person($name: String) { insert Person { name: $name } }",
                 true,
             ),
-            ("hidden", "query hidden() { match { $p: Person } return { $p.name } }", false),
+            (
+                "hidden",
+                "query hidden() { match { $p: Person } return { $p.name } }",
+                false,
+            ),
         ],
         &[("act-invoke", "t-invoke")],
         INVOKE_POLICY_YAML,
@@ -328,12 +422,18 @@ async fn list_queries_returns_only_exposed_with_typed_params() {
     assert_eq!(status, StatusCode::OK, "body: {body}");
 
     let entries = body["queries"].as_array().unwrap();
-    let names: Vec<&str> = entries.iter().map(|q| q["name"].as_str().unwrap()).collect();
+    let names: Vec<&str> = entries
+        .iter()
+        .map(|q| q["name"].as_str().unwrap())
+        .collect();
     assert!(
         names.contains(&"find_person") && names.contains(&"add_person"),
         "exposed queries listed: {names:?}"
     );
-    assert!(!names.contains(&"hidden"), "non-exposed query hidden from the catalog: {names:?}");
+    assert!(
+        !names.contains(&"hidden"),
+        "non-exposed query hidden from the catalog: {names:?}"
+    );
 
     let fp = entries.iter().find(|q| q["name"] == "find_person").unwrap();
     assert_eq!(fp["mutation"], false);
@@ -382,7 +482,11 @@ async fn list_queries_surfaces_query_description_and_instruction() {
     let (_temp, app) = app_with_stored_queries(
         &[
             ("described", described, true),
-            ("bare", "query bare() { match { $p: Person } return { $p.name } }", true),
+            (
+                "bare",
+                "query bare() { match { $p: Person } return { $p.name } }",
+                true,
+            ),
         ],
         &[("act-invoke", "t-invoke")],
         INVOKE_POLICY_YAML,
@@ -398,8 +502,7 @@ async fn list_queries_surfaces_query_description_and_instruction() {
         "query @description surfaces over GET /queries: {described}"
     );
     assert_eq!(
-        described["instruction"],
-        "Use for exact lookups; prefer search for fuzzy matches.",
+        described["instruction"], "Use for exact lookups; prefer search for fuzzy matches.",
         "query @instruction surfaces over GET /queries: {described}"
     );
 
@@ -419,4 +522,122 @@ async fn list_queries_is_empty_when_no_registry() {
         body["queries"].as_array().unwrap().is_empty(),
         "no stored-query registry → empty catalog"
     );
+}
+
+/// GitHub #365: a stored mutation invoked by name honors the same
+/// `Omnigraph-If-Graph-Commit` branch-head precondition as `POST /mutate` —
+/// this is the CLI's `mutate <name>` path in served deployments, so without it
+/// the flag would silently not apply to stored mutations.
+#[tokio::test(flavor = "multi_thread")]
+async fn invoke_stored_mutation_graph_commit_precondition_issue_365() {
+    async fn head_commit_id(app: &axum::Router) -> String {
+        let (status, out) =
+            json_response(app, get_request(&g("/commits?branch=main"), "t-full")).await;
+        assert_eq!(status, StatusCode::OK, "body: {out}");
+        out["commits"]
+            .as_array()
+            .expect("commit list")
+            .iter()
+            .max_by_key(|commit| commit["manifest_version"].as_u64().unwrap())
+            .expect("loaded graph has at least one commit")["graph_commit_id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+    fn invoke_with_graph_commit_precondition(
+        name: &str,
+        body: serde_json::Value,
+        expected_commit: &str,
+    ) -> axum::http::Request<Body> {
+        axum::http::Request::builder()
+            .uri(g(&format!("/queries/{name}/if-graph-commit")))
+            .method(axum::http::Method::POST)
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer t-full")
+            .header("omnigraph-if-graph-commit", expected_commit)
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    }
+
+    let specs: &[(&str, &str, bool)] = &[(
+        "add_person",
+        "query add_person($name: String) { insert Person { name: $name } }",
+        false,
+    )];
+    let (_temp, app) =
+        app_with_stored_queries(specs, &[("act-full", "t-full")], INVOKE_POLICY_YAML).await;
+    let stale_head = head_commit_id(&app).await;
+
+    let conditional_body = json!({ "params": { "name": "Refused" } });
+    let request = axum::http::Request::builder()
+        .uri(g("/queries/add_person/if-graph-commit"))
+        .method(axum::http::Method::POST)
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer t-full")
+        .body(Body::from(serde_json::to_vec(&conditional_body).unwrap()))
+        .unwrap();
+    let (status, _) = json_response(&app, request).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "the stored conditional capability route requires its header"
+    );
+    let request = axum::http::Request::builder()
+        .uri(g("/queries/add_person"))
+        .method(axum::http::Method::POST)
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer t-full")
+        .header("omnigraph-if-graph-commit", &stale_head)
+        .body(Body::from(serde_json::to_vec(&conditional_body).unwrap()))
+        .unwrap();
+    let (status, _) = json_response(&app, request).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "the ordinary stored route must reject an unsafe optional CAS header"
+    );
+
+    // A plain invoke advances the head past the commit the caller read.
+    let (status, body) = json_response(
+        &app,
+        invoke_request(
+            "add_person",
+            "t-full",
+            json!({ "params": { "name": "Eve" } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    // Stale precondition: 412 with structured details, no effect.
+    let (status, body) = json_response(
+        &app,
+        invoke_with_graph_commit_precondition(
+            "add_person",
+            json!({ "params": { "name": "Zed" } }),
+            &stale_head,
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::PRECONDITION_FAILED,
+        "stale graph-commit precondition on a stored mutation must 412; body: {body}"
+    );
+    assert_eq!(body["precondition_failure"]["expected"], json!(stale_head));
+
+    // Current head passes and commits.
+    let current_head = head_commit_id(&app).await;
+    let (status, body) = json_response(
+        &app,
+        invoke_with_graph_commit_precondition(
+            "add_person",
+            json!({ "params": { "name": "Zed" } }),
+            &current_head,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["affected_nodes"], 1, "body: {body}");
+    assert_receipt_commit_matches_get(&app, &body, "t-full").await;
 }

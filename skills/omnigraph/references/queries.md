@@ -115,6 +115,50 @@ query employees_of($company: String) {
 }
 ```
 
+### Undirected traversal (omnigraph >= 0.8.1)
+
+For symmetric relations (same-endpoint-type edges like `IssueRelated: Issue -> Issue`),
+angle brackets match the edge in **either direction**, deduplicated — one
+pattern replaces querying both directions and merging:
+
+```gq
+query related_to($slug: String) {
+    match {
+        $i: Issue { slug: $slug }
+        $i <issueRelated> $r
+    }
+    return { $r.slug }
+}
+```
+
+### Edge bindings — filtering and projecting edge properties (omnigraph >= 0.9.0)
+
+An optional `$var:` prefix on the edge word binds the matched edge *row*, so
+declared edge properties (confidence, role, provenance, …) become usable
+anywhere a node field is:
+
+```gq
+query asserted_links($slug: String) {
+    match {
+        $i: Issue { slug: $slug }
+        $i $w:issueRelated $r
+        $w.confidence = "asserted"
+    }
+    return { $r.slug, $w.confidence }
+}
+```
+
+Rules: composes with the undirected form (`$a $w:<related> $b`) and inside
+`not { }`. A bound traversal returns **one row per matching edge**, so
+parallel edges between the same endpoints appear individually (unbound
+traversals keep set-of-pairs semantics). Rejected with `T23`: binding a
+`{min,max}` multi-hop, rebinding a taken variable name, or projecting bare
+`$w` (project a property instead).
+
+Composes with hop bounds (`$a <knows>{1,3} $b`) and `not { }` ("no edge in
+either direction"). Asymmetric edges (e.g. `Comment -> Issue`) are rejected at
+typecheck (T22) — use the directional form there.
+
 ### Negation
 
 ```gq
@@ -271,7 +315,7 @@ query add_and_link($slug: String, $pattern: String, $createdAt: DateTime, $updat
 
 There's no `upsert` keyword at the query level — use `load --mode merge` for bulk upsert.
 
-> **Insert/update-only OR delete-only (the D₂ rule).** A single mutation query may contain inserts and updates, **or** deletes — never both. Mixing a `delete` with an `insert`/`update` in the same query is rejected at parse time. (Inserts/updates go through a staged two-phase publish; deletes inline-commit — omnigraph doesn't yet use Lance's two-phase delete API (it shipped in Lance 7.0.0 but isn't wired in) — so they can't share one atomic statement.) Split a delete-then-insert into two separate mutations.
+> **Insert/update-only OR delete-only (the D₂ rule).** A single mutation query may contain inserts and updates, **or** deletes — never both. Mixing a `delete` with an `insert`/`update` in the same query is rejected at parse time. (Deletes stage through the same two-phase publish as inserts/updates since 0.8.0; the D₂ split is a deliberate semantic boundary — one mutation query is constructive XOR destructive, keeping read-your-writes unambiguous — not an implementation gap.) Split a delete-then-insert into two separate mutations.
 
 ### Date and DateTime values
 

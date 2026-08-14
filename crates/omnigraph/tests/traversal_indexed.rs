@@ -9,16 +9,21 @@
 
 mod helpers;
 
+use omnigraph::IndexCoverage;
 use omnigraph::db::Omnigraph;
 use omnigraph::instrumentation::with_traversal_mode;
 use omnigraph::loader::{LoadMode, load_jsonl};
-use omnigraph::table_store::{IndexCoverage, TableStore};
 use omnigraph_compiler::ir::ParamMap;
 
 use helpers::*;
 
 /// Run `name` on main under the cost-chooser (auto) Expand mode; first column sorted.
-async fn sorted_names(db: &mut Omnigraph, queries: &str, name: &str, params: &ParamMap) -> Vec<String> {
+async fn sorted_names(
+    db: &mut Omnigraph,
+    queries: &str,
+    name: &str,
+    params: &ParamMap,
+) -> Vec<String> {
     first_column_sorted(&query_main(db, queries, name, params).await.unwrap())
 }
 
@@ -27,7 +32,12 @@ async fn sorted_names(db: &mut Omnigraph, queries: &str, name: &str, params: &Pa
 /// scoped `with_traversal_mode` seam; the auto pass exercises `choose_expand_mode`
 /// end to end (whichever path it selects, the rows must match the forced paths —
 /// the chooser changes which path runs, never the result).
-async fn both_modes(db: &mut Omnigraph, queries: &str, name: &str, params: &ParamMap) -> Vec<String> {
+async fn both_modes(
+    db: &mut Omnigraph,
+    queries: &str,
+    name: &str,
+    params: &ParamMap,
+) -> Vec<String> {
     let csr = first_column_sorted(
         &with_traversal_mode("csr", query_main(db, queries, name, params))
             .await
@@ -58,18 +68,15 @@ async fn key_column_index_coverage_detects_btree_presence() {
     let db = init_and_load(&dir).await;
     let snap = snapshot_main(&db).await.unwrap();
 
-    // Edge `src` gets a BTREE from ensure_indices on load → Indexed.
+    // The shared fixture explicitly reconciles indexes after loading, so the
+    // edge `src` BTREE is present and fully covered here.
     let edge_ds = snap.open("edge:Knows").await.unwrap();
-    let src_cov = TableStore::key_column_index_coverage(&edge_ds, "src")
-        .await
-        .unwrap();
+    let src_cov = edge_ds.index_coverage("src").await.unwrap();
     assert_eq!(src_cov, IndexCoverage::Indexed, "edge src is BTREE-indexed");
 
     // A node property column with no scalar index → Degraded (the warn path).
     let node_ds = snap.open("node:Person").await.unwrap();
-    let age_cov = TableStore::key_column_index_coverage(&node_ds, "age")
-        .await
-        .unwrap();
+    let age_cov = node_ds.index_coverage("age").await.unwrap();
     assert!(
         matches!(age_cov, IndexCoverage::Degraded { .. }),
         "non-indexed column should be Degraded, got {age_cov:?}"
@@ -86,11 +93,12 @@ async fn coverage_degrades_for_appended_unindexed_fragment() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
 
-    // Fresh load: the Knows BTREE covers every fragment → Indexed.
+    // The fixture's explicit post-load `ensure_indices` covers every current
+    // Knows fragment → Indexed.
     let snap = snapshot_main(&db).await.unwrap();
     let edge_ds = snap.open("edge:Knows").await.unwrap();
     assert_eq!(
-        TableStore::key_column_index_coverage(&edge_ds, "src").await.unwrap(),
+        edge_ds.index_coverage("src").await.unwrap(),
         IndexCoverage::Indexed,
         "freshly-loaded edge BTREE covers all fragments"
     );
@@ -107,7 +115,7 @@ async fn coverage_degrades_for_appended_unindexed_fragment() {
 
     let snap2 = snapshot_main(&db).await.unwrap();
     let edge_ds2 = snap2.open("edge:Knows").await.unwrap();
-    let cov = TableStore::key_column_index_coverage(&edge_ds2, "src").await.unwrap();
+    let cov = edge_ds2.index_coverage("src").await.unwrap();
     assert!(
         matches!(cov, IndexCoverage::Degraded { .. }),
         "appended unindexed fragment must degrade coverage, got {cov:?}"
@@ -119,7 +127,13 @@ async fn indexed_matches_csr_one_hop_same_type() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
     // friends_of: `$p knows $f` (Person -> Person, single hop).
-    let got = both_modes(&mut db, TEST_QUERIES, "friends_of", &params(&[("$name", "Alice")])).await;
+    let got = both_modes(
+        &mut db,
+        TEST_QUERIES,
+        "friends_of",
+        &params(&[("$name", "Alice")]),
+    )
+    .await;
     assert_eq!(got, vec!["Bob", "Charlie"], "Alice knows Bob and Charlie");
 }
 
@@ -173,7 +187,13 @@ query connected($name: String) {
 }
 "#;
     // Alice: outgoing Bob, Charlie; incoming Diana (the fresh unindexed edge).
-    let got = both_modes(&mut db, queries, "connected", &params(&[("$name", "Alice")])).await;
+    let got = both_modes(
+        &mut db,
+        queries,
+        "connected",
+        &params(&[("$name", "Alice")]),
+    )
+    .await;
     assert_eq!(got, vec!["Bob", "Charlie", "Diana"]);
 }
 
@@ -217,7 +237,13 @@ async fn indexed_matches_csr_no_match() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
     // Diana has no outgoing Knows edges → empty in both modes.
-    let got = both_modes(&mut db, TEST_QUERIES, "friends_of", &params(&[("$name", "Diana")])).await;
+    let got = both_modes(
+        &mut db,
+        TEST_QUERIES,
+        "friends_of",
+        &params(&[("$name", "Diana")]),
+    )
+    .await;
     assert!(got.is_empty(), "Diana knows no one");
 }
 
@@ -243,7 +269,12 @@ async fn indexed_finds_unindexed_appended_edge() {
     let got = first_column_sorted(
         &with_traversal_mode(
             "indexed",
-            query_main(&mut db, TEST_QUERIES, "friends_of", &params(&[("$name", "Alice")])),
+            query_main(
+                &mut db,
+                TEST_QUERIES,
+                "friends_of",
+                &params(&[("$name", "Alice")]),
+            ),
         )
         .await
         .unwrap(),
@@ -293,7 +324,7 @@ query reach($name: String) {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let mut db = Omnigraph::init(uri, SCHEMA).await.unwrap();
-    load_jsonl(&mut db, DATA, LoadMode::Overwrite).await.unwrap();
+    load_jsonl(&db, DATA, LoadMode::Overwrite).await.unwrap();
 
     let got = both_modes(&mut db, QUERY, "reach", &params(&[("$name", "alice")])).await;
     assert_eq!(
@@ -330,7 +361,7 @@ async fn variable_hops_terminate_and_dedup_on_cycle() {
 {"edge":"Knows","from":"b","to":"c"}
 {"edge":"Knows","from":"c","to":"a"}"#;
     let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-    load_jsonl(&mut db, data, LoadMode::Overwrite).await.unwrap();
+    load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
 
     let got = both_modes(&mut db, REACH_5, "reach", &params(&[("$name", "a")])).await;
     // From a: b (1 hop), c (2 hops); the c->a back-edge hits the seeded source
@@ -338,8 +369,9 @@ async fn variable_hops_terminate_and_dedup_on_cycle() {
     assert_eq!(got, vec!["b", "c"]);
 }
 
-// A self-loop a->a plus a->b. Variable-length traversal must not loop forever and
-// must not re-emit the seeded source.
+// Self-loop a->a plus a->b: the self-edge is a genuine length-1 walk, so the
+// reach set is {a, b} (walk semantics); traversal must terminate. Cycle
+// pruning: see variable_hops_terminate_and_dedup_on_cycle.
 #[tokio::test]
 async fn variable_hops_handle_self_loop() {
     let dir = tempfile::tempdir().unwrap();
@@ -349,9 +381,73 @@ async fn variable_hops_handle_self_loop() {
 {"edge":"Knows","from":"a","to":"a"}
 {"edge":"Knows","from":"a","to":"b"}"#;
     let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-    load_jsonl(&mut db, data, LoadMode::Overwrite).await.unwrap();
+    load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
 
     let got = both_modes(&mut db, REACH_5, "reach", &params(&[("$name", "a")])).await;
-    // a->a hits the seeded source (pruned); only b is reached.
-    assert_eq!(got, vec!["b"]);
+    // a via its own self-edge (1 hop), b (1 hop). No infinite loop.
+    assert_eq!(got, vec!["a", "b"]);
+}
+
+// A stored self-loop must appear in every single-hop spelling — directed,
+// undirected (docs/user/queries/index.md: "a self-loop, appears once"), and
+// bound-edge — and all three must agree.
+#[tokio::test]
+async fn single_hop_self_loop_is_emitted_by_all_spellings() {
+    const QUERIES: &str = r#"
+query friends($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p knows $f
+    }
+    return { $f.name }
+}
+query friends_undirected($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p <knows> $f
+    }
+    return { $f.name }
+}
+query friends_bound($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p $w:knows $f
+    }
+    return { $f.name }
+}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let data = r#"{"type":"Person","data":{"name":"a"}}
+{"type":"Person","data":{"name":"b"}}
+{"edge":"Knows","from":"a","to":"a"}
+{"edge":"Knows","from":"a","to":"b"}"#;
+    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
+
+    let p = params(&[("$name", "a")]);
+    let directed = both_modes(&mut db, QUERIES, "friends", &p).await;
+    assert_eq!(
+        directed,
+        vec!["a", "b"],
+        "directed single hop emits the self-loop"
+    );
+
+    let undirected = both_modes(&mut db, QUERIES, "friends_undirected", &p).await;
+    // The self-loop row is reachable through both the out and in probes; set
+    // semantics emit it once.
+    assert_eq!(
+        undirected,
+        vec!["a", "b"],
+        "undirected emits the self-loop once"
+    );
+
+    // Auto mode only: an edge binding dispatches to execute_expand_bound
+    // before any mode logic, so forcing csr/indexed does not apply.
+    let bound = sorted_names(&mut db, QUERIES, "friends_bound", &p).await;
+    assert_eq!(
+        bound,
+        vec!["a", "b"],
+        "bound-edge agrees with the other spellings"
+    );
 }

@@ -1,4 +1,122 @@
 use super::*;
+use futures::TryStreamExt;
+use std::future::Future;
+
+/// Initial row estimate used by Lance's byte-targeted export scanner.
+pub(super) const EXPORT_SCAN_TARGET_ROWS: usize = 8_192;
+/// Approximate decoded Arrow byte target for one export scanner batch.
+pub(super) const EXPORT_SCAN_TARGET_BYTES: u64 = 32 * 1024 * 1024;
+/// Maximum bytes passed to one asynchronous export transport emission.
+#[doc(hidden)]
+pub const EXPORT_CHUNK_MAX_BYTES: usize = 64 * 1024;
+
+/// One immutable graph cut captured for served export.
+///
+/// The cut retains immutable Lance version pins and the sole exclusive root
+/// export gate while bytes are produced. Ordinary writers may advance HEAD in
+/// parallel; cooperative cleanup, schema, branch, and root controls cannot
+/// remove or reuse the cut's exact coordinates until it is dropped.
+/// Private fields and the absence of `Clone`/serde/default constructors keep
+/// the cut non-forgeable.
+#[doc(hidden)]
+pub struct ExportCut {
+    db: Arc<Omnigraph>,
+    snapshot: Snapshot,
+    catalog: Arc<Catalog>,
+    selected_tables: Vec<String>,
+    _slot: crate::db::write_queue::ExportCutPermit,
+}
+
+impl ExportCut {
+    async fn emit_chunks<Emit, EmitFuture>(&self, emit: &mut Emit) -> Result<()>
+    where
+        Emit: FnMut(Vec<u8>) -> EmitFuture,
+        EmitFuture: Future<Output = Result<()>>,
+    {
+        export_selected_tables(
+            self.db.as_ref(),
+            &self.snapshot,
+            self.catalog.as_ref(),
+            &self.selected_tables,
+            emit,
+        )
+        .await
+    }
+
+    /// Emit this cut as independently owned bounded chunks.
+    ///
+    /// The returned cut retains its root slot and exact-version pins. A served
+    /// transport keeps it in a terminal frame until every preceding data frame
+    /// has drained; a disconnected receiver drops either the in-flight future
+    /// or that terminal frame and therefore releases the cut promptly.
+    #[doc(hidden)]
+    pub async fn write_chunks<Emit, EmitFuture>(self, mut emit: Emit) -> (Self, Result<()>)
+    where
+        Emit: FnMut(Vec<u8>) -> EmitFuture,
+        EmitFuture: Future<Output = Result<()>>,
+    {
+        let result = self.emit_chunks(&mut emit).await;
+        (self, result)
+    }
+
+    /// Consume this cut and write its exact pinned contents as JSONL.
+    ///
+    /// A storage or writer failure after output starts is returned unchanged;
+    /// dropping this future or any error path releases the root export gate.
+    pub async fn write_to<W: Write>(self, writer: &mut W) -> Result<()> {
+        let (_cut, result) = self
+            .write_chunks(|chunk: Vec<u8>| {
+                std::future::ready(writer.write_all(&chunk).map_err(OmniError::from))
+            })
+            .await;
+        result
+    }
+
+    /// Consume this cut and return its exact pinned contents as one JSONL
+    /// string. Intended for tests and non-transport callers; served export uses
+    /// bounded asynchronous chunks instead of retaining the complete artifact.
+    pub async fn into_jsonl(self) -> Result<String> {
+        let mut out = Vec::new();
+        self.write_to(&mut out).await?;
+        String::from_utf8(out)
+            .map_err(|err| OmniError::manifest(format!("export produced invalid UTF-8: {err}")))
+    }
+}
+
+impl Omnigraph {
+    /// Capture one immutable served-export cut.
+    ///
+    /// The exclusive root gate is non-waiting and this is the sole cut-capture
+    /// surface used by served transport.
+    #[doc(hidden)]
+    pub async fn capture_served_export_cut(
+        self: &Arc<Self>,
+        branch: &str,
+        type_names: &[String],
+        table_keys: &[String],
+    ) -> Result<ExportCut> {
+        let slot = self.write_queue().try_acquire_export_cut().ok_or_else(|| {
+            OmniError::ResourceLimitExceeded {
+                resource: "stream_export_slots".to_string(),
+                limit: 1,
+                actual: 2,
+            }
+        })?;
+
+        self.heal_pending_recovery_sidecars_outcome().await?;
+        let (resolved, catalog) = self.capture_read_view(ReadTarget::branch(branch)).await?;
+        let snapshot = resolved.snapshot;
+        let selected_tables = export_table_keys(&snapshot, type_names, table_keys)?;
+
+        Ok(ExportCut {
+            db: Arc::clone(self),
+            snapshot,
+            catalog,
+            selected_tables,
+            _slot: slot,
+        })
+    }
+}
 
 pub(super) async fn entity_at_target(
     db: &Omnigraph,
@@ -44,9 +162,28 @@ pub(super) async fn export_jsonl_to_writer<W: Write>(
     table_keys: &[String],
     writer: &mut W,
 ) -> Result<()> {
-    db.ensure_schema_state_valid().await?;
-    let snapshot = db.snapshot_of(ReadTarget::branch(branch)).await?;
-    export_snapshot_jsonl_to_writer(db, &snapshot, type_names, table_keys, writer).await
+    // Reserve before the first manifest read. Cleanup, schema apply, branch
+    // replacement, and root deletion must not remove or reuse the selected
+    // coordinates while bytes are still being read.
+    let _export_cut = db.write_queue().try_acquire_export_cut().ok_or_else(|| {
+        OmniError::ResourceLimitExceeded {
+            resource: "stream_export_slots".to_string(),
+            limit: 1,
+            actual: 2,
+        }
+    })?;
+    let (resolved, catalog) = db.capture_read_view(ReadTarget::branch(branch)).await?;
+    let selected_tables = export_table_keys(&resolved.snapshot, type_names, table_keys)?;
+    let mut emit =
+        |chunk: Vec<u8>| std::future::ready(writer.write_all(&chunk).map_err(OmniError::from));
+    export_selected_tables(
+        db,
+        &resolved.snapshot,
+        catalog.as_ref(),
+        &selected_tables,
+        &mut emit,
+    )
+    .await
 }
 
 async fn entity_from_snapshot(
@@ -74,16 +211,19 @@ async fn entity_from_snapshot(
     Ok(Some(record_batch_row_to_json(batch, 0)?))
 }
 
-async fn export_snapshot_jsonl_to_writer<W: Write>(
+async fn export_selected_tables<Emit, EmitFuture>(
     db: &Omnigraph,
     snapshot: &Snapshot,
-    type_names: &[String],
-    table_keys: &[String],
-    writer: &mut W,
-) -> Result<()> {
-    let selected_tables = export_table_keys(snapshot, type_names, table_keys)?;
+    catalog: &Catalog,
+    selected_tables: &[String],
+    emit: &mut Emit,
+) -> Result<()>
+where
+    Emit: FnMut(Vec<u8>) -> EmitFuture,
+    EmitFuture: Future<Output = Result<()>>,
+{
     for table_key in selected_tables {
-        export_table_to_writer(db, snapshot, &table_key, writer).await?;
+        export_table(db, snapshot, catalog, table_key, emit).await?;
     }
     Ok(())
 }
@@ -136,58 +276,95 @@ fn export_table_keys(
     Ok(selected.into_iter().collect())
 }
 
-async fn export_table_to_writer<W: Write>(
+async fn export_table<Emit, EmitFuture>(
     db: &Omnigraph,
     snapshot: &Snapshot,
+    catalog: &Catalog,
     table_key: &str,
-    writer: &mut W,
-) -> Result<()> {
+    emit: &mut Emit,
+) -> Result<()>
+where
+    Emit: FnMut(Vec<u8>) -> EmitFuture,
+    EmitFuture: Future<Output = Result<()>>,
+{
     let ds = db
         .storage()
         .open_snapshot_at_table(snapshot, table_key)
         .await?;
     let ordering = Some(vec![ColumnOrdering::asc_nulls_last("id".to_string())]);
-    let catalog = db.catalog();
-    let blob_properties = blob_properties_for_table_key(&catalog, table_key)?;
+    let blob_properties = blob_properties_for_table_key(catalog, table_key)?;
 
     if blob_properties.is_empty() {
-        for batch in db.storage().scan(&ds, None, None, ordering).await? {
-            write_export_rows_from_batch(db, table_key, &batch, None, writer)?;
+        let mut batches = db
+            .storage()
+            .scan_stream_bounded(
+                &ds,
+                None,
+                None,
+                ordering,
+                false,
+                EXPORT_SCAN_TARGET_ROWS,
+                EXPORT_SCAN_TARGET_BYTES,
+            )
+            .await?;
+        while let Some(batch) = batches
+            .try_next()
+            .await
+            .map_err(|error| OmniError::Lance(error.to_string()))?
+        {
+            emit_export_rows_from_batch(catalog, table_key, &batch, None, emit).await?;
         }
         return Ok(());
     }
 
-    let batches = db
+    // Lance's byte target is approximate and overrides its row estimate, so a
+    // scanner batch is not a hard memory bound. Slice each returned descriptor
+    // batch explicitly and materialize only one logical row's complete Blob
+    // property set before observing transport backpressure. One Blob value and
+    // one row's encoded JSON remain indivisible scratch allocations.
+    let mut batches = db
         .storage()
-        .scan_with_row_id(&ds, None, None, ordering, true)
+        .scan_stream_bounded(
+            &ds,
+            None,
+            None,
+            ordering,
+            true,
+            EXPORT_SCAN_TARGET_ROWS,
+            EXPORT_SCAN_TARGET_BYTES,
+        )
         .await?;
-    for batch in batches {
-        let row_ids = batch
-            .column_by_name("_rowid")
-            .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
-            .ok_or_else(|| {
-                OmniError::Lance(format!(
-                    "expected _rowid column when exporting '{}'",
-                    table_key
-                ))
-            })?
-            .values()
-            .iter()
-            .copied()
-            .collect::<Vec<_>>();
-        // Blob materialization reaches through to the inner Lance
-        // `Dataset` because `take_blobs` is a Lance-only API not lifted
-        // onto the `TableStorage` trait surface (the trait covers
-        // staged-write and snapshot-scan primitives; blob descriptor
-        // materialization sits outside that surface).
-        let blob_values =
-            export_blob_values(ds.dataset(), &batch, &row_ids, blob_properties).await?;
-        write_export_rows_from_batch(db, table_key, &batch, Some(&blob_values), writer)?;
+    while let Some(batch) = batches
+        .try_next()
+        .await
+        .map_err(|error| OmniError::Lance(error.to_string()))?
+    {
+        for row_index in 0..batch.num_rows() {
+            let row = batch.slice(row_index, 1);
+            let row_id = row
+                .column_by_name("_rowid")
+                .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
+                .ok_or_else(|| {
+                    OmniError::Lance(format!(
+                        "expected _rowid column when exporting '{}'",
+                        table_key
+                    ))
+                })?
+                .value(0);
+            // Blob materialization reaches through to the inner Lance
+            // `Dataset` because `take_blobs` is a Lance-only API not lifted
+            // onto the `TableStorage` trait surface (the trait covers
+            // staged-write and snapshot-scan primitives; blob descriptor
+            // materialization sits outside that surface).
+            let blob_values =
+                export_blob_values(ds.dataset(), &row, &[row_id], blob_properties).await?;
+            emit_export_rows_from_batch(catalog, table_key, &row, Some(&blob_values), emit).await?;
+        }
     }
     Ok(())
 }
 
-async fn export_blob_values(
+pub(crate) async fn export_blob_values(
     source_ds: &Dataset,
     batch: &RecordBatch,
     row_ids: &[u64],
@@ -212,14 +389,74 @@ async fn export_blob_values(
     Ok(values)
 }
 
-fn write_export_rows_from_batch<W: Write>(
-    db: &Omnigraph,
+/// Convert one descriptor-scanned row into the same logical value shape used
+/// by export, materializing at most that row's Blob values.
+pub(crate) async fn logical_row_image(
+    source_ds: &Dataset,
+    batch: &RecordBatch,
+    row: usize,
+) -> Result<serde_json::Value> {
+    let row_batch = batch.slice(row, 1);
+    let blob_properties = row_batch
+        .schema()
+        .fields()
+        .iter()
+        .filter_map(|field| {
+            let lance_field = lance::datatypes::Field::try_from(field.as_ref())
+                .map_err(|error| OmniError::Lance(error.to_string()));
+            match lance_field {
+                Ok(field) if field.is_blob() => Some(Ok(field.name.clone())),
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .collect::<Result<std::collections::HashSet<_>>>()?;
+    let blob_values = if blob_properties.is_empty() {
+        None
+    } else {
+        let row_id = row_batch
+            .column_by_name("_rowid")
+            .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
+            .ok_or_else(|| OmniError::Lance("change row is missing _rowid".to_string()))?
+            .value(0);
+        Some(export_blob_values(source_ds, &row_batch, &[row_id], &blob_properties).await?)
+    };
+
+    // A pinned Lance version is the commit-era schema authority. Consulting
+    // the live catalog here breaks retained commits after rename/add/drop.
+    let mut image = serde_json::Map::new();
+    for field in row_batch
+        .schema()
+        .fields()
+        .iter()
+        .filter(|field| !field.name().starts_with("_row"))
+    {
+        image.insert(
+            field.name().clone(),
+            export_value_for_field(
+                &row_batch,
+                field.name(),
+                0,
+                blob_values
+                    .as_ref()
+                    .and_then(|values| values.get(field.name())),
+            )?,
+        );
+    }
+    Ok(serde_json::Value::Object(image))
+}
+
+async fn emit_export_rows_from_batch<Emit, EmitFuture>(
+    catalog: &Catalog,
     table_key: &str,
     batch: &RecordBatch,
     blob_values: Option<&HashMap<String, Vec<Option<String>>>>,
-    writer: &mut W,
-) -> Result<()> {
-    let catalog = db.catalog();
+    emit: &mut Emit,
+) -> Result<()>
+where
+    Emit: FnMut(Vec<u8>) -> EmitFuture,
+    EmitFuture: Future<Output = Result<()>>,
+{
     if let Some(type_name) = table_key.strip_prefix("node:") {
         let node_type = catalog
             .node_types
@@ -242,14 +479,15 @@ fn write_export_rows_from_batch<W: Write>(
                     )?,
                 );
             }
-            write_export_jsonl_row(
-                writer,
+            emit_export_jsonl_row(
+                emit,
                 table_key,
                 &serde_json::json!({
                     "type": type_name,
                     "data": serde_json::Value::Object(data),
                 }),
-            )?;
+            )
+            .await?;
         }
         return Ok(());
     }
@@ -278,8 +516,8 @@ fn write_export_rows_from_batch<W: Write>(
                     )?,
                 );
             }
-            write_export_jsonl_row(
-                writer,
+            emit_export_jsonl_row(
+                emit,
                 table_key,
                 &serde_json::json!({
                     "edge": edge_name,
@@ -287,7 +525,8 @@ fn write_export_rows_from_batch<W: Write>(
                     "to": to,
                     "data": serde_json::Value::Object(data),
                 }),
-            )?;
+            )
+            .await?;
         }
         return Ok(());
     }
@@ -298,18 +537,25 @@ fn write_export_rows_from_batch<W: Write>(
     )))
 }
 
-fn write_export_jsonl_row<W: Write>(
-    writer: &mut W,
+async fn emit_export_jsonl_row<Emit, EmitFuture>(
+    emit: &mut Emit,
     table_key: &str,
     row: &serde_json::Value,
-) -> Result<()> {
-    serde_json::to_writer(&mut *writer, row).map_err(|err| {
+) -> Result<()>
+where
+    Emit: FnMut(Vec<u8>) -> EmitFuture,
+    EmitFuture: Future<Output = Result<()>>,
+{
+    let mut encoded = serde_json::to_vec(row).map_err(|err| {
         OmniError::manifest(format!(
             "failed to serialize export row for '{}': {}",
             table_key, err
         ))
     })?;
-    writer.write_all(b"\n")?;
+    encoded.push(b'\n');
+    for chunk in encoded.chunks(EXPORT_CHUNK_MAX_BYTES) {
+        emit(chunk.to_vec()).await?;
+    }
     Ok(())
 }
 
@@ -319,32 +565,40 @@ async fn export_blob_column_values(
     descriptions: &StructArray,
     row_ids: &[u64],
 ) -> Result<Vec<Option<String>>> {
-    let mut non_null_row_ids = Vec::new();
-    let mut non_null_positions = Vec::new();
+    let decoder = crate::blob::BlobDescriptorDecoder::try_new(descriptions)?;
+    let mut managed_row_ids = Vec::new();
+    let mut managed_positions = Vec::new();
     let mut values = vec![None; row_ids.len()];
 
     for (row, row_id) in row_ids.iter().enumerate() {
-        if blob_description_is_null(descriptions, row)? {
-            continue;
+        match decoder.classify(row)? {
+            crate::blob::BlobDescriptor::Null => {}
+            crate::blob::BlobDescriptor::Managed { .. } => {
+                managed_row_ids.push(*row_id);
+                managed_positions.push(row);
+            }
+            crate::blob::BlobDescriptor::External { uri, .. } => {
+                // Export is descriptor-preserving. It must not open or probe a
+                // caller-owned object merely to reproduce the stored URI.
+                values[row] = Some(uri);
+            }
         }
-        non_null_row_ids.push(*row_id);
-        non_null_positions.push(row);
     }
 
-    if non_null_row_ids.is_empty() {
+    if managed_row_ids.is_empty() {
         return Ok(values);
     }
 
-    let mut perm: Vec<usize> = (0..non_null_row_ids.len()).collect();
-    perm.sort_by_key(|&i| non_null_row_ids[i]);
-    let sorted_ids: Vec<u64> = perm.iter().map(|&i| non_null_row_ids[i]).collect();
+    let mut perm: Vec<usize> = (0..managed_row_ids.len()).collect();
+    perm.sort_by_key(|&i| managed_row_ids[i]);
+    let sorted_ids: Vec<u64> = perm.iter().map(|&i| managed_row_ids[i]).collect();
 
     let sorted_blobs = Arc::new(source_ds.clone())
         .take_blobs(&sorted_ids, column_name)
         .await
         .map_err(|e| OmniError::Lance(e.to_string()))?;
 
-    if sorted_blobs.len() != non_null_positions.len() {
+    if sorted_blobs.len() != managed_positions.len() {
         return Err(OmniError::Lance(format!(
             "blob export for '{}' lost alignment with selected rows",
             column_name
@@ -356,20 +610,27 @@ async fn export_blob_column_values(
         inverse_perm[orig_pos] = sorted_pos;
     }
 
-    for (idx, position) in non_null_positions.into_iter().enumerate() {
-        let blob = &sorted_blobs[inverse_perm[idx]];
-        let value = if let Some(uri) = blob.uri() {
-            uri.to_string()
-        } else {
-            let bytes = blob
-                .read()
-                .await
-                .map_err(|e| OmniError::Lance(e.to_string()))?;
-            format!(
-                "base64:{}",
-                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes)
-            )
-        };
+    for (idx, position) in managed_positions.into_iter().enumerate() {
+        let blob = sorted_blobs[inverse_perm[idx]].as_ref().ok_or_else(|| {
+            OmniError::Lance(format!(
+                "blob export for '{}' returned a null accessor for a managed description",
+                column_name
+            ))
+        })?;
+        if blob.uri().is_some() {
+            return Err(OmniError::Lance(format!(
+                "blob export for '{}' resolved a managed description as external",
+                column_name
+            )));
+        }
+        let bytes = blob
+            .read()
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let value = format!(
+            "base64:{}",
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes)
+        );
         values[position] = Some(value);
     }
 

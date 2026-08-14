@@ -1,4 +1,6 @@
 pub mod api;
+mod blob_transport;
+mod export_transport;
 mod handlers;
 mod settings;
 use handlers::*;
@@ -20,32 +22,31 @@ use crate::queries::{QueryRegistry, check, format_check_breakages};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
-use std::io;
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use api::{
-    BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
+    BlobReadQuery, BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
     BranchMergeOutput, BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput,
-    CommitListQuery, ErrorCode, ErrorOutput, ExportRequest, GraphInfo, GraphListResponse,
-    HealthOutput, IngestOutput, IngestRequest, InvokeStoredQueryRequest, InvokeStoredQueryResponse,
-    QueriesCatalogOutput, QueryRequest, ReadOutput, ReadRequest, SchemaApplyOutput,
-    SchemaApplyRequest, SchemaOutput, SnapshotQuery, ingest_output, schema_apply_output,
+    CommitListQuery, ErrorCode, ErrorOutput, ExportRequest, GraphBatchLoadOutput,
+    GraphBatchLoadQuery, GraphInfo, GraphListResponse, HealthOutput, IngestOutput, IngestRequest,
+    InvokeStoredQueryRequest, InvokeStoredQueryResponse, LegacyReadOutput, QueriesCatalogOutput,
+    QueryRequest, ReadOutput, ReadRequest, SchemaApplyOutput, SchemaApplyRequest, SchemaOutput,
+    SnapshotQuery, graph_batch_load_receipt_output, ingest_receipt_output, schema_apply_output,
     snapshot_payload,
 };
 pub use auth::{AWS_SECRET_ENV, EnvOrFileTokenSource, TokenSource, resolve_token_source};
 use axum::body::{Body, Bytes};
 use axum::extract::DefaultBodyLimit;
+use axum::extract::rejection::QueryRejection;
 use axum::extract::{Extension, OriginalUri, Path, Query, Request, State};
-use axum::http::StatusCode;
-use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, HeaderName, HeaderValue};
+use axum::http::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderName, HeaderValue};
+use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use color_eyre::eyre::{Result, WrapErr, bail, eyre};
-use futures::stream;
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::{ManifestConflictDetails, ManifestErrorKind, OmniError};
 use omnigraph::storage::normalize_root_uri;
@@ -60,9 +61,9 @@ pub use policy::{
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::io::{self, Write};
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -72,6 +73,11 @@ use utoipa::openapi::schema::{Object, Type};
 use utoipa::openapi::security::{Http, HttpAuthScheme, SecurityScheme};
 
 type BearerTokenHash = [u8; 32];
+
+/// Machine-readable stdout record emitted after the HTTP listener owns its
+/// requested address. In particular, this exposes the OS-selected port for a
+/// `--bind 127.0.0.1:0` process without a reserve-and-rebind race.
+pub const LISTEN_ADDR_PREFIX: &str = "OMNIGRAPH_LISTEN_ADDR=";
 
 fn hash_bearer_token(token: &str) -> BearerTokenHash {
     let digest = Sha256::digest(token.as_bytes());
@@ -90,6 +96,8 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         handlers::server_health,
         handlers::server_graphs_list,
         handlers::server_snapshot,
+        handlers::server_blob_get,
+        handlers::server_blob_head,
         // deprecated; the #[deprecated] attribute on the handler
         // surfaces as `deprecated: true` on the OpenAPI operation.
         #[allow(deprecated)] handlers::server_read,
@@ -97,11 +105,14 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         handlers::server_export,
         #[allow(deprecated)] handlers::server_change,
         handlers::server_mutate,
+        handlers::server_mutate_if_graph_commit,
         handlers::server_list_queries,
         handlers::server_invoke_query,
+        handlers::server_invoke_query_if_graph_commit,
         handlers::server_schema_apply,
         handlers::server_schema_get,
         handlers::server_load,
+        handlers::server_load_ndjson,
         // deprecated; the #[deprecated] attribute on the handler surfaces as
         // `deprecated: true` on the OpenAPI operation.
         #[allow(deprecated)] handlers::server_ingest,
@@ -111,7 +122,9 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         handlers::server_branch_merge,
         handlers::server_commit_list,
         handlers::server_commit_show,
+        handlers::server_commit_changes,
     ),
+    components(schemas(api::BlobEntityKind)),
     modifiers(&SecurityAddon),
 )]
 pub struct ApiDoc;
@@ -219,6 +232,9 @@ pub struct GraphStartupConfig {
     /// Pre-resolved embedding config from an applied cluster provider profile.
     /// Legacy config paths leave this unset and continue to use env resolution.
     pub embedding: Option<omnigraph::embedding::EmbeddingConfig>,
+    /// Full applied external Blob policy. `open_single_graph` projects it to
+    /// server-safe bases exactly once before engine injection.
+    pub external_blob_policy: omnigraph::ExternalBlobPolicy,
     /// Per-graph stored-query registry, loaded and identity-checked at
     /// settings-build time; type-checked against the schema when this
     /// graph's engine opens.
@@ -264,32 +280,34 @@ pub struct AppState {
     /// resource. Loaded from the cluster-scoped policy binding when
     /// configured. Per-graph policies live on each `GraphHandle.policy`.
     server_policy: Option<Arc<PolicyEngine>>,
+    /// Bounded process-wide ownership for queued served-export bytes. The
+    /// response body and detached producer jointly retain each reservation.
+    export_transport: export_transport::ExportTransport,
 }
 
-struct ExportStreamWriter {
-    sender: mpsc::UnboundedSender<std::result::Result<Bytes, io::Error>>,
+struct OpenedGraph {
+    handle: Arc<GraphHandle>,
 }
 
-impl Write for ExportStreamWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.sender
-            .send(Ok(Bytes::copy_from_slice(buf)))
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "export stream closed"))?;
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
+/// The structured-detail payloads are boxed to keep `Result<_, ApiError>` cheap
+/// to move: every handler returns one, and at most one detail is ever `Some`.
+/// The boxing is an in-memory representation only; [`api::ErrorOutput`] is what
+/// serializes.
 #[derive(Debug)]
 pub struct ApiError {
     status: StatusCode,
-    code: ErrorCode,
-    message: String,
+    code: Option<ErrorCode>,
+    message: Box<str>,
     merge_conflicts: Vec<api::MergeConflictOutput>,
-    manifest_conflict: Option<api::ManifestConflictOutput>,
+    manifest_conflict: Option<Box<api::ManifestConflictOutput>>,
+    read_set_conflict: Option<Box<api::ReadSetConflictOutput>>,
+    key_conflict: Option<Box<api::KeyConflictOutput>>,
+    resource_limit: Option<Box<api::ResourceLimitOutput>>,
+    change_feed_gap: Option<Box<api::ChangeFeedGapOutput>>,
+    blob_range: Option<Box<api::BlobRangeOutput>>,
+    external_blob_source: Option<Box<api::ExternalBlobSourceOutput>>,
+    recovery_required: Option<Box<api::RecoveryRequiredOutput>>,
+    precondition_failure: Option<Box<api::PreconditionFailureOutput>>,
 }
 
 impl AppState {
@@ -506,8 +524,9 @@ impl AppState {
     ) -> Self {
         // Engine-layer policy gate (MR-722). With a per-graph policy
         // installed, every `_as` writer on `Omnigraph` calls into the
-        // PolicyChecker. HTTP-layer `authorize_request` is the first
-        // gate; engine-layer is the redundant-but-correct backstop.
+        // PolicyChecker. Handlers retain an HTTP-layer first gate so served
+        // requests fail before their write bodies are interpreted; the engine
+        // repeats the authoritative actor-aware decision at the write boundary.
         let db = if let Some(policy) = policy_engine.as_ref() {
             let checker = Arc::clone(policy) as Arc<dyn omnigraph_policy::PolicyChecker>;
             db.with_policy(checker)
@@ -539,6 +558,7 @@ impl AppState {
             workload,
             bearer_tokens,
             server_policy: None,
+            export_transport: export_transport::ExportTransport::with_defaults(),
         }
     }
 
@@ -565,6 +585,7 @@ impl AppState {
             workload: Arc::new(workload),
             bearer_tokens,
             server_policy: server_policy.map(Arc::new),
+            export_transport: export_transport::ExportTransport::with_defaults(),
         })
     }
 
@@ -616,40 +637,72 @@ impl ApiError {
     pub fn unauthorized(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::UNAUTHORIZED,
-            code: ErrorCode::Unauthorized,
-            message: message.into(),
+            code: Some(ErrorCode::Unauthorized),
+            message: message.into().into_boxed_str(),
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
+            read_set_conflict: None,
+            key_conflict: None,
+            resource_limit: None,
+            change_feed_gap: None,
+            blob_range: None,
+            external_blob_source: None,
+            recovery_required: None,
+            precondition_failure: None,
         }
     }
 
     pub fn forbidden(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::FORBIDDEN,
-            code: ErrorCode::Forbidden,
-            message: message.into(),
+            code: Some(ErrorCode::Forbidden),
+            message: message.into().into_boxed_str(),
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
+            read_set_conflict: None,
+            key_conflict: None,
+            resource_limit: None,
+            change_feed_gap: None,
+            blob_range: None,
+            external_blob_source: None,
+            recovery_required: None,
+            precondition_failure: None,
         }
     }
 
     pub fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
-            code: ErrorCode::BadRequest,
-            message: message.into(),
+            code: Some(ErrorCode::BadRequest),
+            message: message.into().into_boxed_str(),
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
+            read_set_conflict: None,
+            key_conflict: None,
+            resource_limit: None,
+            change_feed_gap: None,
+            blob_range: None,
+            external_blob_source: None,
+            recovery_required: None,
+            precondition_failure: None,
         }
     }
 
     pub fn not_found(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
-            code: ErrorCode::NotFound,
-            message: message.into(),
+            code: Some(ErrorCode::NotFound),
+            message: message.into().into_boxed_str(),
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
+            read_set_conflict: None,
+            key_conflict: None,
+            resource_limit: None,
+            change_feed_gap: None,
+            blob_range: None,
+            external_blob_source: None,
+            recovery_required: None,
+            precondition_failure: None,
         }
     }
 
@@ -660,30 +713,140 @@ impl ApiError {
     pub fn method_not_allowed(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::METHOD_NOT_ALLOWED,
-            code: ErrorCode::MethodNotAllowed,
-            message: message.into(),
+            code: Some(ErrorCode::MethodNotAllowed),
+            message: message.into().into_boxed_str(),
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
+            read_set_conflict: None,
+            key_conflict: None,
+            resource_limit: None,
+            change_feed_gap: None,
+            blob_range: None,
+            external_blob_source: None,
+            recovery_required: None,
+            precondition_failure: None,
         }
     }
 
     pub fn conflict(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::CONFLICT,
-            code: ErrorCode::Conflict,
-            message: message.into(),
+            code: Some(ErrorCode::Conflict),
+            message: message.into().into_boxed_str(),
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
+            read_set_conflict: None,
+            key_conflict: None,
+            resource_limit: None,
+            change_feed_gap: None,
+            blob_range: None,
+            external_blob_source: None,
+            recovery_required: None,
+            precondition_failure: None,
+        }
+    }
+
+    fn unsupported_media_type(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            code: Some(ErrorCode::BadRequest),
+            message: message.into().into_boxed_str(),
+            merge_conflicts: Vec::new(),
+            manifest_conflict: None,
+            read_set_conflict: None,
+            key_conflict: None,
+            resource_limit: None,
+            change_feed_gap: None,
+            blob_range: None,
+            external_blob_source: None,
+            recovery_required: None,
+            precondition_failure: None,
+        }
+    }
+
+    pub(crate) fn range_not_satisfiable(start: u64, end: u64, length: u64) -> Self {
+        Self {
+            status: StatusCode::RANGE_NOT_SATISFIABLE,
+            code: Some(ErrorCode::BadRequest),
+            // Keep the pre-existing `OmniError` display spelling stable while
+            // adding the structured wire fields below.
+            message: format!(
+                "blob range [{start}, {end}) is not satisfiable for a value of length {length}"
+            )
+            .into_boxed_str(),
+            merge_conflicts: Vec::new(),
+            manifest_conflict: None,
+            read_set_conflict: None,
+            key_conflict: None,
+            resource_limit: None,
+            change_feed_gap: None,
+            blob_range: Some(Box::new(api::BlobRangeOutput { start, end, length })),
+            external_blob_source: None,
+            recovery_required: None,
+            precondition_failure: None,
+        }
+    }
+
+    /// HTTP 412 for a Blob representation validator mismatch. This is distinct
+    /// from the graph-commit write precondition below: it retains the existing
+    /// closed [`ErrorCode::Conflict`] signal and has no write-precondition
+    /// details because no mutation was attempted.
+    pub(crate) fn blob_precondition_failed(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::PRECONDITION_FAILED,
+            code: Some(ErrorCode::Conflict),
+            message: message.into().into_boxed_str(),
+            merge_conflicts: Vec::new(),
+            manifest_conflict: None,
+            read_set_conflict: None,
+            key_conflict: None,
+            resource_limit: None,
+            change_feed_gap: None,
+            blob_range: None,
+            external_blob_source: None,
+            recovery_required: None,
+            precondition_failure: None,
         }
     }
 
     pub fn internal(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
-            code: ErrorCode::Internal,
-            message: message.into(),
+            code: Some(ErrorCode::Internal),
+            message: message.into().into_boxed_str(),
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
+            read_set_conflict: None,
+            key_conflict: None,
+            resource_limit: None,
+            change_feed_gap: None,
+            blob_range: None,
+            external_blob_source: None,
+            recovery_required: None,
+            precondition_failure: None,
+        }
+    }
+
+    /// HTTP 424 Failed Dependency for an external Blob source that passed the
+    /// graph's admission policy but could not be probed or read. `ErrorCode`
+    /// remains a closed rolling contract; the optional structured detail is
+    /// the additive machine-readable discriminator.
+    fn external_blob_source(uri: String, reason: String) -> Self {
+        let message = format!("external blob source '{uri}' is unavailable: {reason}");
+        Self {
+            status: StatusCode::FAILED_DEPENDENCY,
+            code: None,
+            message: message.into_boxed_str(),
+            merge_conflicts: Vec::new(),
+            manifest_conflict: None,
+            read_set_conflict: None,
+            key_conflict: None,
+            resource_limit: None,
+            change_feed_gap: None,
+            blob_range: None,
+            external_blob_source: Some(Box::new(api::ExternalBlobSourceOutput { uri, reason })),
+            recovery_required: None,
+            precondition_failure: None,
         }
     }
 
@@ -694,10 +857,18 @@ impl ApiError {
     pub fn too_many_requests(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::TOO_MANY_REQUESTS,
-            code: ErrorCode::TooManyRequests,
-            message: message.into(),
+            code: Some(ErrorCode::TooManyRequests),
+            message: message.into().into_boxed_str(),
             merge_conflicts: Vec::new(),
             manifest_conflict: None,
+            read_set_conflict: None,
+            key_conflict: None,
+            resource_limit: None,
+            change_feed_gap: None,
+            blob_range: None,
+            external_blob_source: None,
+            recovery_required: None,
+            precondition_failure: None,
         }
     }
 
@@ -715,20 +886,155 @@ impl ApiError {
     fn merge_conflict(conflicts: Vec<api::MergeConflictOutput>) -> Self {
         Self {
             status: StatusCode::CONFLICT,
-            code: ErrorCode::Conflict,
-            message: summarize_merge_conflicts(&conflicts),
+            code: Some(ErrorCode::Conflict),
+            message: summarize_merge_conflicts(&conflicts).into_boxed_str(),
             merge_conflicts: conflicts,
             manifest_conflict: None,
+            read_set_conflict: None,
+            key_conflict: None,
+            resource_limit: None,
+            change_feed_gap: None,
+            blob_range: None,
+            external_blob_source: None,
+            recovery_required: None,
+            precondition_failure: None,
         }
     }
 
     fn manifest_version_conflict(message: String, details: api::ManifestConflictOutput) -> Self {
         Self {
             status: StatusCode::CONFLICT,
-            code: ErrorCode::Conflict,
-            message,
+            code: Some(ErrorCode::Conflict),
+            message: message.into_boxed_str(),
             merge_conflicts: Vec::new(),
-            manifest_conflict: Some(details),
+            manifest_conflict: Some(Box::new(details)),
+            read_set_conflict: None,
+            key_conflict: None,
+            resource_limit: None,
+            change_feed_gap: None,
+            blob_range: None,
+            external_blob_source: None,
+            recovery_required: None,
+            precondition_failure: None,
+        }
+    }
+
+    fn read_set_conflict(message: String, details: api::ReadSetConflictOutput) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            code: Some(ErrorCode::Conflict),
+            message: message.into_boxed_str(),
+            merge_conflicts: Vec::new(),
+            manifest_conflict: None,
+            read_set_conflict: Some(Box::new(details)),
+            key_conflict: None,
+            resource_limit: None,
+            change_feed_gap: None,
+            blob_range: None,
+            external_blob_source: None,
+            recovery_required: None,
+            precondition_failure: None,
+        }
+    }
+
+    fn key_conflict(message: String, details: api::KeyConflictOutput) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            code: Some(ErrorCode::Conflict),
+            message: message.into_boxed_str(),
+            merge_conflicts: Vec::new(),
+            manifest_conflict: None,
+            read_set_conflict: None,
+            key_conflict: Some(Box::new(details)),
+            resource_limit: None,
+            change_feed_gap: None,
+            blob_range: None,
+            external_blob_source: None,
+            recovery_required: None,
+            precondition_failure: None,
+        }
+    }
+
+    fn resource_limit(message: String, details: api::ResourceLimitOutput) -> Self {
+        Self {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            code: Some(ErrorCode::BadRequest),
+            message: message.into_boxed_str(),
+            merge_conflicts: Vec::new(),
+            manifest_conflict: None,
+            read_set_conflict: None,
+            key_conflict: None,
+            resource_limit: Some(Box::new(details)),
+            change_feed_gap: None,
+            blob_range: None,
+            external_blob_source: None,
+            recovery_required: None,
+            precondition_failure: None,
+        }
+    }
+
+    fn change_feed_gap(cursor: Option<String>, first_unreadable_commit_id: String) -> Self {
+        Self {
+            status: StatusCode::GONE,
+            code: None,
+            message: format!("change feed gap at commit \"{first_unreadable_commit_id}\"")
+                .into_boxed_str(),
+            merge_conflicts: Vec::new(),
+            manifest_conflict: None,
+            read_set_conflict: None,
+            key_conflict: None,
+            resource_limit: None,
+            change_feed_gap: Some(Box::new(api::ChangeFeedGapOutput {
+                cursor,
+                first_unreadable_commit_id,
+            })),
+            blob_range: None,
+            external_blob_source: None,
+            recovery_required: None,
+            precondition_failure: None,
+        }
+    }
+
+    fn recovery_required(message: String, operation_id: String) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            // `ErrorCode` is a closed rolling wire contract. The additive
+            // `recovery_required` field carries the new meaning while older
+            // clients continue to deserialize the otherwise familiar body.
+            code: None,
+            message: message.into_boxed_str(),
+            merge_conflicts: Vec::new(),
+            manifest_conflict: None,
+            read_set_conflict: None,
+            key_conflict: None,
+            resource_limit: None,
+            change_feed_gap: None,
+            blob_range: None,
+            external_blob_source: None,
+            recovery_required: Some(Box::new(api::RecoveryRequiredOutput { operation_id })),
+            precondition_failure: None,
+        }
+    }
+
+    /// HTTP 412 Precondition Failed — an
+    /// `Omnigraph-If-Graph-Commit` graph-head precondition no longer holds.
+    /// `code` is omitted for the same closed-wire-contract reason as
+    /// [`Self::recovery_required`].
+    fn precondition_failed(message: String, details: api::PreconditionFailureOutput) -> Self {
+        Self {
+            status: StatusCode::PRECONDITION_FAILED,
+            code: None,
+            message: message.into_boxed_str(),
+            merge_conflicts: Vec::new(),
+            manifest_conflict: None,
+            read_set_conflict: None,
+            key_conflict: None,
+            resource_limit: None,
+            change_feed_gap: None,
+            blob_range: None,
+            external_blob_source: None,
+            recovery_required: None,
+            precondition_failure: Some(Box::new(details)),
         }
     }
 
@@ -752,6 +1058,18 @@ impl ApiError {
                             actual,
                         },
                     ),
+                    Some(ManifestConflictDetails::ReadSetChanged {
+                        member,
+                        expected,
+                        actual,
+                    }) => Self::read_set_conflict(
+                        err.message,
+                        api::ReadSetConflictOutput {
+                            member,
+                            expected,
+                            actual,
+                        },
+                    ),
                     _ => Self::conflict(err.message),
                 },
                 ManifestErrorKind::Internal => Self::internal(err.message),
@@ -762,14 +1080,70 @@ impl ApiError {
                     .map(api::MergeConflictOutput::from)
                     .collect(),
             ),
+            OmniError::KeyConflict { table_key, key } => Self::key_conflict(
+                key.as_ref().map_or_else(
+                    || format!("key conflict in table '{table_key}'"),
+                    |key| format!("key conflict in table '{table_key}': id '{key}' already exists"),
+                ),
+                api::KeyConflictOutput { table_key, key },
+            ),
+            OmniError::ResourceLimitExceeded {
+                resource,
+                limit,
+                actual,
+            } => Self::resource_limit(
+                format!("resource limit exceeded for {resource}: actual {actual}, limit {limit}"),
+                api::ResourceLimitOutput {
+                    resource,
+                    limit,
+                    actual,
+                },
+            ),
+            OmniError::HistoricalVersionReclaimed { version } => {
+                Self::internal(format!("historical table version {version} was reclaimed"))
+            }
+            OmniError::ChangeFeedGap {
+                cursor,
+                first_unreadable_commit_id,
+            } => Self::change_feed_gap(cursor, first_unreadable_commit_id),
+            OmniError::ChangeCursorRejected { reason } => {
+                Self::bad_request(format!("change cursor rejected: {reason}"))
+            }
+            OmniError::RecoveryRequired {
+                operation_id,
+                reason,
+            } => Self::recovery_required(
+                format!("recovery required for operation {operation_id}: {reason}"),
+                operation_id,
+            ),
+            OmniError::PreconditionFailed {
+                branch,
+                expected,
+                actual,
+            } => Self::precondition_failed(
+                format!(
+                    "precondition failed on branch '{branch}': expected head '{expected}' but current is {}",
+                    actual.as_deref().unwrap_or("<absent>")
+                ),
+                api::PreconditionFailureOutput { expected, actual },
+            ),
+            err @ OmniError::ExternalBlobPolicy { .. } => Self::bad_request(err.to_string()),
+            OmniError::ExternalBlobSource { uri, reason } => {
+                Self::external_blob_source(uri, reason)
+            }
+            OmniError::BlobRangeNotSatisfiable { start, end, length } => {
+                Self::range_not_satisfiable(start, end, length)
+            }
+            err @ OmniError::BlobIntegrity { .. } => Self::internal(err.to_string()),
             OmniError::Lance(message) => Self::internal(format!("storage: {message}")),
+            OmniError::RetryableCommitConflict(message) => {
+                Self::conflict(format!("retryable storage commit conflict: {message}"))
+            }
             OmniError::Io(err) => Self::internal(format!("io: {err}")),
-            // Engine-layer policy enforcement (MR-722). All denials and
-            // evaluation failures surface here as 403. The HTTP-layer
-            // `authorize_request` already distinguishes 401 (missing
-            // bearer) from 403 (policy denial), so by the time the
-            // engine gate fires, the bearer is valid — any failure from
-            // the engine is a policy outcome, not an auth one.
+            // Engine-layer policy enforcement (MR-722). Authentication
+            // middleware has already distinguished a missing/invalid bearer
+            // (401); policy denials and evaluation failures surface as 403.
+            // Most handlers also perform an HTTP-layer policy check.
             OmniError::Policy(message) => Self::forbidden(message),
             // `Omnigraph::init` against an existing graph URI in strict
             // mode. Not currently HTTP-reachable (POST /graphs was
@@ -815,7 +1189,7 @@ const RETRY_AFTER_SECONDS: &str = "60";
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let mut headers = axum::http::HeaderMap::new();
-        if matches!(self.code, ErrorCode::TooManyRequests) {
+        if matches!(self.code, Some(ErrorCode::TooManyRequests)) {
             headers.insert(
                 axum::http::header::RETRY_AFTER,
                 axum::http::HeaderValue::from_static(RETRY_AFTER_SECONDS),
@@ -825,13 +1199,284 @@ impl IntoResponse for ApiError {
             self.status,
             headers,
             Json(ErrorOutput {
-                error: self.message,
-                code: Some(self.code),
+                error: self.message.into(),
+                code: self.code,
                 merge_conflicts: self.merge_conflicts,
-                manifest_conflict: self.manifest_conflict,
+                manifest_conflict: self.manifest_conflict.map(|d| *d),
+                read_set_conflict: self.read_set_conflict.map(|d| *d),
+                key_conflict: self.key_conflict.map(|d| *d),
+                resource_limit: self.resource_limit.map(|d| *d),
+                change_feed_gap: self.change_feed_gap.map(|d| *d),
+                blob_range: self.blob_range.map(|d| *d),
+                external_blob_source: self.external_blob_source.map(|d| *d),
+                recovery_required: self.recovery_required.map(|d| *d),
+                precondition_failure: self.precondition_failure.map(|d| *d),
             }),
         )
             .into_response()
+    }
+}
+
+#[cfg(test)]
+mod api_error_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn change_feed_gap_is_typed_410() {
+        let response = ApiError::from_omni(OmniError::ChangeFeedGap {
+            cursor: Some("resume".to_string()),
+            first_unreadable_commit_id: "01GAP".to_string(),
+        })
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::GONE);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error.code, None);
+        let gap = error.change_feed_gap.unwrap();
+        assert_eq!(gap.cursor.as_deref(), Some("resume"));
+        assert_eq!(gap.first_unreadable_commit_id, "01GAP");
+    }
+
+    #[tokio::test]
+    async fn recovery_required_503_omits_closed_error_code() {
+        let response = ApiError::from_omni(OmniError::RecoveryRequired {
+            operation_id: "01JTESTRECOVERY".to_string(),
+            reason: "pending recovery intent".to_string(),
+        })
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error.code, None);
+        assert_eq!(
+            error.recovery_required.unwrap().operation_id,
+            "01JTESTRECOVERY"
+        );
+    }
+
+    #[tokio::test]
+    async fn key_conflict_is_409_with_structured_optional_key() {
+        for (key, expected_message) in [
+            (Some("alice".to_string()), "id 'alice' already exists"),
+            (None, "key conflict in table 'node:Person'"),
+        ] {
+            let response = ApiError::from_omni(OmniError::KeyConflict {
+                table_key: "node:Person".to_string(),
+                key: key.clone(),
+            })
+            .into_response();
+
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
+            assert!(error.error.contains(expected_message));
+            let details = error.key_conflict.expect("structured key conflict");
+            assert_eq!(details.table_key, "node:Person");
+            assert_eq!(details.key, key);
+            assert!(error.recovery_required.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn resource_limit_is_413_with_structured_ceiling() {
+        let response = ApiError::from_omni(OmniError::ResourceLimitExceeded {
+            resource: "keyed write rows for node:Person".to_string(),
+            limit: 8192,
+            actual: 8193,
+        })
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error.code, Some(ErrorCode::BadRequest));
+        let details = error.resource_limit.expect("structured resource limit");
+        assert_eq!(details.resource, "keyed write rows for node:Person");
+        assert_eq!(details.limit, 8192);
+        assert_eq!(details.actual, 8193);
+        assert!(error.recovery_required.is_none());
+    }
+
+    #[tokio::test]
+    async fn blob_reader_errors_keep_the_exhaustive_http_mapping() {
+        let response = ApiError::from_omni(OmniError::BlobRangeNotSatisfiable {
+            start: 4,
+            end: 9,
+            length: 8,
+        })
+        .into_response();
+        assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error.code, Some(ErrorCode::BadRequest));
+        assert_eq!(
+            error.error,
+            "blob range [4, 9) is not satisfiable for a value of length 8"
+        );
+        let range = error.blob_range.expect("structured Blob range");
+        assert_eq!((range.start, range.end, range.length), (4, 9, 8));
+
+        let response = ApiError::from_omni(OmniError::BlobIntegrity {
+            reason: "malformed descriptor".to_string(),
+        })
+        .into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error.code, Some(ErrorCode::Internal));
+    }
+
+    #[tokio::test]
+    async fn external_blob_policy_is_400_bad_request() {
+        let response = ApiError::from_omni(OmniError::ExternalBlobPolicy {
+            uri: "s3://denied/object".to_string(),
+            reason: "outside every configured base".to_string(),
+        })
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error.code, Some(ErrorCode::BadRequest));
+        assert!(error.error.contains("outside every configured base"));
+    }
+
+    #[tokio::test]
+    async fn external_blob_source_is_424_with_rolling_safe_structured_details() {
+        let response = ApiError::from_omni(OmniError::ExternalBlobSource {
+            uri: "s3://allowed/missing".to_string(),
+            reason: "object does not exist".to_string(),
+        })
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::FAILED_DEPENDENCY);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error.code, None);
+        let details = error
+            .external_blob_source
+            .expect("structured external Blob source details");
+        assert_eq!(details.uri, "s3://allowed/missing");
+        assert_eq!(details.reason, "object does not exist");
+        assert!(error.error.contains(&details.reason));
+    }
+}
+
+#[cfg(test)]
+mod external_blob_startup_tests {
+    use super::*;
+    use omnigraph::loader::{LoadMode, load_jsonl};
+
+    #[tokio::test]
+    async fn server_open_drops_embedded_only_external_blob_bases() {
+        let temp = tempfile::tempdir().unwrap();
+        let graph = temp.path().join("graph.omni");
+        Omnigraph::init(
+            graph.to_string_lossy().as_ref(),
+            "node Doc {\nslug: String @key\npayload: Blob\n}\n",
+        )
+        .await
+        .unwrap();
+
+        let external = temp.path().join("external");
+        std::fs::create_dir(&external).unwrap();
+        let payload = external.join("payload.bin");
+        std::fs::write(&payload, b"server must not read this").unwrap();
+        let base = omnigraph::ExternalBlobBase::new(
+            format!("file://{}", external.display()),
+            omnigraph::ExternalBlobExecutionScope::EmbeddedOnly,
+        )
+        .unwrap();
+        let policy = omnigraph::ExternalBlobPolicy::allow(vec![base]).unwrap();
+
+        let opened = open_single_graph(GraphStartupConfig {
+            graph_id: "knowledge".to_string(),
+            uri: graph.to_string_lossy().into_owned(),
+            policy: None,
+            embedding: None,
+            external_blob_policy: policy,
+            queries: QueryRegistry::default(),
+        })
+        .await
+        .unwrap();
+        let data = format!(
+            "{{\"type\":\"Doc\",\"data\":{{\"slug\":\"one\",\"payload\":\"file://{}\"}}}}\n",
+            payload.display()
+        );
+        let error = load_jsonl(opened.handle.engine.as_ref(), &data, LoadMode::Overwrite)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, OmniError::ExternalBlobPolicy { .. }),
+            "server projection must deny an embedded-only URI, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_open_refuses_forged_server_safe_file_base() {
+        let temp = tempfile::tempdir().unwrap();
+        let graph = temp.path().join("graph.omni");
+        let schema = "node Doc {\nslug: String @key\npayload: Blob\n}\n";
+        Omnigraph::init(graph.to_string_lossy().as_ref(), schema)
+            .await
+            .unwrap();
+        // A read-write open normally removes this matching no-op staging
+        // residue. The invalid policy must be rejected before graph open, so
+        // startup cannot perform even that safe recovery mutation first.
+        let staging = graph.join("_schema.pg.staging");
+        std::fs::write(&staging, schema).unwrap();
+        assert!(staging.exists());
+        let policy: omnigraph::ExternalBlobPolicy = serde_json::from_value(serde_json::json!({
+            "mode": "allow",
+            "bases": [{
+                "uri": format!("file://{}", temp.path().display()),
+                "scope": "server_safe"
+            }]
+        }))
+        .unwrap();
+
+        let result = open_single_graph(GraphStartupConfig {
+            graph_id: "knowledge".to_string(),
+            uri: graph.to_string_lossy().into_owned(),
+            policy: None,
+            embedding: None,
+            external_blob_policy: policy,
+            queries: QueryRegistry::default(),
+        })
+        .await;
+        let error = match result {
+            Ok(_) => panic!("server must refuse a forged server-safe file base"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("server-safe external Blob base may not use file://"),
+            "unexpected refusal: {error:?}"
+        );
+        assert!(
+            staging.exists(),
+            "invalid server policy must be refused before read-write open recovery moves graph state"
+        );
+        assert_eq!(std::fs::read_to_string(staging).unwrap(), schema);
     }
 }
 
@@ -891,6 +1536,10 @@ pub fn build_app(state: AppState) -> Router {
     //      `{graph_id}` in the URI path).
     let per_graph_protected = Router::new()
         .route("/snapshot", get(server_snapshot))
+        // Register HEAD explicitly. Axum's GET fallback would invoke the GET
+        // handler and could begin payload work before stripping the body; the
+        // dedicated handler makes the zero-payload-read contract structural.
+        .route("/blob", get(server_blob_get).head(server_blob_head))
         .route("/export", post(server_export))
         // /read and /change are kept indefinitely for back-compat;
         // their handlers carry #[deprecated] so the OpenAPI operation is
@@ -913,14 +1562,23 @@ pub fn build_app(state: AppState) -> Router {
             }),
         )
         .route("/mutate", post(server_mutate))
+        .route(
+            "/mutate/if-graph-commit",
+            post(server_mutate_if_graph_commit),
+        )
         .route("/queries", get(server_list_queries))
         .route("/queries/{name}", post(server_invoke_query))
+        .route(
+            "/queries/{name}/if-graph-commit",
+            post(server_invoke_query_if_graph_commit),
+        )
         .route("/schema", get(server_schema_get))
         .route("/schema/apply", post(server_schema_apply))
         .route(
             "/load",
             post(server_load).layer(DefaultBodyLimit::max(INGEST_REQUEST_BODY_LIMIT_BYTES)),
         )
+        .route("/load/ndjson", post(server_load_ndjson))
         // /ingest is the deprecated alias of /load; its handler carries
         // #[deprecated] (OpenAPI operation flagged) and emits RFC 9745
         // Deprecation + RFC 8288 Link headers. Suppress the call-site warning.
@@ -940,6 +1598,7 @@ pub fn build_app(state: AppState) -> Router {
         .route("/branches/merge", post(server_branch_merge))
         .route("/commits", get(server_commit_list))
         .route("/commits/{commit_id}", get(server_commit_show))
+        .route("/commits/{commit_id}/changes", get(server_commit_changes))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             resolve_graph_handle,
@@ -1039,6 +1698,14 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     };
 
     let listener = TcpListener::bind(&bind).await?;
+    let listen_addr = listener.local_addr()?;
+    {
+        let stdout = io::stdout();
+        let mut stdout = stdout.lock();
+        writeln!(stdout, "{LISTEN_ADDR_PREFIX}{listen_addr}")?;
+        stdout.flush()?;
+    }
+
     axum::serve(listener, build_app(state))
         .with_graceful_shutdown(shutdown_signal())
         .await?;
@@ -1085,7 +1752,7 @@ pub async fn open_multi_graph_state(
     };
 
     let configured_graphs = graphs.len();
-    let results = futures::stream::iter(graphs.into_iter())
+    let results = futures::stream::iter(graphs)
         .map(|cfg| async move {
             let graph_id = cfg.graph_id.clone();
             open_single_graph(cfg).await.map_err(|err| (graph_id, err))
@@ -1097,7 +1764,9 @@ pub async fn open_multi_graph_state(
     let mut failed = 0usize;
     for result in results {
         match result {
-            Ok(handle) => handles.push(handle),
+            Ok(opened) => {
+                handles.push(opened.handle);
+            }
             Err((graph_id, err)) => {
                 failed += 1;
                 warn!(
@@ -1131,15 +1800,33 @@ pub async fn open_multi_graph_state(
 
 /// Open one graph and wrap it in a `GraphHandle`. Used at startup by
 /// `open_multi_graph_state`.
-async fn open_single_graph(cfg: GraphStartupConfig) -> Result<Arc<GraphHandle>> {
+async fn open_single_graph(cfg: GraphStartupConfig) -> Result<OpenedGraph> {
     let graph_id = GraphId::try_from(cfg.graph_id.clone())
         .map_err(|err| color_eyre::eyre::eyre!("graph id '{}': {err}", cfg.graph_id))?;
     let uri = normalize_root_uri(&cfg.uri)
         .wrap_err_with(|| format!("normalize URI for graph '{}'", cfg.graph_id))?;
 
+    // Project and validate the applied resource boundary before a read-write
+    // graph open. `Omnigraph::open` may complete durable recovery, so an
+    // invalid control-plane policy must quarantine the graph before that first
+    // possible effect rather than after recovery has already moved state.
+    let external_blob_policy = cfg.external_blob_policy.server_safe_only().map_err(|err| {
+        color_eyre::eyre::eyre!(
+            "external Blob policy for graph '{}' is invalid: {err}",
+            graph_id
+        )
+    })?;
     let db = Omnigraph::open(&uri)
         .await
         .map_err(|err| color_eyre::eyre::eyre!("open graph '{}' at {}: {err}", graph_id, uri))?;
+    let db = db
+        .with_external_blob_policy(external_blob_policy)
+        .map_err(|err| {
+            color_eyre::eyre::eyre!(
+                "external Blob policy for graph '{}' is invalid: {err}",
+                graph_id
+            )
+        })?;
     let db = if let Some(embedding) = cfg.embedding {
         db.with_embedding_config(Arc::new(embedding))
     } else {
@@ -1162,19 +1849,119 @@ async fn open_single_graph(cfg: GraphStartupConfig) -> Result<Arc<GraphHandle>> 
         None => (None, db),
     };
 
-    Ok(Arc::new(GraphHandle {
-        key: GraphKey::cluster(graph_id),
-        uri,
-        engine: Arc::new(db),
-        policy: policy_arc,
-        queries,
-    }))
+    Ok(OpenedGraph {
+        handle: Arc::new(GraphHandle {
+            key: GraphKey::cluster(graph_id),
+            uri,
+            engine: Arc::new(db),
+            policy: policy_arc,
+            queries,
+        }),
+    })
+}
+
+async fn wait_for_ctrl_c() {
+    if let Err(err) = tokio::signal::ctrl_c().await {
+        error!(error = %err, "failed to install ctrl-c handler");
+    }
+}
+
+#[cfg(unix)]
+async fn wait_for_shutdown_signal_with_terminate(mut terminate: tokio::signal::unix::Signal) {
+    tokio::select! {
+        () = wait_for_ctrl_c() => {},
+        received = terminate.recv() => {
+            if received.is_none() {
+                error!("SIGTERM handler closed before receiving a signal");
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() {
+    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        Ok(terminate) => wait_for_shutdown_signal_with_terminate(terminate).await,
+        Err(err) => {
+            error!(error = %err, "failed to install SIGTERM handler; waiting for ctrl-c only");
+            wait_for_ctrl_c().await
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() {
+    wait_for_ctrl_c().await
 }
 
 async fn shutdown_signal() {
-    if let Err(err) = tokio::signal::ctrl_c().await {
-        error!(error = %err, "failed to install ctrl-c handler");
-        return;
-    }
+    wait_for_shutdown_signal().await;
     info!("shutdown signal received");
+}
+
+#[cfg(all(test, unix))]
+mod shutdown_signal_tests {
+    use std::process::Command;
+    use std::time::Duration;
+
+    use super::*;
+
+    const SIGTERM_CHILD_ENV: &str = "OMNIGRAPH_SERVER_SIGTERM_TEST_CHILD";
+    const SIGTERM_READY_PATH_ENV: &str = "OMNIGRAPH_SERVER_SIGTERM_TEST_READY_PATH";
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "subprocess helper; exercised by sigterm_reaches_the_shared_shutdown_path"]
+    async fn sigterm_child_waits_for_signal() {
+        if std::env::var_os(SIGTERM_CHILD_ENV).is_none() {
+            return;
+        }
+
+        let terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
+        let ready_path = std::env::var(SIGTERM_READY_PATH_ENV).unwrap();
+        std::fs::write(ready_path, b"ready").unwrap();
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_for_shutdown_signal_with_terminate(terminate),
+        )
+        .await
+        .expect("SIGTERM was not observed before the child deadline");
+    }
+
+    #[test]
+    fn sigterm_reaches_the_shared_shutdown_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let ready_path = temp.path().join("signal-handler-ready");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("shutdown_signal_tests::sigterm_child_waits_for_signal")
+            .arg("--ignored")
+            .arg("--nocapture")
+            .env(SIGTERM_CHILD_ENV, "1")
+            .env(SIGTERM_READY_PATH_ENV, &ready_path)
+            .spawn()
+            .unwrap();
+
+        for _ in 0..500 {
+            if ready_path.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            ready_path.exists(),
+            "SIGTERM helper did not install its handler before the deadline"
+        );
+
+        let status = Command::new("kill")
+            .arg("-TERM")
+            .arg(child.id().to_string())
+            .status()
+            .unwrap();
+        assert!(status.success(), "kill -TERM failed with {status}");
+
+        let status = child.wait().unwrap();
+        assert!(status.success(), "SIGTERM helper failed with {status}");
+    }
 }

@@ -13,8 +13,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use fail::FailScenario;
-use serial_test::serial;
 use omnigraph::db::Omnigraph;
+use omnigraph::error::OmniError;
 // One ScopedFailPoint for both engine- and cluster-scoped failpoint names:
 // it is registry-only (error-type agnostic) and lives in the lowest crate.
 use omnigraph::failpoints::ScopedFailPoint;
@@ -22,6 +22,7 @@ use omnigraph_cluster::{
     ApplyOptions, apply_config_dir, apply_config_dir_with_options, approve_config_dir,
     validate_config_dir,
 };
+use serial_test::serial;
 use tempfile::tempdir;
 
 const SCHEMA: &str = r#"
@@ -42,7 +43,11 @@ fn fixture() -> tempfile::TempDir {
     let dir = tempdir().unwrap();
     fs::write(dir.path().join("people.pg"), SCHEMA).unwrap();
     fs::write(dir.path().join("people.gq"), QUERY).unwrap();
-    fs::write(dir.path().join("base.policy.yaml"), "rules: []\n").unwrap();
+    fs::write(
+        dir.path().join("base.policy.yaml"),
+        "version: 1\nrules: []\n",
+    )
+    .unwrap();
     fs::write(
         dir.path().join("cluster.yaml"),
         r#"
@@ -66,14 +71,39 @@ policies:
     dir
 }
 
-/// Seed a state.json where the graph/schema digests match desired, so query
-/// and policy changes are applicable. Digests are borrowed from the public
-/// validate output; the graph composite is a placeholder that apply converges
-/// as a Derived update.
+/// Historical graph resources omit the policy field, so their composite binds
+/// the default-Deny meaning without a policy marker.
+fn historical_graph_digest(
+    graph_id: &str,
+    schema_digest: Option<&str>,
+    query_digests: &[(&str, &str)],
+) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut input = format!(
+        "graph\0{graph_id}\0schema\0{}\0",
+        schema_digest.unwrap_or_default()
+    );
+    for (name, digest) in query_digests {
+        input.push_str("query\0");
+        input.push_str(name);
+        input.push('\0');
+        input.push_str(digest);
+        input.push('\0');
+    }
+    let digest = Sha256::digest(input.as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Seed a state.json where the graph/schema digests are internally consistent,
+/// so query and policy changes are applicable. Desired digests are borrowed
+/// from the public validation output; the graph composite binds the state as it
+/// actually exists before those child resources are applied.
 fn seed_applyable_state(config_dir: &Path) -> BTreeMap<String, String> {
     let validate = validate_config_dir(config_dir);
     assert!(validate.ok, "{:?}", validate.diagnostics);
     let schema_digest = validate.resource_digests["schema.knowledge"].clone();
+    let graph_digest = historical_graph_digest("knowledge", Some(&schema_digest), &[]);
     let state_dir = config_dir.join("__cluster");
     fs::create_dir_all(&state_dir).unwrap();
     fs::write(
@@ -84,7 +114,7 @@ fn seed_applyable_state(config_dir: &Path) -> BTreeMap<String, String> {
   "state_revision": 1,
   "applied_revision": {{
     "resources": {{
-      "graph.knowledge": {{ "digest": "seed" }},
+      "graph.knowledge": {{ "digest": "{graph_digest}" }},
       "schema.knowledge": {{ "digest": "{schema_digest}" }}
     }}
   }}
@@ -113,7 +143,10 @@ async fn failpoint_wiring_returns_injected_diagnostic() {
     let dir = fixture();
     seed_applyable_state(dir.path());
 
-    let _failpoint = ScopedFailPoint::new(omnigraph_cluster::failpoints::names::CLUSTER_APPLY_AFTER_PAYLOAD_PHASE, "return");
+    let _failpoint = ScopedFailPoint::new(
+        omnigraph_cluster::failpoints::names::CLUSTER_APPLY_AFTER_PAYLOAD_PHASE,
+        "return",
+    );
     let out = apply_config_dir(dir.path()).await;
     assert!(!out.ok);
     assert!(out.diagnostics.iter().any(|diagnostic| {
@@ -138,7 +171,10 @@ async fn apply_crash_after_payload_phase_leaves_state_unmoved_then_recovers() {
     let state_before = fs::read(state_path(dir.path())).unwrap();
 
     {
-        let _failpoint = ScopedFailPoint::new(omnigraph_cluster::failpoints::names::CLUSTER_APPLY_AFTER_PAYLOAD_PHASE, "return");
+        let _failpoint = ScopedFailPoint::new(
+            omnigraph_cluster::failpoints::names::CLUSTER_APPLY_AFTER_PAYLOAD_PHASE,
+            "return",
+        );
         let out = apply_config_dir(dir.path()).await;
         assert!(!out.ok);
         assert!(!out.state_written);
@@ -184,12 +220,15 @@ async fn apply_cas_race_surfaces_state_cas_mismatch() {
     // after apply read it but before apply writes. RAII-guarded so a panic
     // inside apply cannot leak the callback into the global registry.
     let race_path = state_path(dir.path());
-    let failpoint = ScopedFailPoint::with_callback(omnigraph_cluster::failpoints::names::CLUSTER_APPLY_BEFORE_STATE_WRITE, move || {
-        let mut state: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&race_path).unwrap()).unwrap();
-        state["state_revision"] = serde_json::json!(99);
-        fs::write(&race_path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
-    });
+    let failpoint = ScopedFailPoint::with_callback(
+        omnigraph_cluster::failpoints::names::CLUSTER_APPLY_BEFORE_STATE_WRITE,
+        move || {
+            let mut state: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&race_path).unwrap()).unwrap();
+            state["state_revision"] = serde_json::json!(99);
+            fs::write(&race_path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+        },
+    );
 
     let out = apply_config_dir(dir.path()).await;
     drop(failpoint);
@@ -268,7 +307,10 @@ async fn create_crash_before_init_recovers_via_sweep() {
     seed_empty_state(dir.path());
 
     {
-        let _failpoint = ScopedFailPoint::new(omnigraph_cluster::failpoints::names::CLUSTER_APPLY_BEFORE_GRAPH_CREATE, "return");
+        let _failpoint = ScopedFailPoint::new(
+            omnigraph_cluster::failpoints::names::CLUSTER_APPLY_BEFORE_GRAPH_CREATE,
+            "return",
+        );
         let out = apply_config_dir(dir.path()).await;
         assert!(!out.ok);
         assert!(out.diagnostics.iter().any(|diagnostic| {
@@ -312,7 +354,10 @@ async fn create_crash_after_init_rolls_state_forward() {
     let state_before = fs::read(dir.path().join("__cluster/state.json")).unwrap();
 
     {
-        let _failpoint = ScopedFailPoint::new(omnigraph_cluster::failpoints::names::CLUSTER_APPLY_AFTER_GRAPH_CREATE, "return");
+        let _failpoint = ScopedFailPoint::new(
+            omnigraph_cluster::failpoints::names::CLUSTER_APPLY_AFTER_GRAPH_CREATE,
+            "return",
+        );
         let out = apply_config_dir(dir.path()).await;
         assert!(!out.ok);
         assert!(!out.state_written);
@@ -401,7 +446,10 @@ async fn schema_crash_before_apply_recovers_via_sweep() {
     fs::write(dir.path().join("people.pg"), SCHEMA_V2).unwrap();
 
     {
-        let _failpoint = ScopedFailPoint::new(omnigraph_cluster::failpoints::names::CLUSTER_APPLY_BEFORE_SCHEMA_APPLY, "return");
+        let _failpoint = ScopedFailPoint::new(
+            omnigraph_cluster::failpoints::names::CLUSTER_APPLY_BEFORE_SCHEMA_APPLY,
+            "return",
+        );
         let out = apply_config_dir_with_options(
             dir.path(),
             ApplyOptions {
@@ -442,7 +490,10 @@ async fn schema_apply_error_before_graph_movement_removes_sidecar() {
     fs::write(dir.path().join("people.pg"), SCHEMA_V2).unwrap();
 
     {
-        let _failpoint = ScopedFailPoint::new(omnigraph::failpoints::names::SCHEMA_APPLY_BEFORE_STAGING_WRITE, "return");
+        let _failpoint = ScopedFailPoint::new(
+            omnigraph::failpoints::names::SCHEMA_APPLY_BEFORE_STAGING_WRITE,
+            "return",
+        );
         let out = apply_config_dir(dir.path()).await;
         assert!(!out.ok);
         assert!(
@@ -476,13 +527,17 @@ async fn schema_apply_error_after_graph_movement_keeps_sidecar() {
     let scenario = FailScenario::setup();
     let dir = fixture();
     converge_with_live_graph(dir.path()).await;
-    let pre_digest = live_schema_digest(dir.path()).await;
+    let uri = dir.path().join("graphs/knowledge.omni");
+    let pre_schema_source = fs::read_to_string(uri.join("_schema.pg")).unwrap();
     fs::write(dir.path().join("people.pg"), SCHEMA_V2).unwrap();
     let desired = validate_config_dir(dir.path());
     let v2_digest = desired.resource_digests["schema.knowledge"].clone();
 
     {
-        let _failpoint = ScopedFailPoint::new(omnigraph::failpoints::names::SCHEMA_APPLY_AFTER_MANIFEST_COMMIT, "return");
+        let _failpoint = ScopedFailPoint::new(
+            omnigraph::failpoints::names::SCHEMA_APPLY_AFTER_MANIFEST_COMMIT,
+            "return",
+        );
         let out = apply_config_dir(dir.path()).await;
         assert!(!out.ok);
         assert!(
@@ -492,11 +547,28 @@ async fn schema_apply_error_after_graph_movement_keeps_sidecar() {
             "{:?}",
             out.diagnostics
         );
-        // Read-only opens do not run engine schema-state recovery, so the
-        // schema file still reads as the old digest even though the manifest
-        // has moved. The cluster sidecar must remain because movement was
-        // detected by the fallback manifest-version proof.
-        assert_eq!(live_schema_digest(dir.path()).await, pre_digest);
+        // Read-only opens cannot repair the torn manifest/schema authority and
+        // must refuse it. Inspect the physical source directly to prove that
+        // recovery has not rewritten it behind the read-only boundary.
+        let read_only_error = match Omnigraph::open_read_only(uri.to_string_lossy().as_ref()).await
+        {
+            Ok(_) => panic!("read-only open must refuse incomplete SchemaApply recovery"),
+            Err(error) => error,
+        };
+        match read_only_error {
+            OmniError::RecoveryRequired { reason, .. } => {
+                assert!(
+                    reason.contains("read-only open found SchemaApply manifest outcome")
+                        && reason.contains("run a read-write open"),
+                    "unexpected read-only recovery refusal: {reason}"
+                );
+            }
+            other => panic!("expected RecoveryRequired from read-only open, got: {other}"),
+        }
+        assert_eq!(
+            fs::read_to_string(uri.join("_schema.pg")).unwrap(),
+            pre_schema_source
+        );
         let sidecars = recovery_sidecars(dir.path());
         assert_eq!(sidecars.len(), 1, "{sidecars:?}");
         let sidecar: serde_json::Value =
@@ -505,7 +577,6 @@ async fn schema_apply_error_after_graph_movement_keeps_sidecar() {
         assert!(sidecar["expected_manifest_version"].is_null(), "{sidecar}");
     }
 
-    let uri = dir.path().join("graphs/knowledge.omni");
     let db = Omnigraph::open(uri.to_string_lossy().as_ref())
         .await
         .unwrap();
@@ -545,7 +616,10 @@ async fn schema_crash_after_apply_rolls_state_forward() {
     let v2_digest = desired.resource_digests["schema.knowledge"].clone();
 
     {
-        let _failpoint = ScopedFailPoint::new(omnigraph_cluster::failpoints::names::CLUSTER_APPLY_AFTER_SCHEMA_APPLY, "return");
+        let _failpoint = ScopedFailPoint::new(
+            omnigraph_cluster::failpoints::names::CLUSTER_APPLY_AFTER_SCHEMA_APPLY,
+            "return",
+        );
         let out = apply_config_dir(dir.path()).await;
         assert!(!out.ok);
         assert!(!out.state_written);
@@ -584,9 +658,17 @@ async fn schema_crash_after_apply_rolls_state_forward() {
 /// Seed: converged state + a stale `old` graph subtree with a real root and
 /// a valid approval for its delete. Returns the approval id.
 async fn seed_approved_delete(dir: &Path) -> String {
+    seed_approved_delete_with_root(dir, true).await
+}
+
+/// `real_root = false` leaves an unopenable faked directory in place — only
+/// the preflight-refusal cell below wants that; every crash-window test needs
+/// the genuine root or its failpoint is never reached.
+async fn seed_approved_delete_with_root(dir: &Path, real_root: bool) -> String {
     let digests = seed_applyable_state(dir);
-    let graph_digest = digests["graph.knowledge"].clone();
     let schema_digest = digests["schema.knowledge"].clone();
+    let graph_digest = historical_graph_digest("knowledge", Some(&schema_digest), &[]);
+    let old_graph_digest = historical_graph_digest("old", Some("4444"), &[]);
     let state_dir = dir.join("__cluster");
     fs::write(
         state_dir.join("state.json"),
@@ -598,7 +680,7 @@ async fn seed_approved_delete(dir: &Path) -> String {
     "resources": {{
       "graph.knowledge": {{ "digest": "{graph_digest}" }},
       "schema.knowledge": {{ "digest": "{schema_digest}" }},
-      "graph.old": {{ "digest": "3333" }},
+      "graph.old": {{ "digest": "{old_graph_digest}" }},
       "schema.old": {{ "digest": "4444" }}
     }}
   }}
@@ -607,9 +689,19 @@ async fn seed_approved_delete(dir: &Path) -> String {
         ),
     )
     .unwrap();
+    // A genuine graph root, not a faked directory.
     let root = dir.join("graphs/old.omni");
-    fs::create_dir_all(&root).unwrap();
-    fs::write(root.join("_schema.pg"), "stale").unwrap();
+    if real_root {
+        omnigraph::db::Omnigraph::init(
+            root.to_str().unwrap(),
+            "node Person {\n  name: String @key\n}\n",
+        )
+        .await
+        .unwrap();
+    } else {
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("_schema.pg"), "stale").unwrap();
+    }
     let approved = approve_config_dir(dir, "graph.old", "test-actor").await;
     assert!(approved.ok, "{:?}", approved.diagnostics);
     approved.approval_id.unwrap()
@@ -626,7 +718,10 @@ async fn delete_crash_before_removal_reproposes() {
     let approval_id = seed_approved_delete(dir.path()).await;
 
     {
-        let _failpoint = ScopedFailPoint::new(omnigraph_cluster::failpoints::names::CLUSTER_APPLY_BEFORE_GRAPH_DELETE, "return");
+        let _failpoint = ScopedFailPoint::new(
+            omnigraph_cluster::failpoints::names::CLUSTER_APPLY_BEFORE_GRAPH_DELETE,
+            "return",
+        );
         let out = apply_config_dir(dir.path()).await;
         assert!(!out.ok);
         assert!(dir.path().join("graphs/old.omni").exists());
@@ -670,7 +765,10 @@ async fn delete_crash_after_removal_rolls_forward() {
     let state_before = fs::read(state_path(dir.path())).unwrap();
 
     {
-        let _failpoint = ScopedFailPoint::new(omnigraph_cluster::failpoints::names::CLUSTER_APPLY_AFTER_GRAPH_DELETE, "return");
+        let _failpoint = ScopedFailPoint::new(
+            omnigraph_cluster::failpoints::names::CLUSTER_APPLY_AFTER_GRAPH_DELETE,
+            "return",
+        );
         let out = apply_config_dir(dir.path()).await;
         assert!(!out.ok);
         assert!(!out.state_written);

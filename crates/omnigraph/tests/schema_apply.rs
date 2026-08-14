@@ -1,14 +1,35 @@
 mod helpers;
 
 use std::fs;
+#[cfg(feature = "failpoints")]
+use std::sync::Arc;
 
-use omnigraph::db::{Omnigraph, ReadTarget};
+use omnigraph::db::{MergeOutcome, Omnigraph, ReadTarget};
+use omnigraph::error::{ManifestErrorKind, OmniError};
 use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::{BlobContent, ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy};
 use omnigraph_compiler::{SchemaMigrationStep, SchemaTypeKind};
 
 use helpers::*;
 
+async fn assert_exact_id_primary_key(db: &Omnigraph, table_key: &str) {
+    let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let dataset = snapshot.open(table_key).await.unwrap();
+    let primary_key = dataset
+        .schema()
+        .unenforced_primary_key()
+        .iter()
+        .map(|field| field.name.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        primary_key,
+        ["id"],
+        "schema apply must preserve exactly `id` as the Lance unenforced primary key for {table_key}"
+    );
+}
+
 #[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn plan_schema_reports_supported_additive_change() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
@@ -30,9 +51,452 @@ async fn plan_schema_reports_supported_additive_change() {
             ..
         } if type_name == "Person" && property_name == "nickname"
     )));
+
+    let preview = db
+        .preview_schema_apply_with_options(&desired, omnigraph::db::SchemaApplyOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(preview.catalog.node_types.len(), 2);
 }
 
 #[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
+async fn apply_schema_interface_evolution_is_identity_only_and_durable() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let mut table_versions_before = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .entries()
+        .map(|entry| {
+            (
+                entry.table_key.clone(),
+                entry.table_path.clone(),
+                entry.table_version,
+            )
+        })
+        .collect::<Vec<_>>();
+    table_versions_before.sort();
+
+    let with_interface = format!("interface Named {{\n    name: String\n}}\n\n{TEST_SCHEMA}");
+    let added = db.apply_schema(&with_interface).await.unwrap();
+    assert!(added.supported && added.applied);
+    assert!(added.steps.iter().any(|step| matches!(
+        step,
+        SchemaMigrationStep::AddType {
+            type_kind: SchemaTypeKind::Interface,
+            name,
+        } if name == "Named"
+    )));
+    let interface_id = db.catalog().type_id("Named").unwrap();
+    let name_property_id = db.catalog().property_id("Named", "name").unwrap();
+
+    let extended_interface =
+        format!("interface Named {{\n    name: String\n    alias: String?\n}}\n\n{TEST_SCHEMA}");
+    let extended = db.apply_schema(&extended_interface).await.unwrap();
+    assert!(extended.supported && extended.applied);
+    assert!(extended.steps.iter().any(|step| matches!(
+        step,
+        SchemaMigrationStep::AddProperty {
+            type_kind: SchemaTypeKind::Interface,
+            type_name,
+            property_name,
+            ..
+        } if type_name == "Named" && property_name == "alias"
+    )));
+    assert_eq!(db.catalog().type_id("Named"), Some(interface_id));
+    assert_eq!(
+        db.catalog().property_id("Named", "name"),
+        Some(name_property_id)
+    );
+    assert!(db.catalog().property_id("Named", "alias").is_some());
+
+    let mut table_versions_after = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .entries()
+        .map(|entry| {
+            (
+                entry.table_key.clone(),
+                entry.table_path.clone(),
+                entry.table_version,
+            )
+        })
+        .collect::<Vec<_>>();
+    table_versions_after.sort();
+    assert_eq!(table_versions_after, table_versions_before);
+
+    drop(db);
+    let reopened = Omnigraph::open(uri).await.unwrap();
+    assert_eq!(reopened.catalog().type_id("Named"), Some(interface_id));
+    assert_eq!(
+        reopened.catalog().property_id("Named", "name"),
+        Some(name_property_id)
+    );
+    assert!(reopened.catalog().property_id("Named", "alias").is_some());
+}
+
+#[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
+async fn long_lived_handle_uses_the_schema_catalog_bound_to_its_write_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let schema_owner = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    // Open before the migration: this handle's process-local ArcSwap catalog is
+    // intentionally stale after `schema_owner` completes the apply.
+    let stale_handle = Omnigraph::open(uri).await.unwrap();
+
+    let desired = format!(
+        "{}\nnode Project {{\n    name: String @key\n}}\n",
+        TEST_SCHEMA.replace(
+            "    age: I32?\n}",
+            "    age: I32?\n    nickname: String?\n}",
+        )
+    );
+    schema_owner.apply_schema(&desired).await.unwrap();
+    let reopened_after_apply = Omnigraph::open(uri).await.unwrap();
+    assert_eq!(reopened_after_apply.catalog().node_types.len(), 3);
+    // The same apply exercises both physical schema shapes: Person is rebuilt
+    // through a staged overwrite for the added property, while Project is a
+    // newly created table incarnation. Neither may drop the immutable v6 PK.
+    assert_exact_id_primary_key(&schema_owner, "node:Person").await;
+    assert_exact_id_primary_key(&schema_owner, "node:Project").await;
+    assert_stable_property_markers(&schema_owner, "node:Person").await;
+    assert_stable_property_markers(&schema_owner, "node:Project").await;
+
+    let projects = stale_handle
+        .query(
+            ReadTarget::branch("main"),
+            "query projects() { match { $p: Project } return { $p.name } }",
+            "projects",
+            &params(&[]),
+        )
+        .await
+        .expect("read capture must refresh the manifest before joining the promoted SchemaIR");
+    assert_eq!(projects.num_rows(), 0);
+
+    let mutation = r#"
+query insert_with_nickname($name: String, $age: I32, $nickname: String) {
+    insert Person { name: $name, age: $age, nickname: $nickname }
+}
+"#;
+    let inserted = stale_handle
+        .mutate(
+            "main",
+            mutation,
+            "insert_with_nickname",
+            &mixed_params(
+                &[("$name", "mutated-after-schema"), ("$nickname", "fresh")],
+                &[("$age", 31)],
+            ),
+        )
+        .await
+        .expect("mutation must typecheck and build its batch with the token-bound catalog");
+    assert_eq!(inserted.affected_nodes, 1);
+
+    let loaded = stale_handle
+        .load(
+            "main",
+            r#"{"type":"Person","data":{"name":"loaded-after-schema","age":32,"nickname":"fresh"}}"#,
+            LoadMode::Merge,
+        )
+        .await
+        .expect("load parsing and validation must use the same token-bound catalog");
+    assert_eq!(loaded.nodes_loaded.get("Person"), Some(&1));
+    assert_eq!(count_rows(&stale_handle, "node:Person").await, 2);
+
+    // The same stale handle must bind branch-merge planning and conservative
+    // branch-control table gates to the accepted contract captured under the
+    // schema gate. The warm handle catalog predates Project; consulting it here
+    // would fail with `unknown node type` (or omit Project's control queue).
+    stale_handle.branch_create("source").await.unwrap();
+    stale_handle.branch_create("target").await.unwrap();
+    let project_mutation = r#"
+query insert_project($name: String) {
+    insert Project { name: $name }
+}
+"#;
+    stale_handle
+        .mutate(
+            "source",
+            project_mutation,
+            "insert_project",
+            &params(&[("$name", "fresh-catalog-project")]),
+        )
+        .await
+        .expect("source write must use the token-bound post-apply catalog");
+    let project_before_indices = stale_handle
+        .snapshot_of(ReadTarget::branch("source"))
+        .await
+        .unwrap()
+        .entry("node:Project")
+        .unwrap()
+        .table_version;
+    stale_handle
+        .ensure_indices_on("source")
+        .await
+        .expect("index planning must use the same token-bound post-apply catalog");
+    let project_after_indices = stale_handle
+        .snapshot_of(ReadTarget::branch("source"))
+        .await
+        .unwrap()
+        .entry("node:Project")
+        .unwrap()
+        .table_version;
+    assert!(
+        project_after_indices > project_before_indices,
+        "the stale handle must discover and build Project's declared key index"
+    );
+    assert_eq!(
+        stale_handle
+            .branch_merge("source", "target")
+            .await
+            .expect("merge planning must use the schema-gated post-apply catalog"),
+        MergeOutcome::FastForward
+    );
+    assert_eq!(
+        count_rows_branch(&stale_handle, "target", "node:Project").await,
+        1
+    );
+}
+
+/// Native branch controls must enumerate their conservative table envelope
+/// from the accepted catalog captured under the schema gate, not a long-lived
+/// handle's pre-apply ArcSwap. Park delete after that envelope is held and prove
+/// a legacy Project-only index reconciler cannot cross its table queue.
+#[cfg(feature = "failpoints")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+async fn stale_handle_branch_delete_gates_tables_added_by_schema_apply() {
+    use omnigraph::failpoints::names;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let schema_owner = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let stale_control = Arc::new(Omnigraph::open(uri).await.unwrap());
+    let desired = format!("{TEST_SCHEMA}\nnode Project {{\n    name: String @key\n}}\n");
+    schema_owner.apply_schema(&desired).await.unwrap();
+    schema_owner.branch_create("target").await.unwrap();
+    schema_owner
+        .load(
+            "target",
+            r#"{"type":"Project","data":{"name":"pending-index"}}"#,
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+    let index_reconciler = Arc::new(Omnigraph::open(uri).await.unwrap());
+
+    let delete_rv =
+        helpers::failpoint::Rendezvous::park_first(names::BRANCH_DELETE_POST_TABLE_GATES);
+    let delete_handle = Arc::clone(&stale_control);
+    let delete_task = tokio::spawn(async move { delete_handle.branch_delete("target").await });
+    delete_rv.wait_until_reached().await;
+
+    let index_handle = Arc::clone(&index_reconciler);
+    let mut index_task =
+        tokio::spawn(async move { index_handle.ensure_indices_on("target").await });
+    let index_blocked =
+        tokio::time::timeout(std::time::Duration::from_millis(250), &mut index_task)
+            .await
+            .is_err();
+    delete_rv.release();
+    assert!(
+        index_blocked,
+        "stale control catalog omitted the newly-added Project table gate"
+    );
+    delete_task.await.unwrap().unwrap();
+
+    if tokio::time::timeout(std::time::Duration::from_secs(10), &mut index_task)
+        .await
+        .is_err()
+    {
+        index_task.abort();
+        let _ = index_task.await;
+        panic!("index reconciler did not finish after branch delete released its table gate");
+    }
+}
+
+#[cfg(feature = "failpoints")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+async fn mutation_waits_for_mid_apply_schema_gate_then_reprepares() {
+    use omnigraph::failpoints::names;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(init_and_load(&dir).await);
+    let desired = TEST_SCHEMA.replace(
+        "    age: I32?\n}",
+        "    age: I32?\n    nickname: String?\n}",
+    );
+
+    // First park the mutation after all validation/staging but before it enters
+    // the schema→branch→table effect gates. This fixes the otherwise tiny race
+    // window deterministically.
+    let mutation_rv =
+        helpers::failpoint::Rendezvous::park_first(names::MUTATION_POST_STAGE_PRE_EFFECT_GATE);
+    let mutation_db = Arc::clone(&db);
+    let mutation_task = tokio::spawn(async move {
+        mutation_db
+            .mutate(
+                "main",
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "schema-gated")], &[("$age", 33)]),
+            )
+            .await
+    });
+    mutation_rv.wait_until_reached().await;
+
+    // Start schema apply and park it after its staging files (and any table
+    // rewrite) exist but before manifest/schema promotion. The outer apply owns
+    // the schema-control gate throughout this window.
+    let schema_rv =
+        helpers::failpoint::Rendezvous::park_first(names::SCHEMA_APPLY_AFTER_STAGING_WRITE);
+    let schema_db = Arc::clone(&db);
+    let schema_task = tokio::spawn(async move { schema_db.apply_schema(&desired).await });
+    schema_rv.wait_until_reached().await;
+
+    mutation_rv.release();
+    // Give the already-runnable mutation repeated scheduler turns. It must stay
+    // pending on the schema gate; completing here means it either advanced under
+    // an in-flight migration or returned a spurious post-prepare failure.
+    for _ in 0..128 {
+        tokio::task::yield_now().await;
+        if mutation_task.is_finished() {
+            break;
+        }
+    }
+    assert!(
+        !mutation_task.is_finished(),
+        "mutation must remain behind the schema-control gate while apply is in flight",
+    );
+
+    schema_rv.release();
+    schema_task.await.unwrap().unwrap();
+    let result = mutation_task
+        .await
+        .unwrap()
+        .expect("insert-only mutation must reprepare under the promoted schema");
+    assert_eq!(result.affected_nodes, 1);
+    assert_eq!(count_rows(&db, "node:Person").await, 5);
+}
+
+/// ReadOnly opens participate in the process-local schema publication gate even
+/// though they perform no recovery writes. Park an open immediately before its
+/// source/IR/state read: schema apply must not reach staging until that coherent
+/// catalog capture finishes.
+#[cfg(feature = "failpoints")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+async fn read_only_open_holds_schema_gate_through_catalog_capture() {
+    use omnigraph::failpoints::names;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let owner = Arc::new(init_and_load(&dir).await);
+    let desired = TEST_SCHEMA.replace(
+        "    age: I32?\n}",
+        "    age: I32?\n    nickname: String?\n}",
+    );
+
+    let open_rv =
+        helpers::failpoint::Rendezvous::park_first(names::OPEN_BEFORE_SCHEMA_CONTRACT_READ);
+    let open_uri = uri.clone();
+    let open_task = tokio::spawn(async move { Omnigraph::open_read_only(&open_uri).await });
+    open_rv.wait_until_reached().await;
+
+    let apply_rv =
+        helpers::failpoint::Rendezvous::park_first(names::SCHEMA_APPLY_AFTER_STAGING_WRITE);
+    let apply_owner = Arc::clone(&owner);
+    let apply_task = tokio::spawn(async move { apply_owner.apply_schema(&desired).await });
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            apply_rv.wait_until_reached(),
+        )
+        .await
+        .is_err(),
+        "schema apply must remain behind the ReadOnly catalog-capture gate",
+    );
+
+    open_rv.release();
+    let opened = open_task.await.unwrap().unwrap();
+    assert!(
+        !opened.catalog().node_types["Person"]
+            .properties
+            .contains_key("nickname"),
+        "the serialized open must publish the complete pre-apply catalog"
+    );
+    apply_rv.wait_until_reached().await;
+    apply_rv.release();
+    apply_task.await.unwrap().unwrap();
+    let current = Omnigraph::open_read_only(&uri).await.unwrap();
+    assert!(
+        current.catalog().node_types["Person"]
+            .properties
+            .contains_key("nickname"),
+        "the next open must publish the complete post-apply catalog"
+    );
+}
+
+/// Refresh must reacquire the schema gate after sidecar healing and retain it
+/// through the ArcSwap publication. Otherwise a concurrent three-file schema
+/// promotion can be interleaved with its contract read.
+#[cfg(feature = "failpoints")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+async fn refresh_holds_schema_gate_through_catalog_publication() {
+    use omnigraph::failpoints::names;
+
+    let dir = tempfile::tempdir().unwrap();
+    let owner = Arc::new(init_and_load(&dir).await);
+    let stale = Arc::new(Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap());
+    let desired = TEST_SCHEMA.replace(
+        "    age: I32?\n}",
+        "    age: I32?\n    nickname: String?\n}",
+    );
+
+    let reload_rv =
+        helpers::failpoint::Rendezvous::park_first(names::SCHEMA_RELOAD_BEFORE_CONTRACT_READ);
+    let refresh_handle = Arc::clone(&stale);
+    let refresh_task = tokio::spawn(async move { refresh_handle.refresh().await });
+    reload_rv.wait_until_reached().await;
+
+    let apply_rv =
+        helpers::failpoint::Rendezvous::park_first(names::SCHEMA_APPLY_AFTER_STAGING_WRITE);
+    let apply_owner = Arc::clone(&owner);
+    let apply_task = tokio::spawn(async move { apply_owner.apply_schema(&desired).await });
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            apply_rv.wait_until_reached(),
+        )
+        .await
+        .is_err(),
+        "schema apply must remain behind refresh's catalog-publication gate",
+    );
+
+    reload_rv.release();
+    refresh_task.await.unwrap().unwrap();
+    apply_rv.wait_until_reached().await;
+    apply_rv.release();
+    apply_task.await.unwrap().unwrap();
+
+    stale.refresh().await.unwrap();
+    assert!(
+        stale.catalog().node_types["Person"]
+            .properties
+            .contains_key("nickname"),
+        "a post-apply refresh must publish the complete new catalog"
+    );
+}
+
+#[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn plan_schema_rejects_when_schema_contract_has_drifted() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
@@ -49,10 +513,11 @@ async fn plan_schema_rejects_when_schema_contract_has_drifted() {
 }
 
 #[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn apply_schema_noop_returns_not_applied() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
 
     let result = db.apply_schema(TEST_SCHEMA).await.unwrap();
     assert!(result.supported);
@@ -61,10 +526,11 @@ async fn apply_schema_noop_returns_not_applied() {
 }
 
 #[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn apply_schema_rejects_when_non_main_branch_exists() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
     db.branch_create("feature").await.unwrap();
 
     let desired = TEST_SCHEMA.replace(
@@ -79,10 +545,11 @@ async fn apply_schema_rejects_when_non_main_branch_exists() {
 }
 
 #[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn apply_schema_unsupported_plan_does_not_advance_manifest() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
     let before_version = db
         .snapshot_of(ReadTarget::branch("main"))
         .await
@@ -117,23 +584,89 @@ async fn apply_schema_unsupported_plan_does_not_advance_manifest() {
 // contract so a regression in the planner can't silently change behavior.
 
 #[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn apply_schema_drops_a_nullable_property_softly_preserves_prior_version() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let uri = dir.path().to_str().unwrap();
+    let external_dir = tempfile::tempdir().unwrap();
+    let external_path = external_dir.path().join("external.bin");
+    std::fs::write(&external_path, b"External").unwrap();
+    let external_uri = format!("file://{}", external_path.display());
+    let canonical_external_uri =
+        url::Url::from_file_path(std::fs::canonicalize(&external_path).unwrap())
+            .expect("canonical external Blob path is absolute")
+            .to_string();
+    let external_policy = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(
+            url::Url::from_directory_path(external_dir.path())
+                .expect("external blob base is absolute"),
+            ExternalBlobExecutionScope::EmbeddedOnly,
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    let initial = r#"
+node Document {
+    title: String @key
+    content: Blob?
+    note: String?
+}
+"#;
+    let db = Omnigraph::init(uri, initial)
+        .await
+        .unwrap()
+        .with_external_blob_policy(external_policy)
+        .unwrap();
+    let data = [
+        serde_json::json!({
+            "type": "Document",
+            "data": {
+                "title": "valid-empty",
+                "content": "base64:",
+                "note": "drop me",
+            },
+        }),
+        serde_json::json!({
+            "type": "Document",
+            "data": {
+                "title": "neighbor",
+                "content": "base64:TmVpZ2hib3I=",
+                "note": "drop me too",
+            },
+        }),
+        serde_json::json!({
+            "type": "Document",
+            "data": {
+                "title": "external",
+                "content": external_uri,
+                "note": "drop me three",
+            },
+        }),
+    ]
+    .into_iter()
+    .map(|row| row.to_string())
+    .collect::<Vec<_>>()
+    .join("\n");
+    load_jsonl(&db, &data, LoadMode::Overwrite).await.unwrap();
 
-    let people_before = count_rows(&db, "node:Person").await;
+    // Admission policy is not durable graph data. Reopen with the default
+    // deny policy so the rewrite proves that a historical descriptor is
+    // carried without re-authorizing or probing its caller-owned target.
+    let db = Omnigraph::open(uri).await.unwrap();
+
+    let documents_before = count_rows(&db, "node:Document").await;
     let before_version = db
         .snapshot_of(ReadTarget::branch("main"))
         .await
         .unwrap()
         .version();
 
-    // Drop `age` from Person. v1 + chassis commit #3 emit
+    // Drop `note` from Document. v1 + chassis commit #3 emit
     // `DropProperty { Soft }`; the rewrite path projects to the
-    // target schema (no `age`), commits via stage_overwrite. Row
+    // target schema (no `note`), commits via stage_overwrite. Row
     // counts are unchanged — only the column is dropped from the
     // current schema view.
-    let desired = TEST_SCHEMA.replace("    age: I32?\n", "");
+    let desired = initial.replace("    note: String?\n", "");
 
     // Confirm the plan emits DropProperty { Soft } (not UnsupportedChange).
     let plan = db.plan_schema(&desired).await.unwrap();
@@ -147,14 +680,19 @@ async fn apply_schema_drops_a_nullable_property_softly_preserves_prior_version()
                 property_name,
                 mode: omnigraph_compiler::DropMode::Soft,
                 ..
-            } if type_name == "Person" && property_name == "age"
+            } if type_name == "Document" && property_name == "note"
         )),
-        "expected DropProperty {{ type=Person, property=age, mode=Soft }} in plan; got {plan:?}",
+        "expected DropProperty {{ type=Document, property=note, mode=Soft }} in plan; got {plan:?}",
     );
 
+    // An unrelated schema rewrite carries the descriptor, not the external
+    // payload. The caller-owned target may be unavailable without blocking
+    // schema evolution.
+    std::fs::remove_file(&external_path).unwrap();
     let result = db.apply_schema(&desired).await.unwrap();
     assert!(result.supported);
     assert!(result.applied);
+    assert_exact_id_primary_key(&db, "node:Document").await;
 
     // Manifest advanced; row count unchanged.
     let after_version = db
@@ -166,11 +704,43 @@ async fn apply_schema_drops_a_nullable_property_softly_preserves_prior_version()
         after_version > before_version,
         "manifest version should advance after soft drop; before={before_version}, after={after_version}",
     );
-    assert_eq!(count_rows(&db, "node:Person").await, people_before);
+    assert_eq!(count_rows(&db, "node:Document").await, documents_before);
 
-    // (a) Current snapshot: `age` is gone from the dataset schema.
+    let empty = read_managed_blob_bytes(
+        &db,
+        ReadTarget::branch("main"),
+        node_blob_cell("Document", "valid-empty", "content"),
+    )
+    .await;
+    assert!(empty.is_empty());
+    let neighbor = read_managed_blob_bytes(
+        &db,
+        ReadTarget::branch("main"),
+        node_blob_cell("Document", "neighbor", "content"),
+    )
+    .await;
+    assert_eq!(&neighbor[..], b"Neighbor");
+    let external = db
+        .read_blob_at(
+            ReadTarget::branch("main"),
+            node_blob_cell("Document", "external", "content"),
+        )
+        .await
+        .unwrap();
+    match external.content {
+        BlobContent::External(reference) => {
+            assert_eq!(reference.uri, canonical_external_uri);
+            assert_eq!(reference.offset, 0);
+            assert_eq!(reference.length, None);
+        }
+        BlobContent::Managed { .. } => {
+            panic!("schema rewrite must preserve the external Blob descriptor")
+        }
+    }
+
+    // (a) Current snapshot: `note` is gone from the dataset schema.
     let current_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-    let current_ds = current_snapshot.open("node:Person").await.unwrap();
+    let current_ds = current_snapshot.open("node:Document").await.unwrap();
     let current_fields = current_ds
         .schema()
         .fields
@@ -178,15 +748,15 @@ async fn apply_schema_drops_a_nullable_property_softly_preserves_prior_version()
         .map(|f| f.name.clone())
         .collect::<Vec<_>>();
     assert!(
-        !current_fields.iter().any(|f| f == "age"),
-        "current Person dataset schema must not include 'age' after soft drop; got fields {current_fields:?}",
+        !current_fields.iter().any(|f| f == "note"),
+        "current Document dataset schema must not include 'note' after soft drop; got fields {current_fields:?}",
     );
 
     // (b) Time travel: at the pre-drop manifest version, the prior
-    // Person dataset version still has `age`. Soft drop is reversible
+    // Document dataset version still has `note`. Soft drop is reversible
     // via Lance's version graph until `omnigraph cleanup` runs.
     let pre_drop_snapshot = db.snapshot_at_version(before_version).await.unwrap();
-    let pre_drop_ds = pre_drop_snapshot.open("node:Person").await.unwrap();
+    let pre_drop_ds = pre_drop_snapshot.open("node:Document").await.unwrap();
     let pre_drop_fields = pre_drop_ds
         .schema()
         .fields
@@ -194,20 +764,21 @@ async fn apply_schema_drops_a_nullable_property_softly_preserves_prior_version()
         .map(|f| f.name.clone())
         .collect::<Vec<_>>();
     assert!(
-        pre_drop_fields.iter().any(|f| f == "age"),
-        "pre-drop Person dataset schema must still include 'age' (time-travel reversibility); got fields {pre_drop_fields:?}",
+        pre_drop_fields.iter().any(|f| f == "note"),
+        "pre-drop Document dataset schema must still include 'note' (time-travel reversibility); got fields {pre_drop_fields:?}",
     );
 
     // (c) Reopen consistency: close the engine, reopen, verify the
     // drop is preserved (column still absent from current schema).
-    let uri = dir.path().to_str().unwrap().to_string();
+    let uri = uri.to_string();
     drop(db);
     let reopened = Omnigraph::open(&uri).await.unwrap();
+    assert_exact_id_primary_key(&reopened, "node:Document").await;
     let reopened_snapshot = reopened
         .snapshot_of(ReadTarget::branch("main"))
         .await
         .unwrap();
-    let reopened_ds = reopened_snapshot.open("node:Person").await.unwrap();
+    let reopened_ds = reopened_snapshot.open("node:Document").await.unwrap();
     let reopened_fields = reopened_ds
         .schema()
         .fields
@@ -215,15 +786,162 @@ async fn apply_schema_drops_a_nullable_property_softly_preserves_prior_version()
         .map(|f| f.name.clone())
         .collect::<Vec<_>>();
     assert!(
-        !reopened_fields.iter().any(|f| f == "age"),
-        "after reopen, Person dataset schema must still lack 'age'; got fields {reopened_fields:?}",
+        !reopened_fields.iter().any(|f| f == "note"),
+        "after reopen, Document dataset schema must still lack 'note'; got fields {reopened_fields:?}",
+    );
+
+    // A soft drop followed by a same-name add mints a new stable property and
+    // a new Lance field id.  The current selector must not reinterpret the old
+    // snapshot's identically-spelled Blob as that new property lifetime.
+    let retired_content_snapshot = reopened.resolve_snapshot("main").await.unwrap();
+    let without_content = desired.replace("    content: Blob?\n", "");
+    reopened.apply_schema(&without_content).await.unwrap();
+    reopened.apply_schema(&desired).await.unwrap();
+    let lifetime_error = reopened
+        .read_blob_at(
+            ReadTarget::snapshot(retired_content_snapshot),
+            node_blob_cell("Document", "valid-empty", "content"),
+        )
+        .await
+        .expect_err("same-name Blob re-add must not adopt the retired property lifetime");
+    assert!(
+        matches!(
+            lifetime_error,
+            OmniError::Manifest(ref error)
+                if error.kind == ManifestErrorKind::BadRequest
+                    && error.message
+                        == "Blob property 'Document.content' belongs to a different property lifetime at the selected target"
+        ),
+        "retired Blob property lifetime must fail closed; got {lifetime_error:?}"
     );
 }
 
 #[tokio::test]
+#[cfg(feature = "failpoints")]
+#[serial_test::parallel]
+async fn schema_apply_rejects_ranged_external_blob_before_arm_or_effects() {
+    use arrow_array::{ArrayRef, RecordBatch, StringArray};
+    use helpers::recovery::{branch_head_commit_id, sidecar_operation_ids};
+    use lance::blob::{BlobDescriptorArrayBuilder, BlobRange};
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let initial = r#"
+node Document {
+    title: String @key
+    content: Blob?
+}
+"#;
+    let desired = r#"
+node Document {
+    title: String @key
+    content: Blob?
+    note: String?
+}
+"#;
+    let mut db = Omnigraph::init(uri, initial).await.unwrap();
+    let entry = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .entry("node:Document")
+        .unwrap()
+        .clone();
+    let table_uri = format!("{uri}/{}", entry.table_path);
+    let mut raw = lance::Dataset::open(&table_uri).await.unwrap();
+    let logical_schema = arrow_schema::Schema::from(raw.schema());
+    let mut descriptor_builder = BlobDescriptorArrayBuilder::new("content");
+    descriptor_builder
+        .push_external("s3://bucket/object", Some(BlobRange { offset: 4, size: 8 }))
+        .unwrap();
+    let (descriptor_field, descriptor) = descriptor_builder.finish().unwrap().into_parts();
+    let schema = Arc::new(arrow_schema::Schema::new_with_metadata(
+        logical_schema
+            .fields()
+            .iter()
+            .map(|field| {
+                if field.name() == "content" {
+                    Arc::new(descriptor_field.clone())
+                } else {
+                    field.clone()
+                }
+            })
+            .collect::<Vec<_>>(),
+        logical_schema.metadata().clone(),
+    ));
+    let mut field_names = schema
+        .fields()
+        .iter()
+        .map(|field| field.name().as_str())
+        .collect::<Vec<_>>();
+    field_names.sort_unstable();
+    assert_eq!(
+        field_names,
+        ["content", "id", "title"],
+        "ranged-descriptor fixture is physical-schema specific"
+    );
+    let columns = schema
+        .fields()
+        .iter()
+        .map(|field| match field.name().as_str() {
+            "id" | "title" => Arc::new(StringArray::from(vec!["ranged"])) as ArrayRef,
+            "content" => descriptor.clone(),
+            other => panic!("unexpected ranged-descriptor fixture field {other}"),
+        })
+        .collect::<Vec<_>>();
+    let batch = RecordBatch::try_new(schema, columns).unwrap();
+    helpers::lance_append_inline(&mut raw, batch).await;
+    db.failpoint_publish_table_head_without_index_rebuild_for_test("main", "node:Document", None)
+        .await
+        .unwrap();
+
+    let before = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let manifest_before = before.version();
+    let table_before = before.entry("node:Document").unwrap().table_version;
+    let physical_head_before = lance::Dataset::open(&table_uri)
+        .await
+        .unwrap()
+        .version()
+        .version;
+    let lineage_before = branch_head_commit_id(dir.path(), "main").await.unwrap();
+    assert!(sidecar_operation_ids(dir.path()).is_empty());
+
+    let error = db.apply_schema(desired).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("cannot preserve ranged external Blob descriptor"),
+        "unexpected schema-apply refusal: {error}"
+    );
+    let after = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    assert_eq!(after.version(), manifest_before);
+    assert_eq!(
+        after.entry("node:Document").unwrap().table_version,
+        table_before
+    );
+    assert_eq!(
+        lance::Dataset::open(&table_uri)
+            .await
+            .unwrap()
+            .version()
+            .version,
+        physical_head_before
+    );
+    assert_eq!(
+        branch_head_commit_id(dir.path(), "main").await.unwrap(),
+        lineage_before
+    );
+    assert!(
+        sidecar_operation_ids(dir.path()).is_empty(),
+        "ranged descriptor refusal must occur before recovery arm"
+    );
+}
+
+#[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn apply_schema_drops_node_and_referencing_edge_softly() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
     let before_version = db
         .snapshot_of(ReadTarget::branch("main"))
         .await
@@ -334,9 +1052,10 @@ edge Knows: Person -> Person {
 }
 
 #[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn apply_schema_drops_an_edge_type_softly() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
     let before_version = db
         .snapshot_of(ReadTarget::branch("main"))
         .await
@@ -391,9 +1110,10 @@ async fn apply_schema_drops_an_edge_type_softly() {
 }
 
 #[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn apply_schema_rejects_adding_a_required_property_without_backfill() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
     let before_version = db
         .snapshot_of(ReadTarget::branch("main"))
         .await
@@ -419,6 +1139,7 @@ async fn apply_schema_rejects_adding_a_required_property_without_backfill() {
 }
 
 #[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn plan_schema_for_property_type_narrowing_is_not_supported() {
     // Symmetric companion to `apply_schema_unsupported_plan_does_not_advance_manifest`,
     // which exercises widening (I32 -> I64). Narrowing (I64 -> I32) is also
@@ -428,8 +1149,8 @@ async fn plan_schema_for_property_type_narrowing_is_not_supported() {
     let uri = dir.path().to_str().unwrap();
 
     let initial = TEST_SCHEMA.replace("age: I32?", "age: I64?");
-    let mut db = Omnigraph::init(uri, &initial).await.unwrap();
-    load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite)
+    let db = Omnigraph::init(uri, &initial).await.unwrap();
+    load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
 
@@ -446,6 +1167,213 @@ async fn plan_schema_for_property_type_narrowing_is_not_supported() {
 }
 
 #[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
+async fn apply_schema_pure_type_rename_preserves_identity_path_and_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let initial = TEST_SCHEMA.replace("    age: I32?", "    age: I32?\n    avatar: Blob?");
+    let data = TEST_DATA.replace(
+        r#"{"name": "Alice", "age": 30}"#,
+        r#"{"name": "Alice", "age": 30, "avatar": "base64:QXZhdGFy"}"#,
+    );
+    let db = Omnigraph::init(uri, &initial).await.unwrap();
+    load_jsonl(&db, &data, LoadMode::Overwrite).await.unwrap();
+    db.ensure_indices().await.unwrap();
+    let before_snapshot_id = db.resolve_snapshot("main").await.unwrap();
+    let before_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let before_version = before_snapshot.version();
+    let before = before_snapshot.entry("node:Person").unwrap().clone();
+    let before_type_id = db.catalog().type_id("Person").unwrap();
+    let before_incarnation = db.catalog().table_incarnation_id("Person").unwrap();
+    let before_name_property_id = db.catalog().property_id("Person", "name").unwrap();
+    let people_before = count_rows(&db, "node:Person").await;
+    let before_avatar = db
+        .read_blob_at(
+            ReadTarget::branch("main"),
+            node_blob_cell("Person", "Alice", "avatar"),
+        )
+        .await
+        .unwrap();
+    let BlobContent::Managed {
+        etag: before_avatar_etag,
+        ..
+    } = before_avatar.content
+    else {
+        panic!("fixture avatar must be managed")
+    };
+
+    let desired = r#"
+node Human @rename_from("Person") {
+    name: String @key
+    age: I32?
+    avatar: Blob?
+}
+
+node Company {
+    name: String @key
+}
+
+edge Knows: Human -> Human {
+    since: Date?
+}
+
+edge WorksAt: Human -> Company
+"#;
+
+    let result = db.apply_schema(desired).await.unwrap();
+    assert!(result.supported && result.applied);
+    assert!(result.steps.iter().any(|step| matches!(
+        step,
+        SchemaMigrationStep::RenameType {
+            type_kind: SchemaTypeKind::Node,
+            from,
+            to,
+        } if from == "Person" && to == "Human"
+    )));
+    assert!(
+        !result.steps.iter().any(|step| matches!(
+            step,
+            SchemaMigrationStep::AddProperty { .. }
+                | SchemaMigrationStep::RenameProperty { .. }
+                | SchemaMigrationStep::DropProperty { .. }
+        )),
+        "pure rename unexpectedly planned a table rewrite: {:?}",
+        result.steps
+    );
+
+    let after_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let after = after_snapshot.entry("node:Human").unwrap();
+    assert_eq!(after.table_path, before.table_path);
+    assert_eq!(after.table_version, before.table_version);
+    assert_eq!(db.catalog().type_id("Human"), Some(before_type_id));
+    assert_eq!(
+        db.catalog().table_incarnation_id("Human"),
+        Some(before_incarnation)
+    );
+    assert_eq!(
+        db.catalog().property_id("Human", "name"),
+        Some(before_name_property_id)
+    );
+    assert_eq!(count_rows(&db, "node:Human").await, people_before);
+    assert!(after_snapshot.entry("node:Person").is_none());
+
+    let current_avatar = read_managed_blob_bytes(
+        &db,
+        ReadTarget::branch("main"),
+        node_blob_cell("Human", "Alice", "avatar"),
+    )
+    .await;
+    assert_eq!(&current_avatar[..], b"Avatar");
+    let renamed_avatar = db
+        .read_blob_at(
+            ReadTarget::branch("main"),
+            node_blob_cell("Human", "Alice", "avatar"),
+        )
+        .await
+        .unwrap();
+    let BlobContent::Managed {
+        etag: renamed_avatar_etag,
+        ..
+    } = renamed_avatar.content
+    else {
+        panic!("renamed avatar must remain managed")
+    };
+    assert_eq!(
+        renamed_avatar_etag, before_avatar_etag,
+        "a pure type alias rename over the same exact table version must preserve the Blob ETag"
+    );
+    let historical_avatar = read_managed_blob_bytes(
+        &db,
+        ReadTarget::snapshot(before_snapshot_id),
+        node_blob_cell("Human", "Alice", "avatar"),
+    )
+    .await;
+    assert_eq!(
+        &historical_avatar[..],
+        b"Avatar",
+        "the current type alias must bind the same stable table identity in a pre-rename snapshot"
+    );
+    let retired_type_error = db
+        .read_blob_at(
+            ReadTarget::branch("main"),
+            node_blob_cell("Person", "Alice", "avatar"),
+        )
+        .await
+        .expect_err("the retired type alias must not remain addressable");
+    assert!(matches!(
+        retired_type_error,
+        OmniError::Manifest(ref error) if error.kind == ManifestErrorKind::BadRequest
+    ));
+
+    let historical_snapshot = db.snapshot_at_version(before_version).await.unwrap();
+    let historical = historical_snapshot.entry("node:Person").unwrap();
+    assert_eq!(historical.table_path, before.table_path);
+    assert_eq!(historical.table_path, after.table_path);
+    assert_eq!(historical.table_version, before.table_version);
+    assert!(historical_snapshot.entry("node:Human").is_none());
+}
+
+#[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
+async fn apply_schema_rename_and_hard_property_drop_cleans_source_incarnation() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let before_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let before_manifest_version = before_snapshot.version();
+    let before = before_snapshot.entry("node:Person").unwrap().clone();
+
+    let desired = r#"
+node Human @rename_from("Person") {
+    name: String @key
+}
+
+node Company {
+    name: String @key
+}
+
+edge Knows: Human -> Human {
+    since: Date?
+}
+
+edge WorksAt: Human -> Company
+"#;
+    let result = db
+        .apply_schema_with_options(
+            desired,
+            omnigraph::db::SchemaApplyOptions {
+                allow_data_loss: true,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(result.applied);
+    assert!(result.steps.iter().any(|step| matches!(
+        step,
+        SchemaMigrationStep::DropProperty {
+            type_name,
+            mode: omnigraph_compiler::DropMode::Hard,
+            ..
+        } if type_name == "Human"
+    )));
+
+    let after_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let after = after_snapshot.entry("node:Human").unwrap();
+    assert_eq!(after.table_path, before.table_path);
+    assert!(after.table_version > before.table_version);
+    assert!(after_snapshot.entry("node:Person").is_none());
+    assert!(
+        db.snapshot_at_version(before_manifest_version)
+            .await
+            .unwrap()
+            .open("node:Person")
+            .await
+            .is_err(),
+        "hard cleanup must reclaim the renamed source incarnation's prior version"
+    );
+}
+
+#[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn apply_schema_renames_node_type_via_rename_from_and_preserves_rows() {
     // Covers the stable-type-id contract: renaming a type preserves the
     // underlying Lance dataset (by stable id), so existing rows survive the
@@ -453,19 +1381,40 @@ async fn apply_schema_renames_node_type_via_rename_from_and_preserves_rows() {
     // "supported" half of the destructive-vs-supported boundary that the
     // rejections above cover.
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let uri = dir.path().to_str().unwrap();
+    let initial = TEST_SCHEMA.replace("    age: I32?", "    age: I32?\n    avatar: Blob?");
+    let data = TEST_DATA.replace(
+        r#"{"name": "Alice", "age": 30}"#,
+        r#"{"name": "Alice", "age": 30, "avatar": "base64:QXZhdGFy"}"#,
+    );
+    let db = Omnigraph::init(uri, &initial).await.unwrap();
+    load_jsonl(&db, &data, LoadMode::Overwrite).await.unwrap();
+    let before_snapshot_id = db.resolve_snapshot("main").await.unwrap();
+    let before = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .entry("node:Person")
+        .unwrap()
+        .clone();
+    let before_type_id = db.catalog().type_id("Person").unwrap();
+    let before_incarnation = db.catalog().table_incarnation_id("Person").unwrap();
+    let before_name_property_id = db.catalog().property_id("Person", "name").unwrap();
+    let before_avatar_property_id = db.catalog().property_id("Person", "avatar").unwrap();
     let people_before = count_rows(&db, "node:Person").await;
     assert!(
         people_before > 0,
         "fixture should seed Person rows for this test to be meaningful"
     );
 
-    // Rename Person -> Human (and the keying property name -> full_name).
+    // Rename Person -> Human, the keying property name -> full_name, and the
+    // Blob property avatar -> portrait.
     // Edges that referenced Person must update to Human in the same migration.
     let desired = r#"
 node Human @rename_from("Person") {
     full_name: String @key @rename_from("name")
     age: I32?
+    portrait: Blob? @rename_from("avatar")
 }
 
 node Company {
@@ -512,15 +1461,200 @@ edge WorksAt: Human -> Company
 
     // Rows survive: table key now resolves under the new type name and the
     // old key is gone.
+    let after_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let after = after_snapshot.entry("node:Human").unwrap();
+    assert_eq!(after.table_path, before.table_path);
+    assert!(
+        after.table_version > before.table_version,
+        "property rename must rewrite the same table rather than rematerialize it"
+    );
+    assert_eq!(db.catalog().type_id("Human"), Some(before_type_id));
+    assert_eq!(
+        db.catalog().table_incarnation_id("Human"),
+        Some(before_incarnation)
+    );
+    assert_eq!(
+        db.catalog().property_id("Human", "full_name"),
+        Some(before_name_property_id)
+    );
+    assert_eq!(
+        db.catalog().property_id("Human", "portrait"),
+        Some(before_avatar_property_id)
+    );
     assert_eq!(count_rows(&db, "node:Human").await, people_before);
+    assert!(
+        after_snapshot.entry("node:Person").is_none(),
+        "old node:Person table key should be unmapped after rename"
+    );
+
+    let current_portrait = read_managed_blob_bytes(
+        &db,
+        ReadTarget::branch("main"),
+        node_blob_cell("Human", "Alice", "portrait"),
+    )
+    .await;
+    assert_eq!(&current_portrait[..], b"Avatar");
+
+    let historical_error = db
+        .read_blob_at(
+            ReadTarget::snapshot(before_snapshot_id),
+            node_blob_cell("Human", "Alice", "portrait"),
+        )
+        .await
+        .expect_err("the current property alias must not guess across a v6 historical rewrite");
+    assert!(
+        matches!(
+            historical_error,
+            OmniError::Manifest(ref error)
+                if error.kind == ManifestErrorKind::BadRequest
+                    && error.message
+                        == "Blob property 'Human.portrait' is unavailable at the selected target"
+        ),
+        "the current type alias must bind the pre-rename table, then the unavailable current property alias must be BadRequest; got {historical_error:?}"
+    );
+    for retired_cell in [
+        node_blob_cell("Person", "Alice", "avatar"),
+        node_blob_cell("Human", "Alice", "avatar"),
+    ] {
+        let error = db
+            .read_blob_at(ReadTarget::branch("main"), retired_cell)
+            .await
+            .expect_err("retired type/property aliases must not remain addressable");
+        assert!(matches!(
+            error,
+            OmniError::Manifest(ref manifest)
+                if manifest.kind == ManifestErrorKind::BadRequest
+        ));
+    }
+}
+
+#[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
+async fn composite_key_identity_survives_lexically_crossing_property_renames() {
+    let initial = r#"
+node Pair {
+    alpha: String
+    zeta: String
+    label: String
+    @key(alpha, zeta)
+}
+"#;
+    let desired = r#"
+node Pair {
+    aaaa: String @rename_from("zeta")
+    zzzz: String @rename_from("alpha")
+    label: String
+    @key(aaaa, zzzz)
+}
+"#;
+    let mutation = r#"
+query put_pair($aaaa: String, $zzzz: String, $label: String) {
+    insert Pair { aaaa: $aaaa, zzzz: $zzzz, label: $label }
+}
+"#;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = Omnigraph::init(dir.path().to_str().unwrap(), initial)
+        .await
+        .unwrap();
+    load_jsonl(
+        &db,
+        r#"{"type":"Pair","data":{"alpha":"A","zeta":"Z","label":"before"}}"#,
+        LoadMode::Append,
+    )
+    .await
+    .unwrap();
+    let canonical_id = r#"["A","Z"]"#;
+    assert_eq!(
+        collect_column_strings(&read_table(&db, "node:Pair").await, "id"),
+        [canonical_id]
+    );
+    let alpha_id = db.catalog().property_id("Pair", "alpha").unwrap();
+    let zeta_id = db.catalog().property_id("Pair", "zeta").unwrap();
+
+    let applied = db.apply_schema(desired).await.unwrap();
+    assert!(applied.supported && applied.applied);
+    assert_eq!(
+        db.catalog().node_types["Pair"].key.as_deref(),
+        Some(&["zzzz".to_string(), "aaaa".to_string()][..]),
+        "runtime key order follows stable property identity across lexical crossing"
+    );
+    assert_eq!(db.catalog().property_id("Pair", "zzzz"), Some(alpha_id));
+    assert_eq!(db.catalog().property_id("Pair", "aaaa"), Some(zeta_id));
+    assert_eq!(
+        collect_column_strings(&read_table(&db, "node:Pair").await, "id"),
+        [canonical_id],
+        "schema rewrite must retain the existing physical identity"
+    );
+
+    db.mutate(
+        "main",
+        mutation,
+        "put_pair",
+        &params(&[("$aaaa", "Z"), ("$zzzz", "A"), ("$label", "after")]),
+    )
+    .await
+    .unwrap();
+
+    let rows = read_table(&db, "node:Pair").await;
+    assert_eq!(count_rows(&db, "node:Pair").await, 1);
+    assert_eq!(collect_column_strings(&rows, "id"), [canonical_id]);
+    assert_eq!(collect_column_strings(&rows, "label"), ["after"]);
+    assert_exact_id_primary_key(&db, "node:Pair").await;
+}
+
+#[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
+async fn apply_schema_drop_then_same_name_readd_mints_new_identity_and_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(
+        uri,
+        r#"
+node Person { name: String @key }
+node Anchor { name: String @key }
+"#,
+    )
+    .await
+    .unwrap();
+    let before = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .entry("node:Person")
+        .unwrap()
+        .clone();
+    let before_type_id = db.catalog().type_id("Person").unwrap();
+    let before_incarnation = db.catalog().table_incarnation_id("Person").unwrap();
+
+    db.apply_schema("node Anchor { name: String @key }")
+        .await
+        .unwrap();
     assert!(
         db.snapshot_of(ReadTarget::branch("main"))
             .await
             .unwrap()
             .entry("node:Person")
-            .is_none(),
-        "old node:Person table key should be unmapped after rename"
+            .is_none()
     );
+
+    db.apply_schema(
+        r#"
+node Person { name: String @key }
+node Anchor { name: String @key }
+"#,
+    )
+    .await
+    .unwrap();
+    let after_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let after = after_snapshot.entry("node:Person").unwrap();
+    assert_ne!(db.catalog().type_id("Person"), Some(before_type_id));
+    assert_ne!(
+        db.catalog().table_incarnation_id("Person"),
+        Some(before_incarnation)
+    );
+    assert_ne!(after.table_path, before.table_path);
+    assert_eq!(after.table_version, 1);
 }
 
 // ─── Hard-mode drops (chassis v1 commit #5 — --allow-data-loss) ──────────────
@@ -535,9 +1669,10 @@ edge WorksAt: Human -> Company
 // persists. Full orphan-dataset deletion is a separate follow-up.
 
 #[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn apply_schema_with_allow_data_loss_promotes_drops_to_hard() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     let desired = TEST_SCHEMA.replace("    age: I32?\n", "");
 
@@ -601,9 +1736,10 @@ async fn apply_schema_with_allow_data_loss_promotes_drops_to_hard() {
 }
 
 #[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn apply_schema_hard_drops_property_makes_prior_version_unreachable() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
     let before_version = db
         .snapshot_of(ReadTarget::branch("main"))
         .await
@@ -653,9 +1789,10 @@ async fn apply_schema_hard_drops_property_makes_prior_version_unreachable() {
 }
 
 #[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn apply_schema_hard_drops_node_and_edge_with_flag_succeeds() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
     let before_version = db
         .snapshot_of(ReadTarget::branch("main"))
         .await
@@ -737,19 +1874,14 @@ edge Knows: Person -> Person {
     // (no manifest entry), which is the user-facing guarantee.
 }
 
-// Regression (bug 3 / dev-graph iss-848): a `Vector @index` on a 0-row table
-// must not abort an otherwise-valid schema apply. A vector (IVF) index trains
-// k-means centroids over the column's vectors, so Lance cannot build it on 0
-// vectors — it errors with "Creating empty vector indices with train=False is
-// not yet implemented". When a *later* migration touches that table (here, an
-// unrelated scalar `@index` on `body`), schema apply reconciles the table's
-// whole index set, which previously tried to materialize the dormant vector
-// index and aborted the entire migration (all-or-nothing). The build is now
-// deferred (pending) when the column is untrainable, instead of failing the
-// migration. The dormant index is materialized by a later `ensure_indices` /
-// `optimize` once the table has rows. Full decoupling — intent recorded at
-// apply, an async reconciler converges physical coverage — is iss-848.
+// Regression (bug 3 / dev-graph iss-848): schema apply records index intent but
+// performs no physical index work. That decoupling is load-bearing for a
+// `Vector @index` on a 0-row table: Lance cannot train IVF centroids on no
+// vectors, yet the logical migration must still succeed. A later
+// `ensure_indices` / `optimize` materializes every buildable declaration once
+// data exists and reports an untrainable vector column as pending meanwhile.
 #[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn apply_schema_defers_vector_index_on_empty_table() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
@@ -764,28 +1896,25 @@ async fn apply_schema_defers_vector_index_on_empty_table() {
         body: String?\n    \
         embedding: Vector(8) @index\n\
         }\n";
-    let mut db = Omnigraph::init(uri, v1).await.unwrap();
+    let db = Omnigraph::init(uri, v1).await.unwrap();
 
-    // Add an *unrelated* scalar @index on `body`. This routes Doc through
-    // schema apply's index reconcile, which must NOT abort on the untrainable
-    // empty vector index.
+    // Add an unrelated scalar @index on `body`. Schema apply must record both
+    // declarations without trying to build either one or train the empty vector.
     let v2 = "node Doc {\n    \
         slug: String @key\n    \
         body: String? @index\n    \
         embedding: Vector(8) @index\n\
         }\n";
-    let result = db.apply_schema(v2).await.expect(
-        "schema apply must succeed: an empty-table vector @index is deferred, not fatal",
-    );
+    let result = db
+        .apply_schema(v2)
+        .await
+        .expect("schema apply must succeed: an empty-table vector @index is deferred, not fatal");
     assert!(result.applied, "the scalar @index change must apply");
 
-    // The deferred vector index is not dropped — once the table has a
-    // trainable vector, `ensure_indices` materializes it without error. (If
-    // the guard wrongly skipped a non-empty column, this would still be
-    // unindexed; if it wrongly tried to build on empty, the apply above would
-    // have failed.)
+    // The deferred declarations are not dropped: after data arrives, the
+    // explicit reconciler materializes every buildable index without error.
     load_jsonl(
-        &mut db,
+        &db,
         r#"{"type":"Doc","data":{"slug":"d1","body":"hello","embedding":[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]}}"#,
         LoadMode::Merge,
     )
@@ -803,13 +1932,14 @@ async fn apply_schema_defers_vector_index_on_empty_table() {
 // optimize. Pre-iss-848 the indexed_tables block built the index inline and
 // bumped the table version.
 #[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn index_only_constraint_apply_touches_no_table_data() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let v1 = "node Doc {\n    slug: String @key\n    n: I64\n}\n";
-    let mut db = Omnigraph::init(uri, v1).await.unwrap();
+    let db = Omnigraph::init(uri, v1).await.unwrap();
     load_jsonl(
-        &mut db,
+        &db,
         r#"{"type":"Doc","data":{"slug":"d1","n":1}}"#,
         LoadMode::Merge,
     )
@@ -823,10 +1953,14 @@ async fn index_only_constraint_apply_touches_no_table_data() {
         .entry("node:Doc")
         .unwrap()
         .table_version;
+    let before_commits = db.list_commits(None).await.unwrap();
 
     // Add an @index on the existing `n` column.
     let v2 = "node Doc {\n    slug: String @key\n    n: I64 @index\n}\n";
-    let result = db.apply_schema(v2).await.expect("index-only apply must succeed");
+    let result = db
+        .apply_schema(v2)
+        .await
+        .expect("index-only apply must succeed");
     assert!(result.applied, "the @index addition must apply");
 
     let after = db
@@ -840,6 +1974,12 @@ async fn index_only_constraint_apply_touches_no_table_data() {
         before, after,
         "adding an @index must not bump the table version (no inline index build)"
     );
+    let after_commits = db.list_commits(None).await.unwrap();
+    assert_eq!(
+        after_commits.len(),
+        before_commits.len() + 1,
+        "metadata-only schema apply must still advance graph_head so it arbitrates concurrent prepared writes"
+    );
 }
 
 // Enum widening (iss-enum-widening-migration): adding variants to an enum is
@@ -847,13 +1987,14 @@ async fn index_only_constraint_apply_touches_no_table_data() {
 // touched, and the widened set is enforced immediately on writes. Narrowing
 // stays OG-MF-106-refused.
 #[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn enum_widening_apply_is_metadata_only_and_accepts_new_variant() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let v1 = "node Ticket {\n    slug: String @key\n    status: enum(todo, doing, done)\n}\n";
-    let mut db = Omnigraph::init(uri, v1).await.unwrap();
+    let db = Omnigraph::init(uri, v1).await.unwrap();
     load_jsonl(
-        &mut db,
+        &db,
         r#"{"type":"Ticket","data":{"slug":"t1","status":"todo"}}"#,
         LoadMode::Merge,
     )
@@ -867,6 +2008,7 @@ async fn enum_widening_apply_is_metadata_only_and_accepts_new_variant() {
         .entry("node:Ticket")
         .unwrap()
         .table_version;
+    let before_commits = db.list_commits(None).await.unwrap();
 
     let v2 =
         "node Ticket {\n    slug: String @key\n    status: enum(todo, doing, done, blocked)\n}\n";
@@ -885,10 +2027,16 @@ async fn enum_widening_apply_is_metadata_only_and_accepts_new_variant() {
         before, after,
         "enum widening must not bump the table version (metadata-only)"
     );
+    let after_commits = db.list_commits(None).await.unwrap();
+    assert_eq!(
+        after_commits.len(),
+        before_commits.len() + 1,
+        "metadata-only enum widening must still advance graph_head"
+    );
 
     // The NEW variant is accepted on the write path...
     load_jsonl(
-        &mut db,
+        &db,
         r#"{"type":"Ticket","data":{"slug":"t2","status":"blocked"}}"#,
         LoadMode::Merge,
     )
@@ -896,7 +2044,7 @@ async fn enum_widening_apply_is_metadata_only_and_accepts_new_variant() {
     .expect("new variant must be accepted after widening");
     // ...an original variant still is...
     load_jsonl(
-        &mut db,
+        &db,
         r#"{"type":"Ticket","data":{"slug":"t3","status":"done"}}"#,
         LoadMode::Merge,
     )
@@ -905,7 +2053,7 @@ async fn enum_widening_apply_is_metadata_only_and_accepts_new_variant() {
     // ...and an out-of-set value is still rejected (the fence didn't widen to
     // free text).
     let err = load_jsonl(
-        &mut db,
+        &db,
         r#"{"type":"Ticket","data":{"slug":"t4","status":"bogus"}}"#,
         LoadMode::Merge,
     )
@@ -914,11 +2062,12 @@ async fn enum_widening_apply_is_metadata_only_and_accepts_new_variant() {
 }
 
 #[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
 async fn enum_narrowing_apply_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let v1 = "node Ticket {\n    slug: String @key\n    status: enum(todo, doing, done)\n}\n";
-    let mut db = Omnigraph::init(uri, v1).await.unwrap();
+    let db = Omnigraph::init(uri, v1).await.unwrap();
 
     let narrowed = "node Ticket {\n    slug: String @key\n    status: enum(todo, done)\n}\n";
     let err = db.apply_schema(narrowed).await;
@@ -931,7 +2080,7 @@ async fn enum_narrowing_apply_is_refused() {
 
     // The graph stays healthy and writable on the original schema.
     load_jsonl(
-        &mut db,
+        &db,
         r#"{"type":"Ticket","data":{"slug":"t1","status":"doing"}}"#,
         LoadMode::Merge,
     )

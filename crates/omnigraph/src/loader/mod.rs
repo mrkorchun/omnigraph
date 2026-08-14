@@ -1,11 +1,11 @@
 use std::collections::HashMap;
-
+use std::fmt;
 use std::io::{BufRead, BufReader, Cursor};
 use std::sync::Arc;
 
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array,
-    Int32Array, Int64Array, RecordBatch, StringArray, UInt32Array, UInt64Array,
+    Int32Array, Int64Array, ListArray, RecordBatch, StringArray, UInt32Array, UInt64Array,
     builder::{
         ArrayBuilder, BooleanBuilder, Date32Builder, Date64Builder, FixedSizeListBuilder,
         Float32Builder, Float64Builder, Int32Builder, Int64Builder, ListBuilder, StringBuilder,
@@ -15,13 +15,16 @@ use arrow_array::{
 use arrow_schema::DataType;
 use base64::Engine;
 use lance::blob::BlobArrayBuilder;
-use omnigraph_compiler::catalog::NodeType;
-use serde::{Deserialize, Serialize};
+use omnigraph_compiler::catalog::{Catalog, EdgeType, NodeType};
+use omnigraph_compiler::types::PropType;
+use serde::de::{MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value as JsonValue;
 
 use crate::db::Omnigraph;
 use crate::error::{OmniError, Result};
 use crate::exec::staging::{MutationStaging, PendingMode};
+use crate::storage_layer::KEYED_WRITE_MAX_BYTES;
 
 /// Result of a load operation.
 #[derive(Debug, Clone, Default)]
@@ -36,6 +39,12 @@ pub struct LoadResult {
     pub branch_created: bool,
     pub nodes_loaded: HashMap<String, usize>,
     pub edges_loaded: HashMap<String, usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LoadReceipt {
+    pub result: LoadResult,
+    pub commit: crate::db::GraphCommit,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,6 +74,12 @@ pub enum LoadMode {
     Merge,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoadInputShape {
+    LoaderCompatible,
+    StrictGraphBatch,
+}
+
 /// Convenience: load JSONL data onto the database handle's *active branch*
 /// (`main` when unbound). Equivalent to `db.load(active_branch, data, mode)`;
 /// use `Omnigraph::load`/`load_as` directly when targeting an explicit branch
@@ -83,6 +98,23 @@ pub async fn load_jsonl_file(db: &Omnigraph, path: &str, mode: LoadMode) -> Resu
 }
 
 impl Omnigraph {
+    fn normalize_load_scope(
+        branch: &str,
+        base: Option<&str>,
+    ) -> Result<(Option<String>, Option<String>)> {
+        crate::db::ensure_public_branch_ref(branch, "load")?;
+        // Branch convention: `None` represents `main`. A requested base keeps
+        // the explicit "main" spelling because it is also returned in the DTO.
+        let requested = Self::normalize_branch_name(branch)?;
+        let base_branch = match base {
+            Some(base) => {
+                Some(Self::normalize_branch_name(base)?.unwrap_or_else(|| "main".to_string()))
+            }
+            None => None,
+        };
+        Ok((requested, base_branch))
+    }
+
     #[deprecated(
         note = "use `load_as` with an explicit `base` instead; the ingest family will be removed in a future release"
     )]
@@ -115,16 +147,7 @@ impl Omnigraph {
         let result = self
             .load_as(branch, Some(from.unwrap_or("main")), data, mode, actor_id)
             .await?;
-        Ok(IngestResult {
-            branch: result.branch.clone(),
-            base_branch: result
-                .base_branch
-                .clone()
-                .unwrap_or_else(|| "main".to_string()),
-            branch_created: result.branch_created,
-            mode,
-            tables: result.to_ingest_tables(),
-        })
+        Ok(result.into_ingest_result(mode))
     }
 
     #[deprecated(
@@ -152,13 +175,24 @@ impl Omnigraph {
         mode: LoadMode,
         actor_id: Option<&str>,
     ) -> Result<IngestResult> {
-        let data = std::fs::read_to_string(path).map_err(OmniError::Io)?;
-        #[allow(deprecated)]
-        self.ingest_as(branch, from, &data, mode, actor_id).await
+        let result = self
+            .load_file_as(branch, Some(from.unwrap_or("main")), path, mode, actor_id)
+            .await?;
+        Ok(result.into_ingest_result(mode))
     }
 
     pub async fn load(&self, branch: &str, data: &str, mode: LoadMode) -> Result<LoadResult> {
         self.load_as(branch, None, data, mode, None).await
+    }
+
+    pub async fn load_with_receipt(
+        &self,
+        branch: &str,
+        data: &str,
+        mode: LoadMode,
+    ) -> Result<LoadReceipt> {
+        self.load_as_with_receipt(branch, None, data, mode, None)
+            .await
     }
 
     /// Load JSONL data onto `branch`.
@@ -176,6 +210,94 @@ impl Omnigraph {
         mode: LoadMode,
         actor_id: Option<&str>,
     ) -> Result<LoadResult> {
+        Ok(self
+            .load_as_with_receipt(branch, base, data, mode, actor_id)
+            .await?
+            .result)
+    }
+
+    pub async fn load_as_with_receipt(
+        &self,
+        branch: &str,
+        base: Option<&str>,
+        data: &str,
+        mode: LoadMode,
+        actor_id: Option<&str>,
+    ) -> Result<LoadReceipt> {
+        self.load_input_as(
+            branch,
+            base,
+            data,
+            mode,
+            actor_id,
+            LoadInputShape::LoaderCompatible,
+        )
+        .await
+    }
+
+    /// Load a strict graph-shaped NDJSON batch onto `branch`.
+    ///
+    /// Each nonblank line must be exactly one node or edge envelope. Unlike
+    /// [`Self::load_as`], this boundary rejects duplicate JSON members,
+    /// unknown or physical fields, noncanonical supplied ids, and compatibility
+    /// coercions. Omitted ids retain ordinary loader semantics: node `@key`
+    /// values derive canonical ids and other rows receive generated ids. The
+    /// operation otherwise uses the same transaction, validation, recovery,
+    /// and graph-level publication path as the ordinary loader.
+    pub async fn load_graph_batch_as(
+        &self,
+        branch: &str,
+        base: Option<&str>,
+        data: &str,
+        mode: LoadMode,
+        actor_id: Option<&str>,
+    ) -> Result<LoadResult> {
+        Ok(self
+            .load_graph_batch_as_with_receipt(branch, base, data, mode, actor_id)
+            .await?
+            .result)
+    }
+
+    pub async fn load_graph_batch_as_with_receipt(
+        &self,
+        branch: &str,
+        base: Option<&str>,
+        data: &str,
+        mode: LoadMode,
+        actor_id: Option<&str>,
+    ) -> Result<LoadReceipt> {
+        self.load_input_as(
+            branch,
+            base,
+            data,
+            mode,
+            actor_id,
+            LoadInputShape::StrictGraphBatch,
+        )
+        .await
+    }
+
+    /// Convenience wrapper around [`Self::load_graph_batch_as`] without an
+    /// actor or implicit branch creation.
+    pub async fn load_graph_batch(
+        &self,
+        branch: &str,
+        data: &str,
+        mode: LoadMode,
+    ) -> Result<LoadResult> {
+        self.load_graph_batch_as(branch, None, data, mode, None)
+            .await
+    }
+
+    async fn load_input_as(
+        &self,
+        branch: &str,
+        base: Option<&str>,
+        data: &str,
+        mode: LoadMode,
+        actor_id: Option<&str>,
+        input_shape: LoadInputShape,
+    ) -> Result<LoadReceipt> {
         // Engine-layer policy gate (MR-722 fan-out / PR #3). Scope is
         // `Branch(branch)` to match the HTTP-layer Change convention.
         // When a fork happens below, `branch_create_from_as` additionally
@@ -187,34 +309,35 @@ impl Omnigraph {
             &omnigraph_policy::ResourceScope::Branch(branch.to_string()),
             actor_id,
         )?;
-        // Schema-contract validation is captured ONCE per write via the
-        // `WriteTxn` opened in `load_jsonl_reader` (after branch resolution).
-        // The redundant `ensure_schema_state_valid` that used to run here is
-        // subsumed by `open_write_txn`'s `resolved_branch_target` call.
-        // Converge any pending recovery sidecar (a previously failed
-        // writer's Phase B → Phase C residual) before staging anything:
-        // without this, sidecar-covered drift wedges every load on the
-        // commit-time drift guard until a process restart — `repair`
-        // refuses while a sidecar is pending. One `list_dir` when no
-        // sidecars exist (the steady state).
-        self.heal_pending_recovery_sidecars().await?;
-        // Reject internal `__run__*` / system-prefixed branches at the
-        // public write boundary. Direct-publish paths assert this
-        // explicitly so a caller can't write to legacy or system
-        // staging branches by passing the prefix verbatim.
-        crate::db::ensure_public_branch_ref(branch, "load")?;
-        // Branch convention: `None` represents `main`. Re-normalizing to
-        // `Some("main")` here would route the publisher commit through a
-        // separate coordinator (the cross-branch path in
-        // `commit_prepared_updates_on_branch_with_expected`) and leave
-        // `self.coordinator` with a stale manifest snapshot.
-        let requested = Self::normalize_branch_name(branch)?;
-        let base_branch = match base {
-            Some(base) => {
-                Some(Self::normalize_branch_name(base)?.unwrap_or_else(|| "main".to_string()))
-            }
-            None => None,
-        };
+        let (requested, base_branch) = Self::normalize_load_scope(branch, base)?;
+        self.load_as_inner(requested, base_branch, data, mode, actor_id, input_shape)
+            .await
+    }
+
+    async fn load_as_inner(
+        &self,
+        requested: Option<String>,
+        base_branch: Option<String>,
+        data: &str,
+        mode: LoadMode,
+        actor_id: Option<&str>,
+        input_shape: LoadInputShape,
+    ) -> Result<LoadReceipt> {
+        // Stage A precedes both an implicit target-branch fork and data staging.
+        // The target branch and an explicit base are read/write authority for the
+        // operation, so an unresolved intent on either closes the barrier. The
+        // helper folds `Some("main")` to main's canonical `None` identity.
+        let mut recovery_branches = vec![requested.as_deref()];
+        if base_branch.is_some() {
+            recovery_branches.push(base_branch.as_deref());
+        }
+        self.heal_pending_recovery_sidecars_for_write(&recovery_branches)
+            .await?;
+
+        // Schema/catalog authority is captured once via the `WriteTxn` (plus its
+        // cheap trailing identity-marker fence); the only second full validation
+        // is the required pre-effect recheck under gates. Per-table resolution
+        // performs no additional contract reads.
         // Fork-if-missing only when a base branch was explicitly given.
         // `requested == None` is `main`, which always exists.
         let mut branch_created = false;
@@ -238,23 +361,23 @@ impl Omnigraph {
         }
         // Direct-to-target writes: no Run state machine, no `__run__` staging
         // branch. Cross-table OCC is enforced by the publisher's
-        // `expected_table_versions` CAS inside `load_jsonl_reader`.
-        let mut result = self
-            .load_direct_on_branch(requested.as_deref(), data, mode, actor_id)
+        // `expected_table_versions` CAS inside the load attempt.
+        let mut receipt = self
+            .load_direct_on_branch(requested.as_deref(), data, mode, actor_id, input_shape)
             .await?;
-        result.branch = requested.unwrap_or_else(|| "main".to_string());
-        result.base_branch = base_branch;
-        result.branch_created = branch_created;
-        Ok(result)
+        receipt.result.branch = requested.unwrap_or_else(|| "main".to_string());
+        receipt.result.base_branch = base_branch;
+        receipt.result.branch_created = branch_created;
+        Ok(receipt)
     }
 
     pub async fn load_file(&self, branch: &str, path: &str, mode: LoadMode) -> Result<LoadResult> {
         self.load_file_as(branch, None, path, mode, None).await
     }
 
-    /// Read a file into memory and delegate to `load_as`. Used by the
-    /// CLI's `omnigraph load` so file-path-based writes flow through
-    /// the same engine-layer policy gate as in-memory `load_as` calls.
+    /// Read a file into memory and delegate to `load_as`. Used by the CLI's
+    /// `omnigraph load` so file-path-based writes flow through the same
+    /// engine-layer policy gate as in-memory `load_as` calls.
     pub async fn load_file_as(
         &self,
         branch: &str,
@@ -267,15 +390,28 @@ impl Omnigraph {
         self.load_as(branch, base, &data, mode, actor_id).await
     }
 
+    pub async fn load_file_as_with_receipt(
+        &self,
+        branch: &str,
+        base: Option<&str>,
+        path: &str,
+        mode: LoadMode,
+        actor_id: Option<&str>,
+    ) -> Result<LoadReceipt> {
+        let data = std::fs::read_to_string(path).map_err(OmniError::Io)?;
+        self.load_as_with_receipt(branch, base, &data, mode, actor_id)
+            .await
+    }
+
     async fn load_direct_on_branch(
         &self,
         branch: Option<&str>,
         data: &str,
         mode: LoadMode,
         actor_id: Option<&str>,
-    ) -> Result<LoadResult> {
-        let reader = BufReader::new(Cursor::new(data.as_bytes()));
-        load_jsonl_reader(self, branch, reader, mode, actor_id).await
+        input_shape: LoadInputShape,
+    ) -> Result<LoadReceipt> {
+        load_jsonl_data(self, branch, data, mode, actor_id, input_shape).await
     }
 }
 
@@ -290,6 +426,17 @@ impl LoadMode {
 }
 
 impl LoadResult {
+    fn into_ingest_result(self, mode: LoadMode) -> IngestResult {
+        let tables = self.to_ingest_tables();
+        IngestResult {
+            branch: self.branch,
+            base_branch: self.base_branch.unwrap_or_else(|| "main".to_string()),
+            branch_created: self.branch_created,
+            mode,
+            tables,
+        }
+    }
+
     pub fn to_ingest_tables(&self) -> Vec<IngestTableResult> {
         let mut tables = self
             .nodes_loaded
@@ -312,82 +459,166 @@ impl LoadResult {
     }
 }
 
-async fn load_jsonl_reader<R: BufRead>(
+async fn load_jsonl_data(
+    db: &Omnigraph,
+    branch: Option<&str>,
+    data: &str,
+    mode: LoadMode,
+    actor_id: Option<&str>,
+    input_shape: LoadInputShape,
+) -> Result<LoadReceipt> {
+    const MAX_PRE_EFFECT_REPREPARES: usize = 32;
+
+    // Every public load entry point already owns a stable `&str` payload
+    // (`load_file_as` reads its file once). Replay that slice directly on a
+    // pre-effect retry; copying it into a second raw byte buffer would double
+    // peak input memory before the parser's per-type materialization.
+    let retryable = matches!(mode, LoadMode::Append | LoadMode::Merge);
+    for attempt in 0..=MAX_PRE_EFFECT_REPREPARES {
+        let replay = BufReader::new(Cursor::new(data.as_bytes()));
+        match load_jsonl_reader_once(db, branch, replay, mode, actor_id, input_shape).await {
+            Err(err)
+                if retryable
+                    && err.is_read_set_changed()
+                    && attempt < MAX_PRE_EFFECT_REPREPARES =>
+            {
+                tracing::debug!(
+                    attempt = attempt + 1,
+                    branch = branch.unwrap_or("main"),
+                    "prepared load authority changed before effects; repreparing"
+                );
+                db.refresh().await?;
+            }
+            result => return result,
+        }
+    }
+    unreachable!("bounded load retry loop always returns")
+}
+
+async fn load_jsonl_reader_once<R: BufRead>(
     db: &Omnigraph,
     branch: Option<&str>,
     reader: R,
     mode: LoadMode,
     actor_id: Option<&str>,
-) -> Result<LoadResult> {
-    let catalog = db.catalog().clone();
+    input_shape: LoadInputShape,
+) -> Result<LoadReceipt> {
+    // Capture the manifest/schema authority before interpreting any input. The
+    // catalog rides the WriteTxn and was built from the exact accepted IR named
+    // by its schema token; a long-lived handle's global catalog may legitimately
+    // lag a schema apply completed through another handle.
+    let txn = db.open_write_txn(branch).await?;
+    let catalog = Arc::clone(&txn.catalog);
+    let snapshot = txn.base.clone();
 
     // Phase 1: Parse all lines, spool into per-type collections
     let mut node_rows: HashMap<String, Vec<JsonValue>> = HashMap::new();
     let mut edge_rows: HashMap<String, Vec<(String, String, JsonValue)>> = HashMap::new();
+    let mut strict_rows = StrictGraphRows::default();
+    let mut keyed_input_budget: HashMap<String, (usize, u64)> = HashMap::new();
+    // Strict syntax is independent of the keyed-write transaction ceiling.
+    // Append/Merge route through the bounded keyed adapter; Overwrite stages a
+    // Lance replacement transaction and must retain the bulk-replacement
+    // contract. Strict normalization still preflights its Arrow allocation.
+    let bounded_keyed_input = matches!(mode, LoadMode::Append | LoadMode::Merge);
 
-    // Parse a stream of JSON values. Accepts both compact JSONL (one object
-    // per line) and pretty-printed JSON where a single object spans multiple
-    // lines — serde's streaming deserializer treats any whitespace (including
-    // newlines) between top-level values as a separator.
-    for (idx, parsed) in serde_json::Deserializer::from_reader(reader)
-        .into_iter::<JsonValue>()
-        .enumerate()
-    {
-        let record_num = idx + 1;
-        let value: JsonValue = parsed.map_err(|e| {
-            OmniError::manifest(format!("invalid JSON at record {}: {}", record_num, e))
-        })?;
+    if input_shape == LoadInputShape::StrictGraphBatch {
+        strict_rows = parse_strict_graph_rows(
+            reader,
+            &catalog,
+            bounded_keyed_input,
+            &mut keyed_input_budget,
+        )?;
+    } else {
+        // Parse a stream of JSON values. Accepts both compact JSONL (one object
+        // per line) and pretty-printed JSON where a single object spans multiple
+        // lines — serde's streaming deserializer treats any whitespace (including
+        // newlines) between top-level values as a separator.
+        for (idx, parsed) in serde_json::Deserializer::from_reader(reader)
+            .into_iter::<JsonValue>()
+            .enumerate()
+        {
+            let record_num = idx + 1;
+            let mut value: JsonValue = parsed.map_err(|e| {
+                OmniError::manifest(format!("invalid JSON at record {}: {}", record_num, e))
+            })?;
 
-        if let Some(type_name) = value.get("type").and_then(|v| v.as_str()) {
-            if !catalog.node_types.contains_key(type_name) {
+            if let Some(type_name) = value
+                .get("type")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+            {
+                if !catalog.node_types.contains_key(&type_name) {
+                    return Err(OmniError::manifest(format!(
+                        "record {}: unknown node type '{}'",
+                        record_num, type_name
+                    )));
+                }
+                let data = value
+                    .get_mut("data")
+                    .map(JsonValue::take)
+                    .unwrap_or(JsonValue::Object(serde_json::Map::new()));
+                if bounded_keyed_input {
+                    account_keyed_json_row(
+                        &format!("node:{type_name}"),
+                        &data,
+                        0,
+                        &mut keyed_input_budget,
+                    )?;
+                }
+                node_rows.entry(type_name).or_default().push(data);
+            } else if let Some(edge_name) = value
+                .get("edge")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+            {
+                if catalog.lookup_edge_by_name(&edge_name).is_none() {
+                    return Err(OmniError::manifest(format!(
+                        "record {}: unknown edge type '{}'",
+                        record_num, edge_name
+                    )));
+                }
+                let from = value
+                    .get("from")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        OmniError::manifest(format!("record {}: edge missing 'from'", record_num))
+                    })?
+                    .to_string();
+                let to = value
+                    .get("to")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        OmniError::manifest(format!("record {}: edge missing 'to'", record_num))
+                    })?
+                    .to_string();
+                let data = value
+                    .get_mut("data")
+                    .map(JsonValue::take)
+                    .unwrap_or(JsonValue::Object(serde_json::Map::new()));
+                let canonical = catalog
+                    .lookup_edge_by_name(&edge_name)
+                    .unwrap()
+                    .name
+                    .clone();
+                if bounded_keyed_input {
+                    account_keyed_json_row(
+                        &format!("edge:{canonical}"),
+                        &data,
+                        from.len().saturating_add(to.len()),
+                        &mut keyed_input_budget,
+                    )?;
+                }
+                edge_rows
+                    .entry(canonical)
+                    .or_default()
+                    .push((from, to, data));
+            } else {
                 return Err(OmniError::manifest(format!(
-                    "record {}: unknown node type '{}'",
-                    record_num, type_name
+                    "record {}: expected 'type' or 'edge' field",
+                    record_num
                 )));
             }
-            let data = value
-                .get("data")
-                .cloned()
-                .unwrap_or(JsonValue::Object(serde_json::Map::new()));
-            node_rows
-                .entry(type_name.to_string())
-                .or_default()
-                .push(data);
-        } else if let Some(edge_name) = value.get("edge").and_then(|v| v.as_str()) {
-            if catalog.lookup_edge_by_name(edge_name).is_none() {
-                return Err(OmniError::manifest(format!(
-                    "record {}: unknown edge type '{}'",
-                    record_num, edge_name
-                )));
-            }
-            let from = value
-                .get("from")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    OmniError::manifest(format!("record {}: edge missing 'from'", record_num))
-                })?
-                .to_string();
-            let to = value
-                .get("to")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    OmniError::manifest(format!("record {}: edge missing 'to'", record_num))
-                })?
-                .to_string();
-            let data = value
-                .get("data")
-                .cloned()
-                .unwrap_or(JsonValue::Object(serde_json::Map::new()));
-            let canonical = catalog.lookup_edge_by_name(edge_name).unwrap().name.clone();
-            edge_rows
-                .entry(canonical)
-                .or_default()
-                .push((from, to, data));
-        } else {
-            return Err(OmniError::manifest(format!(
-                "record {}: expected 'type' or 'edge' field",
-                record_num
-            )));
         }
     }
 
@@ -400,94 +631,64 @@ async fn load_jsonl_reader<R: BufRead>(
     // inline path.
 
     let mut result = LoadResult::default();
-    // Capture-once write transaction (RFC-013 step 3b). `open_write_txn`
-    // validates the schema contract ONCE and pins the base snapshot. Threaded
-    // as `Some(&txn)` through the per-table opens and the manifest publish so
-    // each resolve point reuses the pinned base instead of re-validating the
-    // contract. The branch already exists here (fork-if-missing ran in
-    // `load_as` before this), so this captures the post-fork snapshot. The
-    // load's own base read (`db.snapshot_for_branch` previously) is the same
-    // per-branch snapshot, so reuse `txn.base` for it — dropping a validation.
-    let txn = db.open_write_txn(branch).await?;
-    let snapshot = txn.base.clone();
+    // The branch-wide WriteTxn captured above is threaded through every table
+    // open and the manifest publish, so the parsed batches, validation catalog,
+    // base snapshot, native branch identity, exact graph head, and schema
+    // identity form one immutable authority unit.
     let mut staging = MutationStaging::default();
     let pending_mode = match mode {
-        LoadMode::Merge => PendingMode::Merge,
-        // Append-mode loads accumulate as Append. Edge tables (no @key)
-        // and no-key node tables stay safe on the stage_append path. The
-        // Merge mode applies dedupe-by-id; Append assumes unique inputs.
-        LoadMode::Append => PendingMode::Append,
+        LoadMode::Merge => PendingMode::Upsert,
+        // Append mode is a strict exact-id insert. Every physical graph table
+        // has `id` as its Lance PK in format v6, including edges and node types
+        // without a user-declared @key; no keyed table has an Append side door.
+        // Merge mode applies last-write-wins source dedupe before fenced upsert.
+        LoadMode::Append => PendingMode::StrictInsert,
         LoadMode::Overwrite => PendingMode::Overwrite,
     };
-    // Map LoadMode to MutationOpKind for the version-check policy.
-    // Append/Merge skip the strict pre-stage check (concurrency-safe
-    // under the per-(table, branch) queue + publisher CAS); Overwrite
-    // uses the strict check because it truncates and replaces the
-    // dataset — concurrent advances change what "replace" means.
+    // Map LoadMode to the early table-version policy. Append/Merge may stage
+    // reclaimable files before the effect gates, then revalidate the complete
+    // branch token and fully reprepare on a bounded pre-effect conflict.
+    // Overwrite keeps the strict early check because it replaces the image; its
+    // later branch-wide mismatch surfaces `ReadSetChanged` without replay.
     let load_op_kind = match mode {
         LoadMode::Append => crate::db::MutationOpKind::Insert,
         LoadMode::Merge => crate::db::MutationOpKind::Merge,
         LoadMode::Overwrite => crate::db::MutationOpKind::SchemaRewrite,
     };
-
-    // Up-front fork-queue acquisition. The first write to a table on a
-    // non-main branch forks it (create_branch), which advances Lance state
-    // before the manifest publish; the reclaim of any manifest-unreferenced
-    // leftover (`reclaim_orphaned_fork_and_refork`) must not race a concurrent
-    // in-process fork. So when this load will fork at least one touched table,
-    // acquire the per-(table, branch) write queues for ALL touched tables up
-    // front (one sorted `acquire_many`, keyed uniformly by the target branch
-    // so it covers what `commit_all` recomputes) and hold them through the
-    // publish. Main-branch loads never fork; branch loads where every touched
-    // table is already forked skip this and let `commit_all` acquire at commit.
-    let fork_queue_guards: Option<(
-        Vec<(String, Option<String>)>,
-        Vec<tokio::sync::OwnedMutexGuard<()>>,
-    )> = if let Some(active) = branch {
-        let touched: Vec<(String, Option<String>)> = node_rows
-            .keys()
-            .map(|t| (format!("node:{t}"), Some(active.to_string())))
-            .chain(
-                edge_rows
-                    .keys()
-                    .map(|e| (format!("edge:{e}"), Some(active.to_string()))),
-            )
-            .collect();
-        let needs_fork = touched.iter().any(|(table_key, _)| {
-            snapshot
-                .entry(table_key)
-                .map(|e| e.table_branch.as_deref() != Some(active))
-                .unwrap_or(false)
-        });
-        if needs_fork {
-            let guards = db.write_queue().acquire_many(&touched).await;
-            Some((touched, guards))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    let StrictGraphRows {
+        nodes: strict_nodes,
+        edges: strict_edges,
+    } = strict_rows;
 
     // Phase 2a: build and validate every node batch up front. Cheap and
     // synchronous — surfaces validation errors before any S3 traffic.
-    let mut prepared_nodes: Vec<(String, String, RecordBatch, usize)> =
-        Vec::with_capacity(node_rows.len());
+    let mut node_id_remap = TypedNodeIdRemap::default();
+    let mut prepared_nodes: Vec<(String, String, Vec<RecordBatch>, usize)> =
+        Vec::with_capacity(node_rows.len().saturating_add(strict_nodes.len()));
     for (type_name, rows) in &node_rows {
         let node_type = &catalog.node_types[type_name];
-        let batch = build_node_batch(node_type, rows)?;
+        let batch = build_node_batch(node_type, rows, &mut node_id_remap)?;
         // Validation (value/enum/unique) runs end-of-load via the evaluator.
         let loaded_count = batch.num_rows();
         let table_key = format!("node:{}", type_name);
         let _entry = snapshot
             .entry(&table_key)
             .ok_or_else(|| OmniError::manifest(format!("no manifest entry for {}", table_key)))?;
-        prepared_nodes.push((type_name.clone(), table_key, batch, loaded_count));
+        prepared_nodes.push((type_name.clone(), table_key, vec![batch], loaded_count));
+    }
+    for (type_name, rows) in strict_nodes {
+        let table_key = format!("node:{type_name}");
+        let _entry = snapshot
+            .entry(&table_key)
+            .ok_or_else(|| OmniError::manifest(format!("no manifest entry for {table_key}")))?;
+        let batch = normalize_strict_json_rows(&catalog, &table_key, &rows)?;
+        let loaded_count = batch.num_rows();
+        prepared_nodes.push((type_name, table_key, vec![batch], loaded_count));
     }
 
     // Phase 2b: accumulate every node type in memory. Fragment writes are
     // delayed until after all validation succeeds.
-    for (type_name, table_key, batch, loaded_count) in prepared_nodes {
+    for (type_name, table_key, batches, loaded_count) in prepared_nodes {
         // The loader only needs the captured expected version (the publisher's
         // CAS fence) for `ensure_path` — it discards the handle. With a
         // non-strict load op (Merge/Append) and a `WriteTxn`, collapse #1 skips
@@ -497,34 +698,47 @@ async fn load_jsonl_reader<R: BufRead>(
             .await?;
         staging.ensure_path(
             &table_key,
+            opened.identity,
             opened.full_path,
             opened.table_branch,
+            opened.deferred_fork,
             opened.expected_version,
             load_op_kind,
-        );
-        let schema = batch.schema();
-        staging.append_batch(&table_key, schema, pending_mode, batch)?;
+        )?;
+        for batch in batches {
+            let schema = batch.schema();
+            staging.append_batch(&table_key, schema, pending_mode, batch)?;
+        }
         result.nodes_loaded.insert(type_name, loaded_count);
     }
 
     // Phase 2d: build edge batches. Edge referential integrity (and the rest)
     // runs end-of-load via the unified evaluator, below.
-    let mut prepared_edges: Vec<(String, String, RecordBatch, usize)> =
-        Vec::with_capacity(edge_rows.len());
+    let mut prepared_edges: Vec<(String, String, Vec<RecordBatch>, usize)> =
+        Vec::with_capacity(edge_rows.len().saturating_add(strict_edges.len()));
     for (edge_name, rows) in &edge_rows {
         let edge_type = &catalog.edge_types[edge_name];
-        let batch = build_edge_batch(edge_type, rows)?;
+        let batch = build_edge_batch(edge_type, rows, &node_id_remap)?;
         // Validation (enum/unique, edge-RI, @card) runs end-of-load via the evaluator.
         let loaded_count = batch.num_rows();
         let table_key = format!("edge:{}", edge_name);
         let _entry = snapshot
             .entry(&table_key)
             .ok_or_else(|| OmniError::manifest(format!("no manifest entry for {}", table_key)))?;
-        prepared_edges.push((edge_name.clone(), table_key, batch, loaded_count));
+        prepared_edges.push((edge_name.clone(), table_key, vec![batch], loaded_count));
+    }
+    for (edge_name, rows) in strict_edges {
+        let table_key = format!("edge:{edge_name}");
+        let _entry = snapshot
+            .entry(&table_key)
+            .ok_or_else(|| OmniError::manifest(format!("no manifest entry for {table_key}")))?;
+        let batch = normalize_strict_json_rows(&catalog, &table_key, &rows)?;
+        let loaded_count = batch.num_rows();
+        prepared_edges.push((edge_name, table_key, vec![batch], loaded_count));
     }
 
     // Phase 2e: accumulate every edge type. Same dispatch as Phase 2b.
-    for (edge_name, table_key, batch, loaded_count) in prepared_edges {
+    for (edge_name, table_key, batches, loaded_count) in prepared_edges {
         // Same as the node phase: only the captured expected version is used;
         // collapse #1 skips the open for a non-strict load op under a `WriteTxn`.
         let opened = db
@@ -532,13 +746,17 @@ async fn load_jsonl_reader<R: BufRead>(
             .await?;
         staging.ensure_path(
             &table_key,
+            opened.identity,
             opened.full_path,
             opened.table_branch,
+            opened.deferred_fork,
             opened.expected_version,
             load_op_kind,
-        );
-        let schema = batch.schema();
-        staging.append_batch(&table_key, schema, pending_mode, batch)?;
+        )?;
+        for batch in batches {
+            let schema = batch.schema();
+            staging.append_batch(&table_key, schema, pending_mode, batch)?;
+        }
         result.edges_loaded.insert(edge_name, loaded_count);
     }
 
@@ -581,43 +799,63 @@ async fn load_jsonl_reader<R: BufRead>(
     let staged = staging
         .stage_all_with_concurrency(db, branch, load_write_concurrency())
         .await?;
-    // `_queue_guards` holds per-(table_key, branch) write queues
-    // across the manifest publish below — see exec/mutation.rs for
-    // the rationale (interleaving prevention).
+    crate::failpoints::maybe_fail(crate::failpoints::names::MUTATION_POST_STAGE_PRE_EFFECT_GATE)?;
+    let lineage_intent = db.new_lineage_intent_for_branch(branch, actor_id).await?;
+    // `_queue_guards` holds the root-shared schema → branch → sorted-table
+    // gates across manifest publication. This closes same-process
+    // interleaving across the v3 sidecar/effect lifetime. The exact publisher
+    // token and durable sidecar remain persistent correctness authorities, but
+    // these local gates do not expand the documented single-writer-process
+    // recovery boundary.
     let crate::exec::staging::CommittedMutation {
         updates,
         expected_versions,
         sidecar_handle,
         guards: _queue_guards,
-        committed_handles,
     } = staged
         .commit_all(
             db,
             branch,
             crate::db::manifest::SidecarKind::Load,
             actor_id,
-            fork_queue_guards,
-            Some(&txn),
+            &txn,
+            &lineage_intent,
         )
         .await?;
-    // Same finalize → publisher residual as mutations: per-table
-    // staged commits have advanced Lance HEAD, but the manifest
-    // publish has not run yet. Reuse the mutation failpoint name so
-    // one failpoint pins the shared `MutationStaging` boundary.
+    // Same confirmed-effects → publisher boundary as mutations: table HEADs
+    // have advanced and the v3 sidecar contains their exact transaction
+    // identities, but the graph manifest has not published the result. Reuse
+    // the mutation failpoint name so one failpoint pins the shared boundary.
     crate::failpoints::maybe_fail(crate::failpoints::names::MUTATION_POST_FINALIZE_PRE_PUBLISHER)?;
-    db.commit_updates_on_branch_with_expected(
-        branch,
-        &updates,
-        &expected_versions,
-        actor_id,
-        Some(&txn),
-        committed_handles,
-    )
-    .await?;
-    // The recovery sidecar protects the per-table commit_staged →
-    // manifest publish window. Phase C succeeded — clean up
-    // best-effort: failing the user here would error out a write
-    // that already landed durably.
+    let publish_result = db
+        .commit_updates_on_branch_with_expected(
+            branch,
+            &updates,
+            &expected_versions,
+            actor_id,
+            &txn,
+            lineage_intent,
+        )
+        .await;
+    let commit = match publish_result {
+        Ok(commit) => commit,
+        Err(err) => {
+            // Empty loads can still publish lineage but have no table effect and
+            // therefore no recovery sidecar. Preserve that publish error instead
+            // of manufacturing an "unknown" recovery operation.
+            return match sidecar_handle.as_ref() {
+                Some(handle) => Err(OmniError::recovery_required(
+                    handle.operation_id.clone(),
+                    err.to_string(),
+                )),
+                None => Err(err),
+            };
+        }
+    };
+    // The v3 recovery sidecar protects every independently durable table effect
+    // through the one manifest visibility point. Phase C succeeded — clean up
+    // best-effort: failing the user here would error out a write that already
+    // landed durably; a leftover fixed outcome is idempotently finalized later.
     if let Some(handle) = sidecar_handle {
         if let Err(err) = crate::db::manifest::delete_sidecar(&handle, db.storage_adapter()).await {
             tracing::warn!(
@@ -628,39 +866,617 @@ async fn load_jsonl_reader<R: BufRead>(
         }
     }
 
-    Ok(result)
+    Ok(LoadReceipt { result, commit })
 }
 
-fn build_node_batch(node_type: &NodeType, rows: &[JsonValue]) -> Result<RecordBatch> {
-    let schema = node_type.arrow_schema.clone();
+#[derive(Default)]
+struct StrictGraphRows {
+    nodes: HashMap<String, Vec<JsonValue>>,
+    edges: HashMap<String, Vec<JsonValue>>,
+}
 
-    // Build id column: explicit id, @key value, or generated ULID.
-    let ids: Vec<String> = rows
-        .iter()
-        .map(|row| {
-            let explicit_id = row.get("id").and_then(|v| v.as_str()).map(str::to_string);
-            if let Some(key_prop) = node_type.key_property() {
-                let key_value = row
-                    .get(key_prop)
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .ok_or_else(|| {
-                        OmniError::manifest(format!(
-                            "node {} missing @key property '{}'",
-                            node_type.name, key_prop
-                        ))
-                    })?;
-                if let Some(explicit_id) = explicit_id {
-                    if explicit_id != key_value {
+const GRAPH_BATCH_MAX_LINE_BYTES: usize = KEYED_WRITE_MAX_BYTES as usize;
+const GRAPH_BATCH_JSON_DOM_STRUCTURE_BYTES: u64 = 64 * 1024 * 1024;
+const GRAPH_BATCH_JSON_BYTES_PER_STRUCTURAL_SLOT: u64 = 512;
+const GRAPH_BATCH_JSON_MAX_STRUCTURAL_SLOTS: u64 =
+    GRAPH_BATCH_JSON_DOM_STRUCTURE_BYTES / GRAPH_BATCH_JSON_BYTES_PER_STRUCTURAL_SLOT;
+
+#[derive(Debug, PartialEq, Eq)]
+enum BoundedGraphBatchLine {
+    Line(Vec<u8>),
+    InputTooLarge { limit: usize, actual: usize },
+}
+
+/// Read one NDJSON line without ever retaining more than `max_line_bytes`
+/// (plus one possible CRLF delimiter byte). Once oversized, the retained
+/// prefix is released and the tail is consumed through the next newline so a
+/// caller that chooses to continue can frame the following line correctly.
+fn read_bounded_graph_batch_line<R: BufRead>(
+    reader: &mut R,
+    max_line_bytes: usize,
+) -> Result<Option<BoundedGraphBatchLine>> {
+    let mut line = Vec::new();
+    let mut current_line_bytes = 0_usize;
+    let mut last_byte_was_cr = false;
+    let mut discarding = false;
+
+    loop {
+        let available = reader.fill_buf().map_err(OmniError::Io)?;
+        if available.is_empty() {
+            if current_line_bytes == 0 {
+                return Ok(None);
+            }
+            if discarding || current_line_bytes > max_line_bytes {
+                return Ok(Some(BoundedGraphBatchLine::InputTooLarge {
+                    limit: max_line_bytes,
+                    actual: current_line_bytes,
+                }));
+            }
+            return Ok(Some(BoundedGraphBatchLine::Line(line)));
+        }
+
+        let mut consumed = 0_usize;
+        let mut delimited = false;
+        for &byte in available {
+            consumed = consumed.saturating_add(1);
+            if byte == b'\n' {
+                delimited = true;
+                break;
+            }
+
+            current_line_bytes = current_line_bytes.saturating_add(1);
+            last_byte_was_cr = byte == b'\r';
+            if discarding {
+                continue;
+            }
+            line.push(byte);
+            if line.len() > max_line_bytes {
+                let possible_crlf = line.len() == max_line_bytes + 1 && byte == b'\r';
+                if !possible_crlf {
+                    discarding = true;
+                    line.clear();
+                }
+            }
+        }
+        reader.consume(consumed);
+
+        if delimited {
+            let delimiter_bytes = usize::from(last_byte_was_cr);
+            let actual = current_line_bytes.saturating_sub(delimiter_bytes);
+            if discarding || actual > max_line_bytes {
+                return Ok(Some(BoundedGraphBatchLine::InputTooLarge {
+                    limit: max_line_bytes,
+                    actual,
+                }));
+            }
+            if last_byte_was_cr {
+                let removed = line.pop();
+                debug_assert_eq!(removed, Some(b'\r'));
+            }
+            return Ok(Some(BoundedGraphBatchLine::Line(line)));
+        }
+    }
+}
+
+fn validate_graph_batch_json_structure(raw_json: &[u8]) -> Result<()> {
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut slots = 1_u64;
+    for &byte in raw_json {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        if byte == b'"' {
+            in_string = true;
+            continue;
+        }
+        if matches!(byte, b'{' | b'}' | b'[' | b']' | b',' | b':') {
+            slots = slots.saturating_add(1);
+            if slots > GRAPH_BATCH_JSON_MAX_STRUCTURAL_SLOTS {
+                return Err(OmniError::resource_limit(
+                    "graph_batch_json_structural_slots",
+                    GRAPH_BATCH_JSON_MAX_STRUCTURAL_SLOTS,
+                    slots,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// JSON value decoded with duplicate-member rejection at every object depth.
+/// `serde_json::Value` normally keeps the last duplicate, which is unsuitable
+/// at a write authority boundary because two producers can disagree about the
+/// field that owns an id or edge endpoint.
+struct UniqueJsonValue(JsonValue);
+
+impl<'de> Deserialize<'de> for UniqueJsonValue {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer
+            .deserialize_any(UniqueJsonVisitor)
+            .map(UniqueJsonValue)
+    }
+}
+
+struct UniqueJsonVisitor;
+
+impl<'de> Visitor<'de> for UniqueJsonVisitor {
+    type Value = JsonValue;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON value without duplicate object members")
+    }
+
+    fn visit_unit<E>(self) -> std::result::Result<Self::Value, E> {
+        Ok(JsonValue::Null)
+    }
+
+    fn visit_none<E>(self) -> std::result::Result<Self::Value, E> {
+        Ok(JsonValue::Null)
+    }
+
+    fn visit_bool<E>(self, value: bool) -> std::result::Result<Self::Value, E> {
+        Ok(JsonValue::Bool(value))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> std::result::Result<Self::Value, E> {
+        Ok(JsonValue::Number(value.into()))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> std::result::Result<Self::Value, E> {
+        Ok(JsonValue::Number(value.into()))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> std::result::Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        serde_json::Number::from_f64(value)
+            .map(JsonValue::Number)
+            .ok_or_else(|| E::custom("non-finite JSON number"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E> {
+        Ok(JsonValue::String(value.to_string()))
+    }
+
+    fn visit_string<E>(self, value: String) -> std::result::Result<Self::Value, E> {
+        Ok(JsonValue::String(value))
+    }
+
+    fn visit_seq<A>(self, mut values: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut out = Vec::new();
+        while let Some(UniqueJsonValue(value)) = values.next_element::<UniqueJsonValue>()? {
+            out.push(value);
+        }
+        Ok(JsonValue::Array(out))
+    }
+
+    fn visit_map<A>(self, mut values: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut out = serde_json::Map::new();
+        while let Some(key) = values.next_key::<String>()? {
+            if out.contains_key(&key) {
+                return Err(serde::de::Error::custom(format!(
+                    "duplicate JSON member '{key}'"
+                )));
+            }
+            let UniqueJsonValue(value) = values.next_value::<UniqueJsonValue>()?;
+            out.insert(key, value);
+        }
+        Ok(JsonValue::Object(out))
+    }
+}
+
+fn parse_strict_graph_rows<R: BufRead>(
+    mut reader: R,
+    catalog: &Catalog,
+    bounded_keyed_input: bool,
+    keyed_input_budget: &mut HashMap<String, (usize, u64)>,
+) -> Result<StrictGraphRows> {
+    let mut rows = StrictGraphRows::default();
+    let mut line_number = 0_usize;
+
+    while let Some(frame) = read_bounded_graph_batch_line(&mut reader, GRAPH_BATCH_MAX_LINE_BYTES)?
+    {
+        line_number = line_number.saturating_add(1);
+        let line = match frame {
+            BoundedGraphBatchLine::Line(line) => line,
+            BoundedGraphBatchLine::InputTooLarge { limit, actual } => {
+                return Err(OmniError::resource_limit(
+                    "graph_batch_line_bytes",
+                    u64::try_from(limit).unwrap_or(u64::MAX),
+                    u64::try_from(actual).unwrap_or(u64::MAX),
+                ));
+            }
+        };
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        validate_graph_batch_json_structure(&line)?;
+        let UniqueJsonValue(value) =
+            serde_json::from_slice::<UniqueJsonValue>(&line).map_err(|e| {
+                OmniError::manifest(format!("invalid strict JSON at line {line_number}: {e}"))
+            })?;
+        let mut envelope = match value {
+            JsonValue::Object(envelope) => envelope,
+            _ => {
+                return Err(OmniError::manifest(format!(
+                    "line {line_number}: graph batch row must be one JSON object"
+                )));
+            }
+        };
+
+        match (envelope.contains_key("type"), envelope.contains_key("edge")) {
+            (true, false) => {
+                validate_strict_envelope_fields(line_number, &envelope, &["type", "data"])?;
+                let type_name = take_required_string(&mut envelope, "type", line_number)?;
+                let data = take_object_or_empty(&mut envelope, "data", line_number)?;
+                if !catalog.node_types.contains_key(&type_name) {
+                    return Err(OmniError::manifest(format!(
+                        "line {line_number}: unknown node type '{type_name}'"
+                    )));
+                }
+                let table_key = format!("node:{type_name}");
+                let row = JsonValue::Object(data);
+                if bounded_keyed_input {
+                    account_keyed_json_row(&table_key, &row, 0, keyed_input_budget)?;
+                }
+                rows.nodes.entry(type_name).or_default().push(row);
+            }
+            (false, true) => {
+                validate_strict_envelope_fields(
+                    line_number,
+                    &envelope,
+                    &["edge", "from", "to", "data"],
+                )?;
+                let edge_name = take_required_string(&mut envelope, "edge", line_number)?;
+                let from = take_required_string(&mut envelope, "from", line_number)?;
+                let to = take_required_string(&mut envelope, "to", line_number)?;
+                let mut data = take_object_or_empty(&mut envelope, "data", line_number)?;
+                for reserved in ["src", "dst"] {
+                    if data.contains_key(reserved) {
                         return Err(OmniError::manifest(format!(
-                            "node {} has explicit id '{}' that does not match @key property '{}' value '{}'",
-                            node_type.name, explicit_id, key_prop, key_value
+                            "line {line_number}: edge data field '{reserved}' is reserved structural state"
                         )));
                     }
                 }
+                let edge_type = catalog.lookup_edge_by_name(&edge_name).ok_or_else(|| {
+                    OmniError::manifest(format!(
+                        "line {line_number}: unknown edge type '{edge_name}'"
+                    ))
+                })?;
+                let canonical = edge_type.name.clone();
+                let table_key = format!("edge:{canonical}");
+                if bounded_keyed_input {
+                    account_keyed_json_row(
+                        &table_key,
+                        &JsonValue::Object(data.clone()),
+                        from.len().saturating_add(to.len()),
+                        keyed_input_budget,
+                    )?;
+                }
+                data.insert("src".to_string(), JsonValue::String(from));
+                data.insert("dst".to_string(), JsonValue::String(to));
+                rows.edges
+                    .entry(canonical)
+                    .or_default()
+                    .push(JsonValue::Object(data));
+            }
+            _ => {
+                return Err(OmniError::manifest(format!(
+                    "line {line_number}: graph batch row must contain exactly one of 'type' or 'edge'"
+                )));
+            }
+        }
+    }
+
+    Ok(rows)
+}
+
+fn validate_strict_envelope_fields(
+    line_number: usize,
+    envelope: &serde_json::Map<String, JsonValue>,
+    allowed: &[&str],
+) -> Result<()> {
+    for field in envelope.keys() {
+        if is_reserved_physical_input_field(field) {
+            return Err(OmniError::manifest(format!(
+                "line {line_number}: top-level field '{field}' is reserved physical state"
+            )));
+        }
+        if !allowed.contains(&field.as_str()) {
+            return Err(OmniError::manifest(format!(
+                "line {line_number}: unknown top-level graph batch field '{field}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn take_required_string(
+    envelope: &mut serde_json::Map<String, JsonValue>,
+    field: &str,
+    line_number: usize,
+) -> Result<String> {
+    match envelope.remove(field) {
+        Some(JsonValue::String(value)) => Ok(value),
+        Some(value) => Err(OmniError::manifest(format!(
+            "line {line_number}: graph batch field '{field}' must be a string, got {value}"
+        ))),
+        None => Err(OmniError::manifest(format!(
+            "line {line_number}: graph batch row requires field '{field}'"
+        ))),
+    }
+}
+
+fn take_object_or_empty(
+    envelope: &mut serde_json::Map<String, JsonValue>,
+    field: &str,
+    line_number: usize,
+) -> Result<serde_json::Map<String, JsonValue>> {
+    match envelope.remove(field) {
+        Some(JsonValue::Object(value)) => Ok(value),
+        Some(value) => Err(OmniError::manifest(format!(
+            "line {line_number}: graph batch field '{field}' must be an object, got {value}"
+        ))),
+        None => Ok(serde_json::Map::new()),
+    }
+}
+
+/// Account a keyed JSON record before retaining it in the per-table parse
+/// spool. This is a conservative lower bound on the Arrow payload (string and
+/// decoded blob bytes, scalar widths, and list offsets); the exact accumulated
+/// Arrow check in `MutationStaging::append_batch` remains the final authority.
+/// The early counter prevents an unbounded JSON spool and catches base64 by its
+/// decoded size before the decoder allocates a second copy.
+fn account_keyed_json_row(
+    table_key: &str,
+    data: &JsonValue,
+    structural_string_bytes: usize,
+    budgets: &mut HashMap<String, (usize, u64)>,
+) -> Result<()> {
+    let entry = budgets.entry(table_key.to_string()).or_insert((0, 0));
+    entry.0 = entry
+        .0
+        .checked_add(1)
+        .ok_or_else(|| OmniError::manifest_internal("keyed parsed row count overflow"))?;
+    if entry.0 > crate::storage_layer::KEYED_WRITE_MAX_ROWS {
+        return Err(OmniError::resource_limit(
+            format!("keyed rows for {table_key}"),
+            crate::storage_layer::KEYED_WRITE_MAX_ROWS as u64,
+            entry.0 as u64,
+        ));
+    }
+    let row_bytes = estimate_json_arrow_bytes(data)?
+        .checked_add(
+            u64::try_from(structural_string_bytes)
+                .map_err(|_| OmniError::manifest_internal("keyed string bytes exceed u64"))?,
+        )
+        .ok_or_else(|| OmniError::manifest_internal("keyed parsed row bytes overflow"))?;
+    entry.1 = entry
+        .1
+        .checked_add(row_bytes)
+        .ok_or_else(|| OmniError::manifest_internal("keyed parsed byte count overflow"))?;
+    if entry.1 > KEYED_WRITE_MAX_BYTES {
+        return Err(OmniError::resource_limit(
+            format!("keyed parsed value bytes for {table_key}"),
+            KEYED_WRITE_MAX_BYTES,
+            entry.1,
+        ));
+    }
+    Ok(())
+}
+
+fn estimate_json_arrow_bytes(value: &JsonValue) -> Result<u64> {
+    match value {
+        JsonValue::Null => Ok(0),
+        JsonValue::Bool(_) => Ok(1),
+        // Four bytes avoids rejecting valid Float32/Int32 input early. Wider
+        // physical scalars are charged exactly by the later Arrow batch check.
+        JsonValue::Number(_) => Ok(4),
+        JsonValue::String(value) => {
+            let bytes = match value.strip_prefix("base64:") {
+                Some(encoded) => base64::decoded_len_estimate(encoded.len()).saturating_sub(
+                    encoded
+                        .as_bytes()
+                        .iter()
+                        .rev()
+                        .take_while(|&&byte| byte == b'=')
+                        .count(),
+                ),
+                None => value.len(),
+            };
+            u64::try_from(bytes)
+                .map_err(|_| OmniError::manifest_internal("JSON string bytes exceed u64"))
+        }
+        JsonValue::Array(values) => {
+            let offsets = u64::try_from(values.len())
+                .map_err(|_| OmniError::manifest_internal("JSON array length exceeds u64"))?
+                .checked_add(1)
+                .and_then(|count| count.checked_mul(4))
+                .ok_or_else(|| OmniError::manifest_internal("JSON array offset bytes overflow"))?;
+            values.iter().try_fold(offsets, |bytes, value| {
+                bytes
+                    .checked_add(estimate_json_arrow_bytes(value)?)
+                    .ok_or_else(|| OmniError::manifest_internal("JSON array bytes overflow"))
+            })
+        }
+        // Property names are schema, not per-row Arrow payload. Count values
+        // only so the early lower bound does not reject an otherwise-valid
+        // wide schema; exact field buffers are charged after batch building.
+        JsonValue::Object(values) => values.values().try_fold(0_u64, |bytes, value| {
+            bytes
+                .checked_add(estimate_json_arrow_bytes(value)?)
+                .ok_or_else(|| OmniError::manifest_internal("JSON object bytes overflow"))
+        }),
+    }
+}
+
+/// Legacy exports may carry a physical node id whose spelling predates the
+/// current typed canonical renderer. Edges in the same import still name that
+/// old id, so rebuilding canonical node ids also requires an endpoint rewrite.
+/// Endpoint identity is type-scoped: two concrete node types may legitimately
+/// reuse the same old id string and map it differently.
+#[derive(Default)]
+struct TypedNodeIdRemap {
+    by_node_type: HashMap<String, HashMap<String, String>>,
+}
+
+impl TypedNodeIdRemap {
+    fn record(&mut self, node_type: &str, old_id: &str, canonical_id: &str) -> Result<()> {
+        let by_old_id = self.by_node_type.entry(node_type.to_string()).or_default();
+        if let Some(existing) = by_old_id.get(old_id) {
+            if existing != canonical_id {
+                return Err(OmniError::manifest(format!(
+                    "node {node_type} explicit id '{old_id}' maps to both canonical @key ids \
+                     '{existing}' and '{canonical_id}'; refusing ambiguous edge endpoint remap"
+                )));
+            }
+            return Ok(());
+        }
+        by_old_id.insert(old_id.to_string(), canonical_id.to_string());
+        Ok(())
+    }
+
+    fn endpoint<'a>(&'a self, node_type: &str, old_id: &str) -> Option<&'a str> {
+        self.by_node_type
+            .get(node_type)
+            .and_then(|by_old_id| by_old_id.get(old_id))
+            .map(String::as_str)
+    }
+}
+
+fn build_node_batch(
+    node_type: &NodeType,
+    rows: &[JsonValue],
+    node_id_remap: &mut TypedNodeIdRemap,
+) -> Result<RecordBatch> {
+    let schema = node_type.arrow_schema.clone();
+    let row_refs = rows.iter().collect::<Vec<_>>();
+    preflight_blob_decode_budget(
+        &format!("node:{}", node_type.name),
+        node_type.blob_properties.iter().map(String::as_str),
+        &row_refs,
+    )?;
+
+    // Materialize the typed property columns before deriving physical ids. A
+    // scalar @key's identity is the canonical rendering of the value that will
+    // actually be stored (including width conversion for F32/I32 and the full
+    // U64 range), not an independent rendering of its input JSON token.
+    let mut property_columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len() - 1);
+    for field in schema.fields().iter().skip(1) {
+        if node_type.blob_properties.contains(field.name()) {
+            let col = build_blob_column(field.name(), field.is_nullable(), rows)?;
+            property_columns.push(col);
+        } else {
+            let col = build_column_from_json(
+                field.name(),
+                field.data_type(),
+                field.is_nullable(),
+                rows,
+                JsonConversionMode::LoaderCompat,
+            )?;
+            property_columns.push(col);
+        }
+    }
+
+    let key_columns = node_type
+        .key
+        .as_ref()
+        .map(|key_properties| {
+            key_properties
+                .iter()
+                .map(|key_prop| {
+                    let schema_index = schema.index_of(key_prop).map_err(|_| {
+                        OmniError::manifest_internal(format!(
+                            "@key property '{}' is missing from node {} Arrow schema",
+                            key_prop, node_type.name
+                        ))
+                    })?;
+                    let property_index = schema_index.checked_sub(1).ok_or_else(|| {
+                        OmniError::manifest_internal(format!(
+                            "@key property '{}' aliases reserved physical id",
+                            key_prop
+                        ))
+                    })?;
+                    property_columns
+                        .get(property_index)
+                        .cloned()
+                        .ok_or_else(|| {
+                            OmniError::manifest_internal(format!(
+                                "@key property '{}' has invalid schema position {}",
+                                key_prop, schema_index
+                            ))
+                        })
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?;
+
+    // Build id column: exact explicit id, canonical typed @key value, or a
+    // generated ULID. Export always emits the physical id as a JSON string;
+    // when present, a non-string explicit id is malformed instead of being
+    // silently ignored and replaced.
+    let ids: Vec<String> = rows
+        .iter()
+        .enumerate()
+        .map(|(row_index, row)| {
+            let explicit_id = match row.get("id") {
+                None => None,
+                Some(JsonValue::String(id)) => Some(id.as_str()),
+                Some(value) => {
+                    return Err(OmniError::manifest(format!(
+                        "node {} explicit id must be a string, got {}",
+                        node_type.name, value
+                    )));
+                }
+            };
+            if let (Some(key_properties), Some(key_columns)) =
+                (node_type.key.as_ref(), key_columns.as_ref())
+            {
+                let key_description = match key_properties.as_slice() {
+                    [key] => format!("@key property '{key}'"),
+                    _ => format!("@key properties ({})", key_properties.join(", ")),
+                };
+                let key_value = canonical_node_id(key_columns, row_index)?.ok_or_else(|| {
+                    OmniError::manifest(format!(
+                        "node {} missing {key_description}",
+                        node_type.name
+                    ))
+                })?;
+                if let Some(explicit_id) = explicit_id {
+                    if !explicit_id_matches_node_key(
+                        key_columns,
+                        row_index,
+                        explicit_id,
+                        &key_value,
+                    )? {
+                        return Err(OmniError::manifest(format!(
+                            "node {} has explicit id '{}' that does not match {key_description} canonical value '{}'",
+                            node_type.name, explicit_id, key_value
+                        )));
+                    }
+                    node_id_remap.record(&node_type.name, explicit_id, &key_value)?;
+                }
                 Ok(key_value)
             } else if let Some(explicit_id) = explicit_id {
-                Ok(explicit_id)
+                Ok(explicit_id.to_string())
             } else {
                 Ok(generate_id())
             }
@@ -669,18 +1485,7 @@ fn build_node_batch(node_type: &NodeType, rows: &[JsonValue]) -> Result<RecordBa
 
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
     columns.push(Arc::new(StringArray::from(ids)));
-
-    // Build property columns (skip "id" field at index 0)
-    for field in schema.fields().iter().skip(1) {
-        if node_type.blob_properties.contains(field.name()) {
-            let col = build_blob_column(field.name(), field.is_nullable(), rows)?;
-            columns.push(col);
-        } else {
-            let col =
-                build_column_from_json(field.name(), field.data_type(), field.is_nullable(), rows)?;
-            columns.push(col);
-        }
-    }
+    columns.extend(property_columns);
 
     RecordBatch::try_new(schema, columns).map_err(|e| OmniError::Lance(e.to_string()))
 }
@@ -688,8 +1493,15 @@ fn build_node_batch(node_type: &NodeType, rows: &[JsonValue]) -> Result<RecordBa
 fn build_edge_batch(
     edge_type: &omnigraph_compiler::catalog::EdgeType,
     rows: &[(String, String, JsonValue)],
+    node_id_remap: &TypedNodeIdRemap,
 ) -> Result<RecordBatch> {
     let schema = edge_type.arrow_schema.clone();
+    let row_refs = rows.iter().map(|(_, _, data)| data).collect::<Vec<_>>();
+    preflight_blob_decode_budget(
+        &format!("edge:{}", edge_type.name),
+        edge_type.blob_properties.iter().map(String::as_str),
+        &row_refs,
+    )?;
 
     let ids: Vec<String> = rows
         .iter()
@@ -700,8 +1512,24 @@ fn build_edge_batch(
                 .unwrap_or_else(generate_id)
         })
         .collect();
-    let srcs: Vec<&str> = rows.iter().map(|(from, _, _)| from.as_str()).collect();
-    let dsts: Vec<&str> = rows.iter().map(|(_, to, _)| to.as_str()).collect();
+    let srcs: Vec<String> = rows
+        .iter()
+        .map(|(from, _, _)| {
+            node_id_remap
+                .endpoint(&edge_type.from_type, from)
+                .unwrap_or(from)
+                .to_string()
+        })
+        .collect();
+    let dsts: Vec<String> = rows
+        .iter()
+        .map(|(_, to, _)| {
+            node_id_remap
+                .endpoint(&edge_type.to_type, to)
+                .unwrap_or(to)
+                .to_string()
+        })
+        .collect();
 
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
     columns.push(Arc::new(StringArray::from(ids)));
@@ -720,6 +1548,7 @@ fn build_edge_batch(
                 field.data_type(),
                 field.is_nullable(),
                 &data_values,
+                JsonConversionMode::LoaderCompat,
             )?;
             columns.push(col);
         }
@@ -728,9 +1557,466 @@ fn build_edge_batch(
     RecordBatch::try_new(schema, columns).map_err(|e| OmniError::Lance(e.to_string()))
 }
 
+/// Normalize a bounded group of caller-shaped rows into one dense logical
+/// Arrow batch. This keeps strict validation at the graph facade without
+/// paying one RecordBatch allocation per NDJSON line.
+pub(crate) fn normalize_strict_json_rows(
+    catalog: &Catalog,
+    table_key: &str,
+    rows: &[JsonValue],
+) -> Result<RecordBatch> {
+    if rows.is_empty() {
+        return Err(OmniError::manifest_internal(
+            "strict row normalization requires at least one row",
+        ));
+    }
+    if let Some(type_name) = table_key.strip_prefix("node:") {
+        let node_type = catalog
+            .node_types
+            .get(type_name)
+            .ok_or_else(|| OmniError::manifest(format!("unknown node type '{type_name}'")))?;
+        normalize_strict_node_rows(node_type, rows)
+    } else if let Some(type_name) = table_key.strip_prefix("edge:") {
+        let edge_type = catalog
+            .edge_types
+            .get(type_name)
+            .ok_or_else(|| OmniError::manifest(format!("unknown edge type '{type_name}'")))?;
+        normalize_strict_edge_rows(edge_type, rows)
+    } else {
+        Err(OmniError::manifest(format!(
+            "invalid table key '{table_key}'"
+        )))
+    }
+}
+
+fn normalize_strict_node_rows(node_type: &NodeType, rows: &[JsonValue]) -> Result<RecordBatch> {
+    let objects = strict_row_objects(rows)?;
+    let table_key = format!("node:{}", node_type.name);
+    for object in &objects {
+        validate_strict_input_fields(&table_key, object, &node_type.properties, &[])?;
+        validate_optional_row_id(&node_type.name, object)?;
+    }
+
+    let schema = Arc::clone(&node_type.arrow_schema);
+    preflight_strict_rows_arrow_bytes(
+        &schema,
+        &objects,
+        &node_type.blob_properties,
+        KEYED_WRITE_MAX_BYTES,
+    )?;
+    preflight_blob_decode_budget(
+        &table_key,
+        node_type.blob_properties.iter().map(String::as_str),
+        &rows.iter().collect::<Vec<_>>(),
+    )?;
+
+    let mut property_columns = Vec::with_capacity(schema.fields().len().saturating_sub(1));
+    for field in schema.fields().iter().skip(1) {
+        let column = if node_type.blob_properties.contains(field.name()) {
+            build_blob_column(field.name(), field.is_nullable(), rows)?
+        } else {
+            build_column_from_json(
+                field.name(),
+                field.data_type(),
+                field.is_nullable(),
+                rows,
+                JsonConversionMode::Strict,
+            )?
+        };
+        property_columns.push(column);
+    }
+
+    let key_columns = node_type
+        .key
+        .as_ref()
+        .map(|properties| {
+            properties
+                .iter()
+                .map(|property| {
+                    let schema_index = schema.index_of(property).map_err(|_| {
+                        OmniError::manifest_internal(format!(
+                            "@key property '{property}' is missing from node {} strict schema",
+                            node_type.name
+                        ))
+                    })?;
+                    property_columns
+                        .get(schema_index.saturating_sub(1))
+                        .cloned()
+                        .ok_or_else(|| {
+                            OmniError::manifest_internal(format!(
+                                "@key property '{property}' has an invalid strict schema position"
+                            ))
+                        })
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?;
+
+    let ids = objects
+        .iter()
+        .enumerate()
+        .map(|(row_index, object)| {
+            let explicit_id = optional_row_id(&node_type.name, object)?;
+            if let Some(key_columns) = &key_columns {
+                let canonical = canonical_node_id(key_columns, row_index)?.ok_or_else(|| {
+                    OmniError::manifest(format!(
+                        "node {} is missing a non-null @key value",
+                        node_type.name
+                    ))
+                })?;
+                if let Some(explicit_id) = explicit_id
+                    && explicit_id != canonical
+                {
+                    return Err(OmniError::manifest(format!(
+                        "node {} explicit id '{}' does not match its canonical @key id '{}'",
+                        node_type.name, explicit_id, canonical
+                    )));
+                }
+                Ok(canonical)
+            } else {
+                Ok(explicit_id.map(str::to_string).unwrap_or_else(generate_id))
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut columns = Vec::with_capacity(schema.fields().len());
+    columns.push(Arc::new(StringArray::from(ids)) as ArrayRef);
+    columns.extend(property_columns);
+    RecordBatch::try_new(schema, columns).map_err(|error| OmniError::Lance(error.to_string()))
+}
+
+fn normalize_strict_edge_rows(edge_type: &EdgeType, rows: &[JsonValue]) -> Result<RecordBatch> {
+    let objects = strict_row_objects(rows)?;
+    let table_key = format!("edge:{}", edge_type.name);
+    for object in &objects {
+        validate_strict_input_fields(&table_key, object, &edge_type.properties, &["src", "dst"])?;
+        validate_optional_row_id(&edge_type.name, object)?;
+        validate_required_row_string(&edge_type.name, "src", object)?;
+        validate_required_row_string(&edge_type.name, "dst", object)?;
+    }
+
+    let schema = Arc::clone(&edge_type.arrow_schema);
+    preflight_strict_rows_arrow_bytes(
+        &schema,
+        &objects,
+        &edge_type.blob_properties,
+        KEYED_WRITE_MAX_BYTES,
+    )?;
+    preflight_blob_decode_budget(
+        &table_key,
+        edge_type.blob_properties.iter().map(String::as_str),
+        &rows.iter().collect::<Vec<_>>(),
+    )?;
+
+    let ids = objects
+        .iter()
+        .map(|object| {
+            optional_row_id(&edge_type.name, object)
+                .map(|id| id.map(str::to_string).unwrap_or_else(generate_id))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let srcs = objects
+        .iter()
+        .map(|object| validate_required_row_string(&edge_type.name, "src", object))
+        .collect::<Result<Vec<_>>>()?;
+    let dsts = objects
+        .iter()
+        .map(|object| validate_required_row_string(&edge_type.name, "dst", object))
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut columns = Vec::with_capacity(schema.fields().len());
+    columns.push(Arc::new(StringArray::from(ids)) as ArrayRef);
+    columns.push(Arc::new(StringArray::from(srcs)) as ArrayRef);
+    columns.push(Arc::new(StringArray::from(dsts)) as ArrayRef);
+    for field in schema.fields().iter().skip(3) {
+        let column = if edge_type.blob_properties.contains(field.name()) {
+            build_blob_column(field.name(), field.is_nullable(), rows)?
+        } else {
+            build_column_from_json(
+                field.name(),
+                field.data_type(),
+                field.is_nullable(),
+                rows,
+                JsonConversionMode::Strict,
+            )?
+        };
+        columns.push(column);
+    }
+    RecordBatch::try_new(schema, columns).map_err(|error| OmniError::Lance(error.to_string()))
+}
+
+fn strict_row_objects(rows: &[JsonValue]) -> Result<Vec<&serde_json::Map<String, JsonValue>>> {
+    rows.iter()
+        .map(|row| {
+            row.as_object()
+                .ok_or_else(|| OmniError::manifest("strict input must be one JSON object"))
+        })
+        .collect()
+}
+
+fn validate_strict_input_fields(
+    table_key: &str,
+    object: &serde_json::Map<String, JsonValue>,
+    properties: &HashMap<String, PropType>,
+    structural_fields: &[&str],
+) -> Result<()> {
+    for field in object.keys() {
+        if is_reserved_physical_input_field(field) {
+            return Err(OmniError::manifest(format!(
+                "input field '{field}' is reserved physical state"
+            )));
+        }
+        if field == "id"
+            || structural_fields.contains(&field.as_str())
+            || properties.contains_key(field)
+        {
+            continue;
+        }
+        return Err(OmniError::manifest(format!(
+            "unknown input field '{field}' for '{table_key}'"
+        )));
+    }
+    Ok(())
+}
+
+fn is_reserved_physical_input_field(field: &str) -> bool {
+    matches!(
+        field,
+        "_tombstone"
+            | "_rowid"
+            | "_rowaddr"
+            | "_rowoffset"
+            | "_row_created_at_version"
+            | "_row_last_updated_at_version"
+    )
+}
+
+fn validate_optional_row_id(
+    type_name: &str,
+    object: &serde_json::Map<String, JsonValue>,
+) -> Result<()> {
+    optional_row_id(type_name, object).map(|_| ())
+}
+
+fn optional_row_id<'a>(
+    type_name: &str,
+    object: &'a serde_json::Map<String, JsonValue>,
+) -> Result<Option<&'a str>> {
+    match object.get("id") {
+        Some(JsonValue::String(value)) => Ok(Some(value)),
+        Some(value) => Err(OmniError::manifest(format!(
+            "strict row for {type_name} field 'id' must be a string, got {value}"
+        ))),
+        None => Ok(None),
+    }
+}
+
+fn validate_required_row_string<'a>(
+    type_name: &str,
+    field: &str,
+    object: &'a serde_json::Map<String, JsonValue>,
+) -> Result<&'a str> {
+    match object.get(field) {
+        Some(JsonValue::String(value)) => Ok(value),
+        Some(JsonValue::Null) => Err(OmniError::manifest(format!(
+            "strict row for {type_name} requires non-null string field '{field}'"
+        ))),
+        Some(value) => Err(OmniError::manifest(format!(
+            "strict row for {type_name} field '{field}' must be a string, got {value}"
+        ))),
+        None => Err(OmniError::manifest(format!(
+            "strict row for {type_name} requires explicit field '{field}'"
+        ))),
+    }
+}
+
+// Single-row test shim over `preflight_strict_row_arrow_bytes_with_limit`,
+// kept next to the strict-row staged-write preflight helpers.
+#[cfg(test)]
+#[allow(dead_code)]
+fn preflight_strict_row_arrow_bytes(
+    schema: &arrow_schema::Schema,
+    object: &serde_json::Map<String, JsonValue>,
+) -> Result<()> {
+    preflight_strict_row_arrow_bytes_with_limit(schema, object, KEYED_WRITE_MAX_BYTES)
+}
+
+#[cfg(test)]
+fn preflight_strict_row_arrow_bytes_with_limit(
+    schema: &arrow_schema::Schema,
+    object: &serde_json::Map<String, JsonValue>,
+    limit: u64,
+) -> Result<()> {
+    let mut projected = 0_u64;
+    for field in schema.fields() {
+        let value = object.get(field.name()).unwrap_or(&JsonValue::Null);
+        projected =
+            projected.saturating_add(projected_strict_column_bytes(field.data_type(), value)?);
+        if projected > limit {
+            return Err(OmniError::resource_limit(
+                "strict_input_arrow_bytes",
+                limit,
+                projected,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn preflight_strict_rows_arrow_bytes(
+    schema: &arrow_schema::Schema,
+    objects: &[&serde_json::Map<String, JsonValue>],
+    blob_properties: &std::collections::HashSet<String>,
+    limit: u64,
+) -> Result<()> {
+    let mut projected = 0_u64;
+    for object in objects {
+        for field in schema.fields() {
+            let value = object.get(field.name()).unwrap_or(&JsonValue::Null);
+            let field_bytes = if blob_properties.contains(field.name()) {
+                16_u64.saturating_add(estimate_json_arrow_bytes(value)?)
+            } else {
+                projected_strict_column_bytes(field.data_type(), value)?
+            };
+            projected = projected.saturating_add(field_bytes);
+            if projected > limit {
+                return Err(OmniError::resource_limit(
+                    "strict_input_arrow_bytes",
+                    limit,
+                    projected,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn projected_strict_column_bytes(data_type: &DataType, value: &JsonValue) -> Result<u64> {
+    const ARRAY_BUFFER_OVERHEAD: u64 = 16;
+    let bytes = match data_type {
+        DataType::Utf8 => ARRAY_BUFFER_OVERHEAD.saturating_add(
+            value
+                .as_str()
+                .and_then(|value| u64::try_from(value.len()).ok())
+                .unwrap_or_default(),
+        ),
+        DataType::Int32 | DataType::Float32 | DataType::Date32 => ARRAY_BUFFER_OVERHEAD + 4,
+        DataType::Int64 | DataType::UInt64 | DataType::Float64 | DataType::Date64 => {
+            ARRAY_BUFFER_OVERHEAD + 8
+        }
+        DataType::UInt32 => ARRAY_BUFFER_OVERHEAD + 4,
+        DataType::Boolean => ARRAY_BUFFER_OVERHEAD + 1,
+        DataType::List(child) => {
+            let mut bytes = ARRAY_BUFFER_OVERHEAD;
+            if let Some(items) = value.as_array() {
+                for item in items {
+                    bytes = bytes
+                        .saturating_add(projected_strict_list_item_bytes(child.data_type(), item)?);
+                }
+            }
+            bytes
+        }
+        DataType::FixedSizeList(child, dimension) => {
+            let dimension = u64::try_from(*dimension).map_err(|_| {
+                OmniError::manifest_internal(format!(
+                    "strict-row vector has invalid dimension {dimension}"
+                ))
+            })?;
+            let child_width = projected_strict_fixed_width(child.data_type())?;
+            ARRAY_BUFFER_OVERHEAD.saturating_add(dimension.saturating_mul(child_width + 1))
+        }
+        other => {
+            return Err(OmniError::manifest(format!(
+                "strict input has unsupported Arrow type {other:?}"
+            )));
+        }
+    };
+    Ok(bytes)
+}
+
+fn projected_strict_list_item_bytes(data_type: &DataType, value: &JsonValue) -> Result<u64> {
+    match data_type {
+        DataType::Utf8 => Ok(8_u64.saturating_add(
+            value
+                .as_str()
+                .and_then(|value| u64::try_from(value.len()).ok())
+                .unwrap_or_default(),
+        )),
+        other => projected_strict_fixed_width(other).map(|width| width + 1),
+    }
+}
+
+fn projected_strict_fixed_width(data_type: &DataType) -> Result<u64> {
+    match data_type {
+        DataType::Boolean => Ok(1),
+        DataType::Int32 | DataType::UInt32 | DataType::Float32 | DataType::Date32 => Ok(4),
+        DataType::Int64 | DataType::UInt64 | DataType::Float64 | DataType::Date64 => Ok(8),
+        other => Err(OmniError::manifest(format!(
+            "strict input has unsupported nested Arrow type {other:?}"
+        ))),
+    }
+}
+
+/// Refuse an oversized aggregate base64 payload before any blob bytes are
+/// decoded. The later Arrow-sized staging check remains authoritative for all
+/// columns and allocator overhead; this guard prevents encoded input from
+/// briefly allocating an over-limit decoded copy first.
+fn preflight_blob_decode_budget<'a>(
+    table_key: &str,
+    blob_properties: impl Iterator<Item = &'a str>,
+    rows: &[&JsonValue],
+) -> Result<()> {
+    let mut decoded_bytes = 0_u64;
+    for property in blob_properties {
+        for row in rows {
+            let Some(encoded) = row
+                .get(property)
+                .and_then(JsonValue::as_str)
+                .and_then(|value| value.strip_prefix("base64:"))
+            else {
+                continue;
+            };
+            let estimate = base64::decoded_len_estimate(encoded.len()).saturating_sub(
+                encoded
+                    .as_bytes()
+                    .iter()
+                    .rev()
+                    .take_while(|&&byte| byte == b'=')
+                    .count(),
+            ) as u64;
+            decoded_bytes = decoded_bytes.checked_add(estimate).ok_or_else(|| {
+                OmniError::manifest_internal("decoded blob input byte count overflow")
+            })?;
+            if decoded_bytes > KEYED_WRITE_MAX_BYTES {
+                return Err(OmniError::resource_limit(
+                    format!("decoded blob input bytes for {table_key}"),
+                    KEYED_WRITE_MAX_BYTES,
+                    decoded_bytes,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Append a blob value (URI or base64 bytes) to a BlobArrayBuilder.
 pub(crate) fn append_blob_value(builder: &mut BlobArrayBuilder, value: &str) -> Result<()> {
     if let Some(encoded) = value.strip_prefix("base64:") {
+        let decoded_estimate = base64::decoded_len_estimate(encoded.len()).saturating_sub(
+            encoded
+                .as_bytes()
+                .iter()
+                .rev()
+                .take_while(|&&b| b == b'=')
+                .count(),
+        );
+        if decoded_estimate as u64 > KEYED_WRITE_MAX_BYTES {
+            return Err(OmniError::resource_limit(
+                "decoded blob input bytes",
+                KEYED_WRITE_MAX_BYTES,
+                decoded_estimate as u64,
+            ));
+        }
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(encoded)
             .map_err(|e| OmniError::manifest(format!("invalid base64 blob data: {}", e)))?;
@@ -738,7 +2024,10 @@ pub(crate) fn append_blob_value(builder: &mut BlobArrayBuilder, value: &str) -> 
             .push_bytes(bytes)
             .map_err(|e| OmniError::Lance(e.to_string()))
     } else {
-        // Treat as URI (file://, s3://, gs://, or any other scheme)
+        // Treat as URI. Bound builder scratch before Lance copies the string;
+        // policy/scheme/containment validation remains operation-wide after
+        // last-write-wins folding.
+        crate::blob::validate_external_blob_uri_raw_limit(value)?;
         builder
             .push_uri(value)
             .map_err(|e| OmniError::Lance(e.to_string()))
@@ -777,11 +2066,18 @@ fn build_blob_column(name: &str, nullable: bool, rows: &[JsonValue]) -> Result<A
         .map_err(|e| OmniError::Lance(e.to_string()))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JsonConversionMode {
+    LoaderCompat,
+    Strict,
+}
+
 fn build_column_from_json(
     name: &str,
     data_type: &DataType,
     nullable: bool,
     rows: &[JsonValue],
+    mode: JsonConversionMode,
 ) -> Result<ArrayRef> {
     let array: ArrayRef = match data_type {
         DataType::Utf8 => {
@@ -796,38 +2092,100 @@ fn build_column_from_json(
             Arc::new(StringArray::from(values))
         }
         DataType::Int32 => {
-            let values: Vec<Option<i32>> = rows
-                .iter()
-                .map(|row| row.get(name).and_then(|v| v.as_i64()).map(|v| v as i32))
-                .collect();
+            let mut values = Vec::with_capacity(rows.len());
+            for row in rows {
+                let value = row.get(name).unwrap_or(&JsonValue::Null);
+                let converted = if let Some(value) = value.as_i64() {
+                    Some(i32::try_from(value).map_err(|_| {
+                        OmniError::manifest(format!(
+                            "property '{name}' value {value} exceeds Int32 range"
+                        ))
+                    })?)
+                } else if let Some(value) = value.as_u64() {
+                    Some(i32::try_from(value).map_err(|_| {
+                        OmniError::manifest(format!(
+                            "property '{name}' value {value} exceeds Int32 range"
+                        ))
+                    })?)
+                } else {
+                    None
+                };
+                values.push(converted);
+            }
             Arc::new(Int32Array::from(values))
         }
         DataType::Int64 => {
-            let values: Vec<Option<i64>> = rows
-                .iter()
-                .map(|row| row.get(name).and_then(|v| v.as_i64()))
-                .collect();
+            let mut values = Vec::with_capacity(rows.len());
+            for row in rows {
+                let value = row.get(name).unwrap_or(&JsonValue::Null);
+                let converted = if let Some(value) = value.as_i64() {
+                    Some(value)
+                } else if let Some(value) = value.as_u64() {
+                    Some(i64::try_from(value).map_err(|_| {
+                        OmniError::manifest(format!(
+                            "property '{name}' value {value} exceeds Int64 range"
+                        ))
+                    })?)
+                } else {
+                    None
+                };
+                values.push(converted);
+            }
             Arc::new(Int64Array::from(values))
         }
         DataType::UInt32 => {
-            let values: Vec<Option<u32>> = rows
-                .iter()
-                .map(|row| row.get(name).and_then(|v| v.as_u64()).map(|v| v as u32))
-                .collect();
+            let mut values = Vec::with_capacity(rows.len());
+            for row in rows {
+                let value = row.get(name).unwrap_or(&JsonValue::Null);
+                let converted = if let Some(value) = value.as_u64() {
+                    Some(u32::try_from(value).map_err(|_| {
+                        OmniError::manifest(format!(
+                            "property '{name}' value {value} exceeds UInt32 range"
+                        ))
+                    })?)
+                } else if let Some(value) = value.as_i64() {
+                    Some(u32::try_from(value).map_err(|_| {
+                        OmniError::manifest(format!(
+                            "property '{name}' value {value} exceeds UInt32 range"
+                        ))
+                    })?)
+                } else {
+                    None
+                };
+                values.push(converted);
+            }
             Arc::new(UInt32Array::from(values))
         }
         DataType::UInt64 => {
-            let values: Vec<Option<u64>> = rows
-                .iter()
-                .map(|row| row.get(name).and_then(|v| v.as_u64()))
-                .collect();
+            let mut values = Vec::with_capacity(rows.len());
+            for row in rows {
+                let value = row.get(name).unwrap_or(&JsonValue::Null);
+                let converted = if let Some(value) = value.as_u64() {
+                    Some(value)
+                } else if let Some(value) = value.as_i64() {
+                    Some(u64::try_from(value).map_err(|_| {
+                        OmniError::manifest(format!(
+                            "property '{name}' value {value} exceeds UInt64 range"
+                        ))
+                    })?)
+                } else {
+                    None
+                };
+                values.push(converted);
+            }
             Arc::new(UInt64Array::from(values))
         }
         DataType::Float32 => {
-            let values: Vec<Option<f32>> = rows
-                .iter()
-                .map(|row| row.get(name).and_then(|v| v.as_f64()).map(|v| v as f32))
-                .collect();
+            let mut values = Vec::with_capacity(rows.len());
+            for row in rows {
+                let value = row.get(name).unwrap_or(&JsonValue::Null);
+                values.push(
+                    value
+                        .as_f64()
+                        .map(|value| checked_json_f32(value, &format!("property '{name}'")))
+                        .transpose()?,
+                );
+            }
             Arc::new(Float32Array::from(values))
         }
         DataType::Float64 => {
@@ -890,15 +2248,76 @@ fn build_column_from_json(
         DataType::FixedSizeList(child_field, dim) => {
             // Vector type: parse JSON array of floats into FixedSizeList<Float32>
             let dim = *dim;
+            let dim_usize = usize::try_from(dim).map_err(|_| {
+                OmniError::manifest_internal(format!(
+                    "vector property '{name}' has invalid dimension {dim}"
+                ))
+            })?;
+            if mode == JsonConversionMode::Strict {
+                // Strict row normalization must reject malformed input and
+                // prove the builder's lower-bound allocation before creating
+                // it. A legal compiler dimension can still approach i32::MAX;
+                // even one nullable null would otherwise reserve or append
+                // billions of child slots before the post-build batch bound.
+                for row in rows {
+                    let value = row.get(name).unwrap_or(&JsonValue::Null);
+                    match value {
+                        JsonValue::Array(items) => {
+                            if items.len() != dim_usize {
+                                return Err(OmniError::manifest(format!(
+                                    "vector property '{}' expects {} dimensions, got {}",
+                                    name,
+                                    dim,
+                                    items.len()
+                                )));
+                            }
+                            for item in items {
+                                let Some(value) = item.as_f64() else {
+                                    return Err(OmniError::manifest(format!(
+                                        "vector property '{}' elements must be numeric, got {}",
+                                        name, item
+                                    )));
+                                };
+                                checked_json_f32(value, "vector element")?;
+                            }
+                        }
+                        JsonValue::Null if nullable => {}
+                        JsonValue::Null => {
+                            return Err(OmniError::manifest(format!(
+                                "non-nullable vector property '{}' has null values",
+                                name
+                            )));
+                        }
+                        other => {
+                            return Err(OmniError::manifest(format!(
+                                "vector property '{}' expects a JSON array, got {}",
+                                name, other
+                            )));
+                        }
+                    }
+                }
+                let allocation_bytes = u64::try_from(rows.len())
+                    .ok()
+                    .and_then(|rows| rows.checked_mul(u64::try_from(dim_usize).ok()?))
+                    .and_then(|values| values.checked_mul(4))
+                    .unwrap_or(u64::MAX);
+                if allocation_bytes > KEYED_WRITE_MAX_BYTES {
+                    return Err(OmniError::resource_limit(
+                        "strict_input_arrow_bytes",
+                        KEYED_WRITE_MAX_BYTES,
+                        allocation_bytes,
+                    ));
+                }
+            }
             let mut builder = FixedSizeListBuilder::with_capacity(
-                Float32Builder::with_capacity(rows.len() * dim as usize),
+                Float32Builder::with_capacity(rows.len() * dim_usize),
                 dim,
                 rows.len(),
             )
             .with_field(child_field.clone());
             for row in rows {
                 if let Some(arr) = row.get(name).and_then(|v| v.as_array()) {
-                    if arr.len() != dim as usize {
+                    if arr.len() != dim_usize {
                         return Err(OmniError::manifest(format!(
                             "vector property '{}' expects {} dimensions, got {}",
                             name,
@@ -918,11 +2337,13 @@ fn build_column_from_json(
                                 name, val
                             )));
                         };
-                        builder.values().append_value(v as f32);
+                        builder
+                            .values()
+                            .append_value(checked_json_f32(v, "vector element")?);
                     }
                     builder.append(true);
                 } else if nullable {
-                    for _ in 0..dim as usize {
+                    for _ in 0..dim_usize {
                         builder.values().append_null();
                     }
                     builder.append(false);
@@ -935,12 +2356,42 @@ fn build_column_from_json(
             }
             Arc::new(builder.finish())
         }
+        _ if mode == JsonConversionMode::Strict => {
+            return Err(OmniError::manifest(format!(
+                "strict property '{name}' has unsupported Arrow type {data_type:?}"
+            )));
+        }
         _ => {
             // Unsupported type: fill with nulls
             let values: Vec<Option<&str>> = vec![None; rows.len()];
             Arc::new(StringArray::from(values))
         }
     };
+
+    if mode == JsonConversionMode::Strict {
+        for (row_index, row) in rows.iter().enumerate() {
+            let input = row.get(name).unwrap_or(&JsonValue::Null);
+            if !input.is_null() && array.is_null(row_index) {
+                return Err(OmniError::manifest(format!(
+                    "strict property '{name}' expects {data_type:?}, got {input}"
+                )));
+            }
+        }
+        if matches!(data_type, DataType::List(_)) {
+            let list = array.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "strict list conversion for '{name}' produced a non-list array"
+                ))
+            })?;
+            for row_index in 0..list.len() {
+                if !list.is_null(row_index) && list.value(row_index).null_count() != 0 {
+                    return Err(OmniError::manifest(format!(
+                        "strict list property '{name}' contains a null or invalid item"
+                    )));
+                }
+            }
+        }
+    }
 
     if !nullable && array.null_count() > 0 {
         return Err(OmniError::manifest(format!(
@@ -971,6 +2422,25 @@ fn make_list_value_builder(data_type: &DataType, capacity: usize) -> Result<Box<
             )));
         }
     })
+}
+
+fn checked_json_f32(value: f64, context: &str) -> Result<f32> {
+    if !value.is_finite() {
+        return Err(OmniError::manifest(format!(
+            "{context} value {value} must be finite for Float32"
+        )));
+    }
+    // Judge range after IEEE round-to-nearest conversion. A shortest decimal
+    // spelling that round-trips through JSON may land just outside the exact
+    // f64 value of `f32::MAX` while still converting back to finite
+    // `f32::MAX`; rejecting it would make export/import asymmetric.
+    let narrowed = value as f32;
+    if !narrowed.is_finite() {
+        return Err(OmniError::manifest(format!(
+            "{context} value {value} exceeds Float32 range"
+        )));
+    }
+    Ok(narrowed)
 }
 
 fn append_json_list_item(
@@ -1011,6 +2481,11 @@ fn append_json_list_item(
                     OmniError::manifest(format!("list value {} exceeds Int32 range", value))
                 })?;
                 builder.append_value(value);
+            } else if let Some(value) = value.as_u64() {
+                let value = i32::try_from(value).map_err(|_| {
+                    OmniError::manifest(format!("list value {} exceeds Int32 range", value))
+                })?;
+                builder.append_value(value);
             } else {
                 builder.append_null();
             }
@@ -1021,6 +2496,11 @@ fn append_json_list_item(
                 .downcast_mut::<Int64Builder>()
                 .ok_or_else(|| OmniError::manifest("list Int64 builder downcast failed"))?;
             if let Some(value) = value.as_i64() {
+                builder.append_value(value);
+            } else if let Some(value) = value.as_u64() {
+                let value = i64::try_from(value).map_err(|_| {
+                    OmniError::manifest(format!("list value {} exceeds Int64 range", value))
+                })?;
                 builder.append_value(value);
             } else {
                 builder.append_null();
@@ -1036,6 +2516,11 @@ fn append_json_list_item(
                     OmniError::manifest(format!("list value {} exceeds UInt32 range", value))
                 })?;
                 builder.append_value(value);
+            } else if let Some(value) = value.as_i64() {
+                let value = u32::try_from(value).map_err(|_| {
+                    OmniError::manifest(format!("list value {} exceeds UInt32 range", value))
+                })?;
+                builder.append_value(value);
             } else {
                 builder.append_null();
             }
@@ -1047,6 +2532,11 @@ fn append_json_list_item(
                 .ok_or_else(|| OmniError::manifest("list UInt64 builder downcast failed"))?;
             if let Some(value) = value.as_u64() {
                 builder.append_value(value);
+            } else if let Some(value) = value.as_i64() {
+                let value = u64::try_from(value).map_err(|_| {
+                    OmniError::manifest(format!("list value {} exceeds UInt64 range", value))
+                })?;
+                builder.append_value(value);
             } else {
                 builder.append_null();
             }
@@ -1057,7 +2547,7 @@ fn append_json_list_item(
                 .downcast_mut::<Float32Builder>()
                 .ok_or_else(|| OmniError::manifest("list Float32 builder downcast failed"))?;
             if let Some(value) = value.as_f64() {
-                builder.append_value(value as f32);
+                builder.append_value(checked_json_f32(value, "list value")?);
             } else {
                 builder.append_null();
             }
@@ -1360,7 +2850,7 @@ pub(crate) fn validate_enum_constraints(
 /// - `Ok(None)` if any column is null: the row is exempt (a partial tuple
 ///   can't violate uniqueness under SQL null semantics).
 /// - `Ok(Some(tuple))` otherwise.
-/// - `Err(..)` propagated from [`unique_key_scalar`] on an un-keyable value.
+/// - `Err(..)` propagated from [`canonical_scalar_key`] on an un-keyable value.
 ///
 /// Shared by every write surface through the unified validation evaluator
 /// (`crate::validate::evaluate_unique`, used by the loader, mutation, and
@@ -1372,12 +2862,33 @@ pub(crate) fn composite_unique_key(
 ) -> Result<Option<Vec<String>>> {
     let mut parts = Vec::with_capacity(group_columns.len());
     for column in group_columns {
-        match unique_key_scalar(column, row)? {
+        match canonical_scalar_key(column, row)? {
             Some(value) => parts.push(value),
             None => return Ok(None),
         }
     }
     Ok(Some(parts))
+}
+
+/// Derive the exact physical node id for a typed `@key` tuple.
+///
+/// A one-column key retains the historical scalar spelling. Composite keys use
+/// a JSON array of the per-column canonical strings: JSON escaping makes the
+/// encoding deterministic and unambiguous without inventing a delimiter that
+/// user data could forge.
+pub(crate) fn canonical_node_id(key_columns: &[ArrayRef], row: usize) -> Result<Option<String>> {
+    let Some(parts) = composite_unique_key(key_columns, row)? else {
+        return Ok(None);
+    };
+    match parts.as_slice() {
+        [] => Err(OmniError::manifest_internal(
+            "cannot derive a physical node id from an empty @key tuple",
+        )),
+        [scalar] => Ok(Some(scalar.clone())),
+        _ => serde_json::to_string(&parts)
+            .map(Some)
+            .map_err(|error| OmniError::manifest_internal(format!("encode @key tuple: {error}"))),
+    }
 }
 
 /// Render a constraint's column tuple for error messages: a single item as
@@ -1390,8 +2901,10 @@ pub(crate) fn format_tuple(items: &[String]) -> String {
     }
 }
 
-/// Reduce a single Arrow scalar at (`array`, `row`) to its uniqueness-key
-/// string.
+/// Reduce one typed Arrow scalar at (`array`, `row`) to its canonical key
+/// string. This one renderer owns both physical node-id derivation for `@key`
+/// writes and logical uniqueness tuples, so input surfaces cannot disagree
+/// about width conversion, dates, booleans, or unsigned values.
 ///
 /// - `Ok(None)` for a null value: nulls are exempt from uniqueness (standard
 ///   SQL semantics over nullable columns).
@@ -1404,7 +2917,7 @@ pub(crate) fn format_tuple(items: &[String]) -> String {
 ///   exempting the row, and because every legal scalar encoding is handled
 ///   above, the error fires only for a genuinely un-keyable column type — never
 ///   for a legal value that merely arrived in an unenumerated encoding.
-fn unique_key_scalar(array: &ArrayRef, row: usize) -> Result<Option<String>> {
+pub(crate) fn canonical_scalar_key(array: &ArrayRef, row: usize) -> Result<Option<String>> {
     use arrow_array::{Array, LargeStringArray, StringViewArray};
     if array.is_null(row) {
         return Ok(None);
@@ -1431,10 +2944,30 @@ fn unique_key_scalar(array: &ArrayRef, row: usize) -> Result<Option<String>> {
         return Ok(Some(a.value(row).to_string()));
     }
     if let Some(a) = array.as_any().downcast_ref::<Float32Array>() {
-        return Ok(Some(a.value(row).to_string()));
+        let value = a.value(row);
+        if !value.is_finite() {
+            return Err(OmniError::manifest(format!(
+                "scalar key: non-finite Float32 value {value} cannot identify a row"
+            )));
+        }
+        return Ok(Some(if value == 0.0 {
+            "0".to_string()
+        } else {
+            value.to_string()
+        }));
     }
     if let Some(a) = array.as_any().downcast_ref::<Float64Array>() {
-        return Ok(Some(a.value(row).to_string()));
+        let value = a.value(row);
+        if !value.is_finite() {
+            return Err(OmniError::manifest(format!(
+                "scalar key: non-finite Float64 value {value} cannot identify a row"
+            )));
+        }
+        return Ok(Some(if value == 0.0 {
+            "0".to_string()
+        } else {
+            value.to_string()
+        }));
     }
     if let Some(a) = array.as_any().downcast_ref::<BooleanArray>() {
         return Ok(Some(a.value(row).to_string()));
@@ -1446,9 +2979,105 @@ fn unique_key_scalar(array: &ArrayRef, row: usize) -> Result<Option<String>> {
         return Ok(Some(a.value(row).to_string()));
     }
     Err(OmniError::manifest(format!(
-        "uniqueness key: unsupported column type {:?} for @unique/@key enforcement",
+        "scalar key: unsupported column type {:?} for @unique/@key enforcement",
         array.data_type()
     )))
+}
+
+/// Compare an explicit physical id from an export with the typed key scalar it
+/// accompanies. Comparison happens in the declared Arrow type, not by string,
+/// because old writers derived some ids from literal text while export emitted
+/// the stored value (notably Date/DateTime and rounded F32).
+fn explicit_id_matches_scalar_key(array: &ArrayRef, row: usize, explicit: &str) -> Result<bool> {
+    use arrow_array::{Array, LargeStringArray, StringViewArray};
+    if array.is_null(row) {
+        return Ok(false);
+    }
+    if let Some(a) = array.as_any().downcast_ref::<StringArray>() {
+        return Ok(a.value(row) == explicit);
+    }
+    if let Some(a) = array.as_any().downcast_ref::<LargeStringArray>() {
+        return Ok(a.value(row) == explicit);
+    }
+    if let Some(a) = array.as_any().downcast_ref::<StringViewArray>() {
+        return Ok(a.value(row) == explicit);
+    }
+    if let Some(a) = array.as_any().downcast_ref::<Int32Array>() {
+        return Ok(explicit.parse::<i32>().ok() == Some(a.value(row)));
+    }
+    if let Some(a) = array.as_any().downcast_ref::<Int64Array>() {
+        return Ok(explicit.parse::<i64>().ok() == Some(a.value(row)));
+    }
+    if let Some(a) = array.as_any().downcast_ref::<UInt32Array>() {
+        return Ok(explicit.parse::<u32>().ok() == Some(a.value(row)));
+    }
+    if let Some(a) = array.as_any().downcast_ref::<UInt64Array>() {
+        return Ok(explicit.parse::<u64>().ok() == Some(a.value(row)));
+    }
+    if let Some(a) = array.as_any().downcast_ref::<Float32Array>() {
+        return Ok(explicit
+            .parse::<f32>()
+            .is_ok_and(|value| value == a.value(row)));
+    }
+    if let Some(a) = array.as_any().downcast_ref::<Float64Array>() {
+        return Ok(explicit
+            .parse::<f64>()
+            .is_ok_and(|value| value == a.value(row)));
+    }
+    if let Some(a) = array.as_any().downcast_ref::<BooleanArray>() {
+        return Ok(explicit
+            .parse::<bool>()
+            .is_ok_and(|value| value == a.value(row)));
+    }
+    if let Some(a) = array.as_any().downcast_ref::<Date32Array>() {
+        let parsed = explicit
+            .parse::<i32>()
+            .ok()
+            .or_else(|| parse_date32_literal(explicit).ok());
+        return Ok(parsed == Some(a.value(row)));
+    }
+    if let Some(a) = array.as_any().downcast_ref::<Date64Array>() {
+        let parsed = explicit
+            .parse::<i64>()
+            .ok()
+            .or_else(|| parse_date64_literal(explicit).ok());
+        return Ok(parsed == Some(a.value(row)));
+    }
+    Err(OmniError::manifest(format!(
+        "scalar key: unsupported column type {:?} for explicit id comparison",
+        array.data_type()
+    )))
+}
+
+/// Accept either the current exact tuple id or a legacy id derived from one
+/// typed key component. Before composite keys were made physical, writers used
+/// whichever component was first in that version's runtime catalog. Supported
+/// property renames could change that lexical order, so one old export may
+/// legitimately contain scalar ids from different tuple positions. The caller
+/// always persists `canonical_id` and records an endpoint remap; accepting an
+/// old spelling never weakens the invariant that physical `id` equals the
+/// complete typed key. If the same old id names different tuples, the typed
+/// remap rejects the import as ambiguous before any effect.
+fn explicit_id_matches_node_key(
+    key_columns: &[ArrayRef],
+    row: usize,
+    explicit: &str,
+    canonical_id: &str,
+) -> Result<bool> {
+    if explicit == canonical_id {
+        return Ok(true);
+    }
+    if key_columns.is_empty() {
+        return Err(OmniError::manifest_internal(
+            "cannot compare an explicit id to an empty @key tuple",
+        ));
+    }
+    for column in key_columns {
+        if explicit_id_matches_scalar_key(column, row, explicit)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn extract_numeric_value(col: &ArrayRef, row: usize) -> Option<f64> {
@@ -1513,13 +3142,332 @@ edge WorksAt: Person -> Company
 {"edge": "WorksAt", "from": "Alice", "to": "Acme"}
 "#;
 
+    #[test]
+    fn strict_json_conversion_rejects_nullable_wrong_types_and_list_items() {
+        let wrong_scalar = vec![serde_json::json!({"score": "not-an-int"})];
+        let compatible = build_column_from_json(
+            "score",
+            &DataType::Int32,
+            true,
+            &wrong_scalar,
+            JsonConversionMode::LoaderCompat,
+        )
+        .unwrap();
+        assert!(
+            compatible.is_null(0),
+            "bulk-load compatibility keeps its historical nullable coercion"
+        );
+        let strict = build_column_from_json(
+            "score",
+            &DataType::Int32,
+            true,
+            &wrong_scalar,
+            JsonConversionMode::Strict,
+        )
+        .expect_err("strict normalization must not turn a wrong type into null");
+        assert!(strict.to_string().contains("expects Int32"), "{strict:?}");
+
+        let list_type = DataType::List(Arc::new(arrow_schema::Field::new(
+            "item",
+            DataType::Utf8,
+            true,
+        )));
+        let wrong_list = vec![serde_json::json!({"tags": ["valid", 7]})];
+        build_column_from_json(
+            "tags",
+            &list_type,
+            false,
+            &wrong_list,
+            JsonConversionMode::LoaderCompat,
+        )
+        .expect("bulk-load compatibility retains nullable list-item coercion");
+        let strict = build_column_from_json(
+            "tags",
+            &list_type,
+            false,
+            &wrong_list,
+            JsonConversionMode::Strict,
+        )
+        .expect_err("strict normalization must reject a wrong list item");
+        assert!(
+            strict.to_string().contains("null or invalid item"),
+            "{strict:?}"
+        );
+
+        let missing_nullable = vec![serde_json::json!({})];
+        let strict = build_column_from_json(
+            "score",
+            &DataType::Int32,
+            true,
+            &missing_nullable,
+            JsonConversionMode::Strict,
+        )
+        .expect("a missing nullable strict-row property remains null");
+        assert!(strict.is_null(0));
+
+        let pathological_vector = DataType::FixedSizeList(
+            Arc::new(arrow_schema::Field::new("item", DataType::Float32, true)),
+            i32::MAX,
+        );
+        let strict = build_column_from_json(
+            "embedding",
+            &pathological_vector,
+            true,
+            &missing_nullable,
+            JsonConversionMode::Strict,
+        )
+        .expect_err("strict normalization must bound vector allocation before building");
+        assert!(
+            matches!(
+                strict,
+                OmniError::ResourceLimitExceeded {
+                    ref resource,
+                    limit: KEYED_WRITE_MAX_BYTES,
+                    actual: 8_589_934_588,
+                } if resource == "strict_input_arrow_bytes"
+            ),
+            "{strict:?}"
+        );
+
+        let list_schema = arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", DataType::Utf8, false),
+            arrow_schema::Field::new(
+                "tags",
+                DataType::List(Arc::new(arrow_schema::Field::new(
+                    "item",
+                    DataType::Utf8,
+                    false,
+                ))),
+                false,
+            ),
+        ]);
+        let list_row = serde_json::json!({"id": "row", "tags": ["one", "two"]});
+        let error = preflight_strict_row_arrow_bytes_with_limit(
+            &list_schema,
+            list_row.as_object().unwrap(),
+            32,
+        )
+        .expect_err("aggregate list buffers must be bounded before builders allocate");
+        assert!(matches!(
+            error,
+            OmniError::ResourceLimitExceeded {
+                ref resource,
+                limit: 32,
+                actual: 57,
+            } if resource == "strict_input_arrow_bytes"
+        ));
+    }
+
+    #[test]
+    fn strict_graph_batch_framing_and_structure_are_bounded_before_dom() {
+        let mut reader = BufReader::new(Cursor::new(b"abcd\n{}\r\n"));
+        assert_eq!(
+            read_bounded_graph_batch_line(&mut reader, 3).unwrap(),
+            Some(BoundedGraphBatchLine::InputTooLarge {
+                limit: 3,
+                actual: 4,
+            })
+        );
+        assert_eq!(
+            read_bounded_graph_batch_line(&mut reader, 3).unwrap(),
+            Some(BoundedGraphBatchLine::Line(b"{}".to_vec())),
+            "the oversized tail must be consumed without corrupting the next CRLF line"
+        );
+
+        let amplified = format!(
+            "[{}0]",
+            "0,".repeat(GRAPH_BATCH_JSON_MAX_STRUCTURAL_SLOTS as usize)
+        );
+        let error = validate_graph_batch_json_structure(amplified.as_bytes())
+            .expect_err("many tiny JSON values must fail before DOM allocation");
+        assert!(matches!(
+            error,
+            OmniError::ResourceLimitExceeded {
+                ref resource,
+                limit: GRAPH_BATCH_JSON_MAX_STRUCTURAL_SLOTS,
+                actual,
+            } if resource == "graph_batch_json_structural_slots"
+                && actual == GRAPH_BATCH_JSON_MAX_STRUCTURAL_SLOTS + 1
+        ));
+    }
+
+    #[tokio::test]
+    async fn strict_graph_batch_loads_graph_rows_with_crlf_and_blank_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        let input = concat!(
+            "\r\n",
+            "{\"type\":\"Person\",\"data\":{\"name\":\"Alice\",\"age\":30}}\r\n",
+            "{\"type\":\"Person\",\"data\":{\"name\":\"Bob\"}}\r\n",
+            "\r\n",
+            "{\"edge\":\"Knows\",\"from\":\"Alice\",\"to\":\"Bob\"}\r\n",
+        );
+
+        let result = db
+            .load_graph_batch("main", input, LoadMode::Append)
+            .await
+            .unwrap();
+        assert_eq!(result.nodes_loaded["Person"], 2);
+        assert_eq!(result.edges_loaded["Knows"], 1);
+
+        let snapshot = db.snapshot().await;
+        assert_eq!(
+            snapshot
+                .open("node:Person")
+                .await
+                .unwrap()
+                .count_rows(None)
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            snapshot
+                .open("edge:Knows")
+                .await
+                .unwrap()
+                .count_rows(None)
+                .await
+                .unwrap(),
+            1
+        );
+
+        let nullable_dir = tempfile::tempdir().unwrap();
+        let nullable_uri = nullable_dir.path().to_str().unwrap();
+        let nullable_schema = r#"
+node Doc {
+    slug: String @key
+    body: String?
+    embedding: Vector(2)? @embed(body)
+}
+"#;
+        let nullable_db = Omnigraph::init(nullable_uri, nullable_schema)
+            .await
+            .unwrap();
+        nullable_db
+            .load_graph_batch(
+                "main",
+                r#"{"type":"Doc","data":{"slug":"doc-1","body":"hello"}}"#,
+                LoadMode::Append,
+            )
+            .await
+            .expect("a nullable @embed target may remain null");
+        let nullable_snapshot = nullable_db.snapshot().await;
+        let nullable_rows = nullable_snapshot
+            .open("node:Doc")
+            .await
+            .unwrap()
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .unwrap();
+        assert_eq!(nullable_rows.len(), 1);
+        assert!(
+            nullable_rows[0]
+                .column_by_name("embedding")
+                .unwrap()
+                .is_null(0),
+            "strict graph loading must preserve ordinary nullable-vector semantics"
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_graph_batch_rejects_ambiguous_or_noncanonical_json_before_effects() {
+        let cases = [
+            (
+                "recursive duplicate",
+                r#"{"type":"Person","data":{"id":"Alice","name":"Alice","extra":{"x":1,"x":2}}}"#,
+                "duplicate JSON member 'x'",
+            ),
+            (
+                "two objects on one line",
+                r#"{"type":"Person","data":{"id":"Alice","name":"Alice"}} {"type":"Person","data":{"id":"Bob","name":"Bob"}}"#,
+                "invalid strict JSON",
+            ),
+            (
+                "node and edge",
+                r#"{"type":"Person","edge":"Knows","data":{"id":"Alice","name":"Alice"}}"#,
+                "exactly one of 'type' or 'edge'",
+            ),
+            (
+                "unknown top-level field",
+                r#"{"type":"Person","data":{"id":"Alice","name":"Alice"},"branch":"main"}"#,
+                "unknown top-level graph batch field 'branch'",
+            ),
+            (
+                "reserved top-level field",
+                r#"{"type":"Person","data":{"id":"Alice","name":"Alice"},"_rowid":7}"#,
+                "reserved physical state",
+            ),
+            (
+                "unknown data field",
+                r#"{"type":"Person","data":{"id":"Alice","name":"Alice","nickname":"Al"}}"#,
+                "unknown input field 'nickname'",
+            ),
+            (
+                "reserved data field",
+                r#"{"type":"Person","data":{"id":"Alice","name":"Alice","_rowid":7}}"#,
+                "reserved physical state",
+            ),
+            (
+                "non-string supplied id",
+                r#"{"type":"Person","data":{"id":7,"name":"Alice"}}"#,
+                "field 'id' must be a string",
+            ),
+            (
+                "noncanonical id",
+                r#"{"type":"Person","data":{"id":"person-1","name":"Alice"}}"#,
+                "does not match its canonical @key id 'Alice'",
+            ),
+            (
+                "nullable wrong type",
+                r#"{"type":"Person","data":{"id":"Alice","name":"Alice","age":"old"}}"#,
+                "expects Int32",
+            ),
+            (
+                "edge structural field in data",
+                r#"{"edge":"Knows","from":"Alice","to":"Bob","data":{"id":"knows-1","src":"Mallory"}}"#,
+                "reserved structural state",
+            ),
+        ];
+
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        let before = db.snapshot().await;
+        for (case, input, expected) in cases {
+            let error = db
+                .load_graph_batch("main", input, LoadMode::Append)
+                .await
+                .expect_err(case);
+            assert!(error.to_string().contains(expected), "{case}: {error}");
+            let after = db.snapshot().await;
+            assert_eq!(after.version(), before.version(), "{case} changed manifest");
+            assert_eq!(
+                after
+                    .open("node:Person")
+                    .await
+                    .unwrap()
+                    .count_rows(None)
+                    .await
+                    .unwrap(),
+                0,
+                "{case} wrote node rows"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_load_creates_data() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
-        let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
 
-        let result = load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite)
+        let result = load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
             .await
             .unwrap();
 
@@ -1533,8 +3481,8 @@ edge WorksAt: Person -> Company
     async fn test_load_data_readable_via_lance() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
-        let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-        load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite)
+        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
             .await
             .unwrap();
 
@@ -1571,8 +3519,8 @@ edge WorksAt: Person -> Company
     async fn test_load_edges_reference_node_keys() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
-        let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-        load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite)
+        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
             .await
             .unwrap();
 
@@ -1610,10 +3558,10 @@ edge WorksAt: Person -> Company
     async fn test_load_manifest_version_advances() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
-        let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
         let v1 = db.version().await;
 
-        load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite)
+        load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
             .await
             .unwrap();
 
@@ -1624,15 +3572,13 @@ edge WorksAt: Person -> Company
     async fn test_load_append_adds_rows() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
-        let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
 
         let batch1 = r#"{"type": "Person", "data": {"name": "Alice", "age": 30}}"#;
         let batch2 = r#"{"type": "Person", "data": {"name": "Bob", "age": 25}}"#;
 
-        load_jsonl(&mut db, batch1, LoadMode::Overwrite)
-            .await
-            .unwrap();
-        load_jsonl(&mut db, batch2, LoadMode::Append).await.unwrap();
+        load_jsonl(&db, batch1, LoadMode::Overwrite).await.unwrap();
+        load_jsonl(&db, batch2, LoadMode::Append).await.unwrap();
 
         let snap = db.snapshot().await;
         let person_ds = snap.open("node:Person").await.unwrap();
@@ -1643,10 +3589,10 @@ edge WorksAt: Person -> Company
     async fn test_load_unknown_type_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
-        let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
 
         let bad = r#"{"type": "FakeType", "data": {"name": "x"}}"#;
-        let result = load_jsonl(&mut db, bad, LoadMode::Overwrite).await;
+        let result = load_jsonl(&db, bad, LoadMode::Overwrite).await;
         assert!(result.is_err());
     }
 
@@ -1655,7 +3601,7 @@ edge WorksAt: Person -> Company
     async fn test_ingest_creates_branch_and_reports_tables() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
-        let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
 
         let result = db
             .ingest("feature", Some("main"), TEST_DATA, LoadMode::Overwrite)
@@ -1700,8 +3646,8 @@ edge WorksAt: Person -> Company
     async fn test_ingest_existing_branch_ignores_from_and_merges_data() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
-        let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-        load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite)
+        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
             .await
             .unwrap();
         db.branch_create_from(crate::db::ReadTarget::branch("main"), "feature")
@@ -1775,7 +3721,7 @@ edge WorksAt: Person -> Company
     async fn test_ingest_as_stamps_actor_on_branch_head_commit() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
-        let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
 
         db.ingest_as(
             "feature",
@@ -1792,7 +3738,7 @@ edge WorksAt: Person -> Company
             .await
             .unwrap()
             .into_iter()
-            .last()
+            .next()
             .unwrap();
         assert_eq!(head.actor_id.as_deref(), Some("act-andrew"));
     }
@@ -1843,7 +3789,10 @@ edge WorksAt: Person -> Company
         let result = db
             .load_as("nonexistent", None, TEST_DATA, LoadMode::Merge, None)
             .await;
-        assert!(result.is_err(), "load without base must not create branches");
+        assert!(
+            result.is_err(),
+            "load without base must not create branches"
+        );
         assert!(
             !db.branch_list()
                 .await
@@ -1853,7 +3802,10 @@ edge WorksAt: Person -> Company
         );
 
         // Loads to main carry the default branch metadata.
-        let main_load = db.load("main", TEST_DATA, LoadMode::Overwrite).await.unwrap();
+        let main_load = db
+            .load("main", TEST_DATA, LoadMode::Overwrite)
+            .await
+            .unwrap();
         assert_eq!(main_load.branch, "main");
         assert_eq!(main_load.base_branch, None);
         assert!(!main_load.branch_created);
@@ -1937,7 +3889,7 @@ edge WorksAt: Person -> Company
         // silently un-enforced; now it errors instead of weakening the
         // constraint in silence.
         let blob: ArrayRef = Arc::new(LargeBinaryArray::from(vec![Some(&b"abc"[..])]));
-        let err = unique_key_scalar(&blob, 0).unwrap_err();
+        let err = canonical_scalar_key(&blob, 0).unwrap_err();
         assert!(
             err.to_string().contains("unsupported column type"),
             "un-keyable type must fail loudly (got: {err})"
@@ -1957,11 +3909,156 @@ edge WorksAt: Person -> Company
         let view: ArrayRef = Arc::new(StringViewArray::from(vec![Some("v")]));
         for array in [&utf8, &large, &view] {
             assert_eq!(
-                unique_key_scalar(array, 0).unwrap(),
+                canonical_scalar_key(array, 0).unwrap(),
                 Some("v".to_string()),
                 "string array {:?} must render, not error",
                 array.data_type()
             );
         }
+    }
+
+    #[test]
+    fn canonical_scalar_key_handles_every_supported_non_string_key_type() {
+        let cases: Vec<(ArrayRef, &str)> = vec![
+            (Arc::new(BooleanArray::from(vec![true])), "true"),
+            (Arc::new(Int32Array::from(vec![-32])), "-32"),
+            (
+                Arc::new(Int64Array::from(vec![i64::MIN])),
+                "-9223372036854775808",
+            ),
+            (Arc::new(UInt32Array::from(vec![u32::MAX])), "4294967295"),
+            (
+                Arc::new(UInt64Array::from(vec![u64::MAX])),
+                "18446744073709551615",
+            ),
+            (Arc::new(Float32Array::from(vec![1.25_f32])), "1.25"),
+            (Arc::new(Float64Array::from(vec![-2.5_f64])), "-2.5"),
+            (Arc::new(Float32Array::from(vec![-0.0_f32])), "0"),
+            (Arc::new(Float64Array::from(vec![-0.0_f64])), "0"),
+            (Arc::new(Date32Array::from(vec![19_723])), "19723"),
+            (
+                Arc::new(Date64Array::from(vec![1_704_067_200_000])),
+                "1704067200000",
+            ),
+        ];
+
+        for (array, expected) in cases {
+            assert_eq!(
+                canonical_scalar_key(&array, 0).unwrap().as_deref(),
+                Some(expected),
+                "scalar array {:?} must use its exact stored representation",
+                array.data_type()
+            );
+        }
+
+        for non_finite in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let array: ArrayRef = Arc::new(Float32Array::from(vec![non_finite]));
+            assert!(canonical_scalar_key(&array, 0).is_err());
+        }
+        for non_finite in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let array: ArrayRef = Arc::new(Float64Array::from(vec![non_finite]));
+            assert!(canonical_scalar_key(&array, 0).is_err());
+        }
+    }
+
+    #[test]
+    fn explicit_id_comparison_is_typed_for_legacy_spellings() {
+        let equivalent: Vec<(ArrayRef, &str)> = vec![
+            (Arc::new(BooleanArray::from(vec![true])), "true"),
+            (
+                Arc::new(Float32Array::from(vec![1.234_567_9_f32])),
+                "1.23456789",
+            ),
+            (Arc::new(Date32Array::from(vec![19_723])), "2024-01-01"),
+            (
+                Arc::new(Date64Array::from(vec![1_704_067_200_000])),
+                "2024-01-01T00:00:00Z",
+            ),
+            (
+                Arc::new(UInt64Array::from(vec![u64::MAX])),
+                "18446744073709551615",
+            ),
+        ];
+
+        for (array, explicit) in equivalent {
+            assert!(
+                explicit_id_matches_scalar_key(&array, 0, explicit).unwrap(),
+                "legacy id {explicit:?} must equal typed {:?} value",
+                array.data_type()
+            );
+        }
+        let day: ArrayRef = Arc::new(Date32Array::from(vec![19_723]));
+        assert!(!explicit_id_matches_scalar_key(&day, 0, "2024-01-02").unwrap());
+    }
+
+    #[test]
+    fn composite_node_id_is_deterministic_and_unambiguous() {
+        let scalar: Vec<ArrayRef> = vec![Arc::new(StringArray::from(vec!["a,b"]))];
+        assert_eq!(
+            canonical_node_id(&scalar, 0).unwrap().as_deref(),
+            Some("a,b"),
+            "one-column keys retain their historical scalar id"
+        );
+
+        let composite: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(vec!["a,b"])),
+            Arc::new(UInt32Array::from(vec![7])),
+            Arc::new(StringArray::from(vec!["quote\"and\\slash"])),
+        ];
+        assert_eq!(
+            canonical_node_id(&composite, 0).unwrap().as_deref(),
+            Some(r#"["a,b","7","quote\"and\\slash"]"#)
+        );
+    }
+
+    #[test]
+    fn typed_node_id_remap_disambiguates_types_and_rejects_ambiguity() {
+        let mut remap = TypedNodeIdRemap::default();
+        remap.record("Exact", "16777217", "16777217").unwrap();
+        remap.record("Rounded", "16777217", "16777216").unwrap();
+        assert_eq!(remap.endpoint("Exact", "16777217"), Some("16777217"));
+        assert_eq!(remap.endpoint("Rounded", "16777217"), Some("16777216"));
+
+        let err = remap.record("Rounded", "16777217", "16777218").unwrap_err();
+        assert!(
+            err.to_string().contains("ambiguous edge endpoint remap"),
+            "same typed old id must not choose a canonical endpoint silently: {err}"
+        );
+    }
+
+    #[test]
+    fn external_blob_uri_builder_checks_raw_limit_before_lance_copy() {
+        let prefix = "s3://bucket/";
+        let exact = format!(
+            "{prefix}{}",
+            "x".repeat(crate::blob::EXTERNAL_BLOB_URI_MAX_BYTES as usize - prefix.len())
+        );
+        let mut builder = BlobArrayBuilder::new(1);
+        append_blob_value(&mut builder, &exact).unwrap();
+
+        let oversized = format!("{exact}x");
+        let mut builder = BlobArrayBuilder::new(1);
+        assert!(matches!(
+            append_blob_value(&mut builder, &oversized),
+            Err(OmniError::ResourceLimitExceeded {
+                resource,
+                limit: crate::blob::EXTERNAL_BLOB_URI_MAX_BYTES,
+                actual,
+            }) if resource == "external Blob URI bytes"
+                && actual == crate::blob::EXTERNAL_BLOB_URI_MAX_BYTES + 1
+        ));
+    }
+
+    #[test]
+    fn checked_json_f32_accepts_boundary_and_rejects_overflow_and_nonfinite() {
+        assert_eq!(checked_json_f32(f32::MAX as f64, "test").unwrap(), f32::MAX);
+        assert_eq!(
+            checked_json_f32(f32::MAX as f64 * (1.0 + f64::EPSILON), "test").unwrap(),
+            f32::MAX
+        );
+        assert!(checked_json_f32(f32::MAX as f64 * (1.0 + f32::EPSILON as f64), "test").is_err());
+        assert!(checked_json_f32(f64::MAX, "test").is_err());
+        assert!(checked_json_f32(f64::INFINITY, "test").is_err());
+        assert!(checked_json_f32(f64::NAN, "test").is_err());
     }
 }

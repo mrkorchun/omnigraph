@@ -19,7 +19,32 @@ pub fn parse_schema(input: &str) -> Result<SchemaFile> {
     parse_schema_diagnostic(input).map_err(|e| CompilerError::Parse(e.to_string()))
 }
 
+/// Parse source that is already bound to a persisted accepted schema contract.
+///
+/// This compatibility seam permits exactly one historical admission bug:
+/// body-level `@unique(...)` could contain a Blob property before v0.10. New
+/// schema admission must always use [`parse_schema`], which rejects that shape.
+/// Property-level Blob annotations remain rejected in both modes.
+#[doc(hidden)]
+pub fn parse_persisted_schema_contract(input: &str) -> Result<SchemaFile> {
+    parse_schema_diagnostic_with_mode(input, ConstraintValidationMode::PersistedContract)
+        .map_err(|e| CompilerError::Parse(e.to_string()))
+}
+
 pub fn parse_schema_diagnostic(input: &str) -> std::result::Result<SchemaFile, ParseDiagnostic> {
+    parse_schema_diagnostic_with_mode(input, ConstraintValidationMode::Admission)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConstraintValidationMode {
+    Admission,
+    PersistedContract,
+}
+
+fn parse_schema_diagnostic_with_mode(
+    input: &str,
+    constraint_mode: ConstraintValidationMode,
+) -> std::result::Result<SchemaFile, ParseDiagnostic> {
     let pairs = SchemaParser::parse(Rule::schema_file, input).map_err(pest_error_to_diagnostic)?;
 
     let mut declarations = Vec::new();
@@ -53,7 +78,7 @@ pub fn parse_schema_diagnostic(input: &str) -> std::result::Result<SchemaFile, P
 
     let schema = SchemaFile { declarations };
     validate_schema_annotations(&schema).map_err(compiler_error_to_diagnostic)?;
-    validate_constraints(&schema).map_err(compiler_error_to_diagnostic)?;
+    validate_constraints(&schema, constraint_mode).map_err(compiler_error_to_diagnostic)?;
     Ok(schema)
 }
 
@@ -130,12 +155,28 @@ fn parse_node_decl(pair: pest::iterators::Pair<Rule>) -> Result<NodeDecl> {
     // Desugar property-level @key/@unique/@index annotations into constraints
     desugar_property_constraints(&properties, &mut constraints);
 
+    let source_constraints = constraints.clone();
+    let property_origins = properties
+        .iter()
+        .map(|property| {
+            (
+                property.name.clone(),
+                NodePropertyOrigin {
+                    declared_directly: true,
+                    interface_properties: Vec::new(),
+                },
+            )
+        })
+        .collect();
+
     Ok(NodeDecl {
         name,
         annotations,
         implements,
         properties,
         constraints,
+        source_constraints,
+        property_origins,
     })
 }
 
@@ -423,6 +464,17 @@ fn resolve_interfaces(node: &mut NodeDecl, interfaces: &[&InterfaceDecl]) -> Res
         })?;
 
         for iface_prop in &iface.properties {
+            let origin = node
+                .property_origins
+                .entry(iface_prop.name.clone())
+                .or_insert_with(|| NodePropertyOrigin {
+                    declared_directly: false,
+                    interface_properties: Vec::new(),
+                });
+            origin.interface_properties.push(InterfacePropertyOrigin {
+                interface_name: iface.name.clone(),
+                property_name: iface_prop.name.clone(),
+            });
             if let Some(existing) = node.properties.iter().find(|p| p.name == iface_prop.name) {
                 // Property exists — verify type compatibility
                 if existing.prop_type != iface_prop.prop_type {
@@ -447,12 +499,24 @@ fn resolve_interfaces(node: &mut NodeDecl, interfaces: &[&InterfaceDecl]) -> Res
         }
     }
 
+    for origin in node.property_origins.values_mut() {
+        origin.interface_properties.sort();
+        origin.interface_properties.dedup();
+    }
+
     Ok(())
 }
 
 fn parse_prop_decl(pair: pest::iterators::Pair<Rule>) -> Result<PropDecl> {
     let mut inner = pair.into_inner();
     let name = inner.next().unwrap().as_str().to_string();
+    if super::is_reserved_storage_system_column(&name) {
+        return Err(CompilerError::Parse(format!(
+            "property name '{name}' is reserved for a virtual storage system column; \
+             a graph created with a pre-RC Lance binary must be exported with that binary, \
+             renamed, and rebuilt"
+        )));
+    }
     let type_ref = inner.next().unwrap();
     let prop_type = parse_type_ref(type_ref)?;
 
@@ -625,8 +689,16 @@ fn validate_string_annotation(
 fn validate_schema_annotations(schema: &SchemaFile) -> Result<()> {
     for decl in &schema.declarations {
         match decl {
-            SchemaDecl::Interface(_) => {} // Interfaces have no type-level annotations
+            SchemaDecl::Interface(interface) => {
+                for prop in &interface.properties {
+                    rename_from_annotation(
+                        &prop.annotations,
+                        &format!("property {}.{}", interface.name, prop.name),
+                    )?;
+                }
+            } // Interfaces have no type-level annotations
             SchemaDecl::Node(node) => {
+                rename_from_annotation(&node.annotations, &format!("node {}", node.name))?;
                 // Reject constraint annotations on node level (must be on properties or as body constraints)
                 for ann in &node.annotations {
                     if ann.name == "key"
@@ -657,6 +729,7 @@ fn validate_schema_annotations(schema: &SchemaFile) -> Result<()> {
                 }
             }
             SchemaDecl::Edge(edge) => {
+                rename_from_annotation(&edge.annotations, &format!("edge {}", edge.name))?;
                 for ann in &edge.annotations {
                     if ann.name == "key"
                         || ann.name == "unique"
@@ -701,6 +774,10 @@ fn validate_property_annotations(
     validate_string_annotation(
         &prop.annotations,
         "description",
+        &format!("property {}.{}", type_name, prop.name),
+    )?;
+    rename_from_annotation(
+        &prop.annotations,
         &format!("property {}.{}", type_name, prop.name),
     )?;
 
@@ -866,15 +943,27 @@ fn validate_property_annotations(
 
 // ─── Constraint Validation ───────────────────────────────────────────────────
 
-fn validate_constraints(schema: &SchemaFile) -> Result<()> {
+fn validate_constraints(schema: &SchemaFile, mode: ConstraintValidationMode) -> Result<()> {
     for decl in &schema.declarations {
         match decl {
             SchemaDecl::Interface(_) => {}
             SchemaDecl::Node(node) => {
-                validate_type_constraints(&node.constraints, &node.properties, &node.name, false)?;
+                validate_type_constraints(
+                    &node.constraints,
+                    &node.properties,
+                    &node.name,
+                    false,
+                    mode,
+                )?;
             }
             SchemaDecl::Edge(edge) => {
-                validate_type_constraints(&edge.constraints, &edge.properties, &edge.name, true)?;
+                validate_type_constraints(
+                    &edge.constraints,
+                    &edge.properties,
+                    &edge.name,
+                    true,
+                    mode,
+                )?;
             }
         }
     }
@@ -886,6 +975,7 @@ fn validate_type_constraints(
     properties: &[PropDecl],
     type_name: &str,
     is_edge: bool,
+    mode: ConstraintValidationMode,
 ) -> Result<()> {
     let prop_names: HashMap<&str, &PropDecl> =
         properties.iter().map(|p| (p.name.as_str(), p)).collect();
@@ -947,9 +1037,17 @@ fn validate_type_constraints(
                     if is_edge && (col == "src" || col == "dst") {
                         continue;
                     }
-                    if !prop_names.contains_key(col.as_str()) {
-                        return Err(CompilerError::Parse(format!(
+                    let prop = prop_names.get(col.as_str()).ok_or_else(|| {
+                        CompilerError::Parse(format!(
                             "@unique on {} references unknown property '{}'",
+                            type_name, col
+                        ))
+                    })?;
+                    if matches!(prop.prop_type.scalar, ScalarType::Blob)
+                        && mode == ConstraintValidationMode::Admission
+                    {
+                        return Err(CompilerError::Parse(format!(
+                            "@unique is not supported on blob property {}.{}",
                             type_name, col
                         )));
                     }

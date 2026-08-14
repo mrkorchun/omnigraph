@@ -31,17 +31,20 @@ use crate::error::{OmniError, Result};
 
 #[cfg(test)]
 use super::SubTableUpdate;
-use super::layout::{open_manifest_dataset, tombstone_object_id, version_object_id};
+use super::layout::{
+    open_manifest_dataset_with_session, table_object_id, tombstone_object_id, version_object_id,
+};
 use super::metadata::{TableVersionMetadata, parse_namespace_version_request};
-use super::migrations::{read_stamp, refuse_if_stamp_unsupported};
+use super::migrations::guard_stamp;
 use super::state::{
     GraphLineageRow, GraphLineageRowPart, ManifestState, assemble_manifest_state,
-    graph_lineage_row_parts, head_lineage_row, manifest_rows_batch, manifest_schema,
-    read_manifest_state, read_publish_scan,
+    graph_head_object_id, graph_lineage_row_parts, head_lineage_row, manifest_rows_batch,
+    manifest_schema, read_manifest_state, read_publish_scan,
 };
 use super::{
-    ManifestChange, OBJECT_TYPE_TABLE, OBJECT_TYPE_TABLE_TOMBSTONE, OBJECT_TYPE_TABLE_VERSION,
-    SubTableEntry, TableRegistration, TableTombstone,
+    ExpectedTableVersions, MAIN_BRANCH_HEAD_KEY, ManifestChange, OBJECT_TYPE_TABLE,
+    OBJECT_TYPE_TABLE_TOMBSTONE, OBJECT_TYPE_TABLE_VERSION, SubTableEntry, TableIdentity,
+    TableRegistration, TableRename, TableTombstone,
 };
 
 /// Bound on the publisher-level retry loop that wraps Lance's row-level CAS
@@ -54,11 +57,10 @@ const PUBLISHER_RETRY_BUDGET: u32 = 5;
 /// The graph-lineage commit to record atomically with a manifest publish
 /// (RFC-013 Phase 7). One logical commit per publish: the `graph_commit_id` is
 /// minted once by the caller and stays stable across the publisher's CAS
-/// retries; only the parent re-resolves per attempt (against the freshly loaded
-/// `__manifest`), so a retry after a concurrent commit parents off the new head
-/// — the TOCTOU the dual-write era's `commit_graph.refresh()` guarded is closed
-/// by construction.
-#[derive(Debug, Clone)]
+/// retries. Legacy [`PublishPrecondition::Any`] publishes re-resolve the parent
+/// per attempt. An exact-head publish instead rejects a retry once that authority
+/// changed, so a prepared write can never be silently re-parented.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct LineageIntent {
     /// ULID minted once before the publish loop; the graph commit's identity.
     pub graph_commit_id: String,
@@ -71,6 +73,55 @@ pub(crate) struct LineageIntent {
     pub merged_parent_commit_id: Option<String>,
     /// Commit timestamp (microseconds since the UNIX epoch).
     pub created_at: i64,
+}
+
+/// The exact mutable graph-head authority a prepared write observed. A missing
+/// row is first-class: a freshly-created named branch inherits lineage commits
+/// but has no `graph_head:<its-name>` until its first graph commit.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct GraphHeadExpectation {
+    /// `None` means main; `Some("main")` is normalized to `None` by [`new`].
+    pub(crate) branch: Option<String>,
+    /// Lance-native stable branch identity. This detects delete/recreate ABA;
+    /// manifest versions/eTags are deliberately not branch identity.
+    pub(crate) branch_identifier: lance::dataset::refs::BranchIdentifier,
+    /// Exact commit id stored in the branch's head row, or `None` when absent.
+    pub(crate) head_commit_id: Option<String>,
+}
+
+impl GraphHeadExpectation {
+    pub(crate) fn new(
+        branch: Option<&str>,
+        branch_identifier: lance::dataset::refs::BranchIdentifier,
+        head_commit_id: Option<String>,
+    ) -> Self {
+        Self {
+            branch: branch
+                .filter(|branch| *branch != "main")
+                .map(ToOwned::to_owned),
+            branch_identifier,
+            head_commit_id,
+        }
+    }
+
+    fn object_id(&self) -> String {
+        graph_head_object_id(self.branch.as_deref())
+    }
+}
+
+/// Authority checked by the manifest publisher on every CAS attempt.
+///
+/// `Any` preserves the legacy dispatcher semantics: row-level contention may
+/// retry and re-parent a lineage intent. `ExactGraphHead` is the RFC-022
+/// foundation for prepared writes: after contention, any head movement becomes
+/// `ReadSetChanged` rather than a transparent re-parent. Its native branch-id
+/// check detects delete/recreate ABA on every attempt; it is not a distributed
+/// ref-control fence (Lance branch create/delete still lacks conditional CAS),
+/// so branch control remains within the documented single-writer-process bound.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum PublishPrecondition {
+    Any,
+    ExactGraphHead(GraphHeadExpectation),
 }
 
 /// The result of a manifest publish that may have folded in a graph commit.
@@ -92,17 +143,37 @@ pub(super) struct PublishOutcome {
 
 #[async_trait]
 pub(super) trait ManifestBatchPublisher: Send + Sync {
+    /// Compatibility/default publish behavior for bounded or recovery paths
+    /// that do not carry an exact graph-head precondition. Exact RFC-022
+    /// adapters call `publish_with_precondition` directly.
     async fn publish(
         &self,
         changes: &[ManifestChange],
-        expected_table_versions: &HashMap<String, u64>,
+        expected_table_versions: &ExpectedTableVersions,
         lineage: Option<&LineageIntent>,
+    ) -> Result<PublishOutcome> {
+        self.publish_with_precondition(
+            changes,
+            expected_table_versions,
+            lineage,
+            &PublishPrecondition::Any,
+        )
+        .await
+    }
+
+    async fn publish_with_precondition(
+        &self,
+        changes: &[ManifestChange],
+        expected_table_versions: &ExpectedTableVersions,
+        lineage: Option<&LineageIntent>,
+        precondition: &PublishPrecondition,
     ) -> Result<PublishOutcome>;
 }
 
 pub(super) struct GraphNamespacePublisher {
     root_uri: String,
     branch: Option<String>,
+    control_session: Arc<lance::session::Session>,
 }
 
 #[derive(Debug)]
@@ -112,6 +183,7 @@ struct PendingVersionRow {
     location: Option<String>,
     metadata: Option<String>,
     table_key: String,
+    identity: Option<TableIdentity>,
     table_version: Option<u64>,
     table_branch: Option<String>,
     row_count: Option<u64>,
@@ -119,29 +191,54 @@ struct PendingVersionRow {
 
 /// Everything one CAS attempt needs out of a single `__manifest` scan
 /// (RFC-013 P2): the open dataset, table state for the pre-check + pending-row
-/// build, and the `graph_commit` lineage rows for parent resolution. Folding the
-/// lineage into this struct is what lets `resolve_lineage_rows` skip its own
-/// `read_graph_lineage` scan.
+/// build, `graph_commit` lineage rows for parent resolution, and exact
+/// `graph_head` rows for OCC. Folding lineage authority into this struct is what
+/// lets both checks skip their own `read_graph_lineage` scan.
 struct LoadedPublishState {
     dataset: Dataset,
-    registered_tables: HashMap<String, String>,
-    existing_versions: HashMap<(String, u64), SubTableEntry>,
-    existing_tombstones: HashMap<(String, u64), ()>,
+    registered_tables: HashMap<TableIdentity, TableRegistration>,
+    existing_versions: HashMap<(TableIdentity, u64), SubTableEntry>,
+    existing_tombstones: HashMap<(TableIdentity, u64), ()>,
     lineage_rows: Vec<GraphLineageRow>,
+    graph_heads: HashMap<String, String>,
 }
 
+/// What `fold_inputs` folds a publish batch down to: the alias/path
+/// registrations after the batch, the surviving version entries, and the
+/// `(identity, version)` pairs the batch tombstoned.
+type FoldedPublishInputs = (
+    HashMap<TableIdentity, TableRegistration>,
+    Vec<SubTableEntry>,
+    Vec<(TableIdentity, u64)>,
+);
+
 impl GraphNamespacePublisher {
+    #[cfg(test)]
     pub(super) fn new(root_uri: &str, branch: Option<&str>) -> Self {
+        Self::new_with_session(root_uri, branch, crate::lance_access::control_session())
+    }
+
+    pub(super) fn new_with_session(
+        root_uri: &str,
+        branch: Option<&str>,
+        control_session: Arc<lance::session::Session>,
+    ) -> Self {
         Self {
             root_uri: root_uri.trim_end_matches('/').to_string(),
             branch: branch
                 .filter(|branch| *branch != "main")
                 .map(ToOwned::to_owned),
+            control_session,
         }
     }
 
     async fn dataset(&self) -> Result<Dataset> {
-        open_manifest_dataset(&self.root_uri, self.branch.as_deref()).await
+        open_manifest_dataset_with_session(
+            &self.root_uri,
+            self.branch.as_deref(),
+            &self.control_session,
+        )
+        .await
     }
 
     async fn load_publish_state(&self) -> Result<LoadedPublishState> {
@@ -157,111 +254,212 @@ impl GraphNamespacePublisher {
         // format) is refused with the rebuild-via-export/import message. There is
         // no in-place migration — storage-format changes are a cutover. See
         // `db/manifest/migrations.rs`.
-        refuse_if_stamp_unsupported(read_stamp(&dataset))?;
+        guard_stamp(&dataset)?;
         // ONE `__manifest` scan for everything the publish needs: table
-        // locations, version entries, tombstones, AND the `graph_commit` lineage
-        // rows for parent resolution (RFC-013 P2). The lineage extraction rides
-        // this pass instead of a second `read_graph_lineage` scan in
-        // `resolve_lineage_rows`; the per-attempt re-read is preserved because
-        // `load_publish_state` runs once per CAS attempt, so a retry sees the
-        // advanced head and re-parents correctly.
+        // locations, version entries, tombstones, `graph_commit` lineage rows
+        // for parent resolution, AND exact `graph_head` rows for OCC (RFC-013
+        // P2 / RFC-022). Extraction rides this pass instead of a second
+        // `read_graph_lineage` scan; the per-attempt re-read is preserved because
+        // `load_publish_state` runs once per CAS attempt.
         let scan = read_publish_scan(&dataset).await?;
         let existing_versions = scan
             .version_entries
             .iter()
-            .map(|entry| {
-                (
-                    (entry.table_key.clone(), entry.table_version),
-                    entry.clone(),
-                )
-            })
+            .map(|entry| ((entry.identity, entry.table_version), entry.clone()))
             .collect();
         let existing_tombstones = scan.tombstones.into_iter().collect();
         Ok(LoadedPublishState {
             dataset,
-            registered_tables: scan.table_locations,
+            registered_tables: scan.table_registrations,
             existing_versions,
             existing_tombstones,
             lineage_rows: scan.lineage_rows,
+            graph_heads: scan.graph_heads,
         })
     }
 
     fn build_pending_rows(
         changes: &[ManifestChange],
-        known_tables: &HashMap<String, String>,
-        existing_versions: &HashMap<(String, u64), SubTableEntry>,
-        existing_tombstones: &HashMap<(String, u64), ()>,
+        known_tables: &HashMap<TableIdentity, TableRegistration>,
+        existing_versions: &HashMap<(TableIdentity, u64), SubTableEntry>,
+        existing_tombstones: &HashMap<(TableIdentity, u64), ()>,
     ) -> Result<Vec<PendingVersionRow>> {
-        let mut request_versions = HashMap::<(String, u64), ()>::new();
+        let mut request_versions = HashMap::<(TableIdentity, u64), ()>::new();
+        let mut binding_changes = HashMap::<TableIdentity, ()>::new();
         let mut known_tables = known_tables.clone();
         let mut rows = Vec::with_capacity(changes.len());
 
+        // Registration and rename rows are applied first so an update in the
+        // same batch resolves through the post-change binding.
         for change in changes {
-            if let ManifestChange::RegisterTable(TableRegistration {
-                table_key,
-                table_path,
-            }) = change
-            {
-                if let Some(existing_path) = known_tables.get(table_key) {
-                    if existing_path != table_path {
+            match change {
+                ManifestChange::RegisterTable(registration) => {
+                    registration.identity.validate()?;
+                    let canonical_path = super::table_path_for_identity(
+                        &registration.table_key,
+                        registration.identity,
+                    )?;
+                    if canonical_path != registration.table_path {
                         return Err(OmniError::Lance(
                             NamespaceError::ConcurrentModification {
                                 message: format!(
-                                    "table {} already exists with different path {}",
-                                    table_key, existing_path
+                                    "table {} identity {} must use canonical path {}, got {}",
+                                    registration.table_key,
+                                    registration.identity,
+                                    canonical_path,
+                                    registration.table_path,
                                 ),
                             }
                             .to_string(),
                         ));
                     }
-                } else {
-                    known_tables.insert(table_key.clone(), table_path.clone());
+                    if let Some(existing) = known_tables.get(&registration.identity) {
+                        if existing == registration {
+                            continue;
+                        }
+                        return Err(OmniError::Lance(
+                            NamespaceError::ConcurrentModification {
+                                message: format!(
+                                    "table identity {} is already registered as {} at {}",
+                                    registration.identity, existing.table_key, existing.table_path,
+                                ),
+                            }
+                            .to_string(),
+                        ));
+                    }
+                    if binding_changes.insert(registration.identity, ()).is_some() {
+                        return Err(OmniError::manifest(format!(
+                            "manifest batch changes table binding {} more than once",
+                            registration.identity
+                        )));
+                    }
+                    known_tables.insert(registration.identity, registration.clone());
+                    rows.push(PendingVersionRow {
+                        object_id: table_object_id(registration.identity),
+                        object_type: OBJECT_TYPE_TABLE.to_string(),
+                        location: Some(registration.table_path.clone()),
+                        metadata: None,
+                        table_key: registration.table_key.clone(),
+                        identity: Some(registration.identity),
+                        table_version: None,
+                        table_branch: None,
+                        row_count: None,
+                    });
                 }
-                rows.push(PendingVersionRow {
-                    object_id: table_key.clone(),
-                    object_type: OBJECT_TYPE_TABLE.to_string(),
-                    location: Some(table_path.clone()),
-                    metadata: None,
-                    table_key: table_key.clone(),
-                    table_version: None,
-                    table_branch: None,
-                    row_count: None,
-                });
+                ManifestChange::RenameTable(TableRename {
+                    identity,
+                    expected_table_key,
+                    table_key,
+                    table_path,
+                }) => {
+                    identity.validate()?;
+                    if binding_changes.insert(*identity, ()).is_some() {
+                        return Err(OmniError::manifest(format!(
+                            "manifest batch changes table binding {identity} more than once"
+                        )));
+                    }
+                    let existing = known_tables.get(identity).ok_or_else(|| {
+                        OmniError::Lance(
+                            NamespaceError::TableNotFound {
+                                message: format!("table identity {identity} not found"),
+                            }
+                            .to_string(),
+                        )
+                    })?;
+                    if !Self::is_live_identity(*identity, existing_versions, existing_tombstones) {
+                        return Err(OmniError::Lance(
+                            NamespaceError::TableNotFound {
+                                message: format!(
+                                    "live table identity {identity} not found for rename"
+                                ),
+                            }
+                            .to_string(),
+                        ));
+                    }
+                    if existing.table_key != *expected_table_key
+                        || existing.table_path != *table_path
+                    {
+                        return Err(OmniError::manifest_read_set_changed(
+                            format!("table_binding:{identity}"),
+                            Some(format!("{expected_table_key}@{table_path}")),
+                            Some(format!("{}@{}", existing.table_key, existing.table_path)),
+                        ));
+                    }
+                    let canonical_path = super::table_path_for_identity(table_key, *identity)?;
+                    if canonical_path != *table_path {
+                        return Err(OmniError::manifest(format!(
+                            "rename of table identity {identity} must preserve physical path \
+                             {table_path}; alias '{table_key}' implies {canonical_path}"
+                        )));
+                    }
+                    if table_key == expected_table_key {
+                        continue;
+                    }
+                    let renamed = TableRegistration {
+                        identity: *identity,
+                        table_key: table_key.clone(),
+                        table_path: table_path.clone(),
+                    };
+                    known_tables.insert(*identity, renamed);
+                    rows.push(PendingVersionRow {
+                        object_id: table_object_id(*identity),
+                        object_type: OBJECT_TYPE_TABLE.to_string(),
+                        location: Some(table_path.clone()),
+                        metadata: None,
+                        table_key: table_key.clone(),
+                        identity: Some(*identity),
+                        table_version: None,
+                        table_branch: None,
+                        row_count: None,
+                    });
+                }
+                ManifestChange::Update(_) | ManifestChange::Tombstone(_) => {}
             }
         }
 
         for change in changes {
             match change {
-                ManifestChange::RegisterTable(_) => {}
+                ManifestChange::RegisterTable(_) | ManifestChange::RenameTable(_) => {}
                 ManifestChange::Update(update) => {
+                    update.identity.validate()?;
                     let request = update.to_create_table_version_request();
                     let (table_key, table_version, row_count, table_branch, version_metadata) =
                         parse_namespace_version_request(&request)
                             .map_err(|e| OmniError::Lance(e.to_string()))?;
-                    if !known_tables.contains_key(table_key.as_str()) {
-                        return Err(OmniError::Lance(
+                    let registration = known_tables.get(&update.identity).ok_or_else(|| {
+                        OmniError::Lance(
                             NamespaceError::TableNotFound {
-                                message: format!("table {} not found", table_key),
+                                message: format!("table identity {} not found", update.identity),
                             }
                             .to_string(),
-                        ));
-                    }
-                    if request_versions
-                        .insert((table_key.clone(), table_version), ())
-                        .is_some()
-                    {
+                        )
+                    })?;
+                    if registration.table_key != table_key {
                         return Err(OmniError::Lance(
                             NamespaceError::ConcurrentModification {
                                 message: format!(
-                                    "table version {} already exists for {}",
-                                    table_version, table_key
+                                    "table identity {} is bound to {}, not {}",
+                                    update.identity, registration.table_key, table_key
                                 ),
                             }
                             .to_string(),
                         ));
                     }
-                    if let Some(existing) =
-                        existing_versions.get(&(table_key.clone(), table_version))
+                    if request_versions
+                        .insert((update.identity, table_version), ())
+                        .is_some()
+                    {
+                        return Err(OmniError::Lance(
+                            NamespaceError::ConcurrentModification {
+                                message: format!(
+                                    "table version {} already exists for identity {} ({})",
+                                    table_version, update.identity, table_key
+                                ),
+                            }
+                            .to_string(),
+                        ));
+                    }
+                    if let Some(existing) = existing_versions.get(&(update.identity, table_version))
                     {
                         let is_owner_branch_handoff = existing.row_count == row_count
                             && existing.table_branch != table_branch;
@@ -269,8 +467,8 @@ impl GraphNamespacePublisher {
                             return Err(OmniError::Lance(
                                 NamespaceError::ConcurrentModification {
                                     message: format!(
-                                        "table version {} already exists for {}",
-                                        table_version, table_key
+                                        "table version {} already exists for identity {} ({})",
+                                        table_version, update.identity, table_key
                                     ),
                                 }
                                 .to_string(),
@@ -279,45 +477,60 @@ impl GraphNamespacePublisher {
                     }
 
                     rows.push(PendingVersionRow {
-                        object_id: version_object_id(&table_key, table_version),
+                        object_id: version_object_id(update.identity, table_version),
                         object_type: OBJECT_TYPE_TABLE_VERSION.to_string(),
                         location: None,
                         metadata: Some(version_metadata.to_json_string()?),
                         table_key,
+                        identity: Some(update.identity),
                         table_version: Some(table_version),
                         table_branch,
                         row_count: Some(row_count),
                     });
                 }
                 ManifestChange::Tombstone(TableTombstone {
+                    identity,
                     table_key,
                     tombstone_version,
                 }) => {
-                    if !known_tables.contains_key(table_key.as_str()) {
-                        return Err(OmniError::Lance(
+                    identity.validate()?;
+                    let registration = known_tables.get(identity).ok_or_else(|| {
+                        OmniError::Lance(
                             NamespaceError::TableNotFound {
-                                message: format!("table {} not found", table_key),
+                                message: format!("table identity {identity} not found"),
+                            }
+                            .to_string(),
+                        )
+                    })?;
+                    if registration.table_key != *table_key {
+                        return Err(OmniError::Lance(
+                            NamespaceError::ConcurrentModification {
+                                message: format!(
+                                    "table identity {identity} is bound to {}, not {}",
+                                    registration.table_key, table_key
+                                ),
                             }
                             .to_string(),
                         ));
                     }
-                    if existing_tombstones.contains_key(&(table_key.clone(), *tombstone_version)) {
+                    if existing_tombstones.contains_key(&(*identity, *tombstone_version)) {
                         return Err(OmniError::Lance(
                             NamespaceError::ConcurrentModification {
                                 message: format!(
-                                    "table tombstone {} already exists for {}",
-                                    tombstone_version, table_key
+                                    "table tombstone {} already exists for identity {} ({})",
+                                    tombstone_version, identity, table_key
                                 ),
                             }
                             .to_string(),
                         ));
                     }
                     rows.push(PendingVersionRow {
-                        object_id: tombstone_object_id(table_key, *tombstone_version),
+                        object_id: tombstone_object_id(*identity, *tombstone_version),
                         object_type: OBJECT_TYPE_TABLE_TOMBSTONE.to_string(),
                         location: None,
                         metadata: None,
                         table_key: table_key.clone(),
+                        identity: Some(*identity),
                         table_version: Some(*tombstone_version),
                         table_branch: None,
                         row_count: None,
@@ -379,6 +592,7 @@ impl GraphNamespacePublisher {
         let mut locations: Vec<Option<String>> = Vec::with_capacity(rows.len());
         let mut metadata = Vec::with_capacity(rows.len());
         let mut table_keys = Vec::with_capacity(rows.len());
+        let mut table_identities = Vec::with_capacity(rows.len());
         let mut table_versions: Vec<Option<u64>> = Vec::with_capacity(rows.len());
         let mut table_branches = Vec::with_capacity(rows.len());
         let mut row_counts: Vec<Option<u64>> = Vec::with_capacity(rows.len());
@@ -389,6 +603,7 @@ impl GraphNamespacePublisher {
             locations.push(row.location);
             metadata.push(row.metadata);
             table_keys.push(row.table_key);
+            table_identities.push(row.identity);
             table_versions.push(row.table_version);
             table_branches.push(row.table_branch);
             row_counts.push(row.row_count);
@@ -400,26 +615,27 @@ impl GraphNamespacePublisher {
             locations,
             metadata,
             table_keys,
+            table_identities,
             table_versions,
             table_branches,
             row_counts,
         )
     }
 
-    /// Reduce the loaded `(table_key, table_version) → entry` map and the
-    /// tombstone set to "latest non-tombstoned version per table" — the same
+    /// Reduce the loaded `(identity, table_version) → entry` map and the
+    /// tombstone set to "latest non-tombstoned version per identity" — the same
     /// reduction performed by `read_manifest_state` on the visible snapshot.
     /// Tombstoned tables fall back to their highest tombstone version so that
     /// the resulting `actual` reported in `ExpectedVersionMismatch` is
     /// meaningful even when the caller's expected table no longer exists.
-    fn latest_visible_per_table(
-        existing_versions: &HashMap<(String, u64), SubTableEntry>,
-        existing_tombstones: &HashMap<(String, u64), ()>,
-    ) -> HashMap<String, u64> {
-        let mut max_tombstones = HashMap::<String, u64>::new();
-        for (key, version) in existing_tombstones.keys() {
+    fn latest_visible_per_identity(
+        existing_versions: &HashMap<(TableIdentity, u64), SubTableEntry>,
+        existing_tombstones: &HashMap<(TableIdentity, u64), ()>,
+    ) -> HashMap<TableIdentity, u64> {
+        let mut max_tombstones = HashMap::<TableIdentity, u64>::new();
+        for (identity, version) in existing_tombstones.keys() {
             max_tombstones
-                .entry(key.clone())
+                .entry(*identity)
                 .and_modify(|v| {
                     if *version > *v {
                         *v = *version;
@@ -428,17 +644,17 @@ impl GraphNamespacePublisher {
                 .or_insert(*version);
         }
 
-        let mut latest = HashMap::<String, u64>::new();
-        for (key, version) in existing_versions.keys() {
+        let mut latest = HashMap::<TableIdentity, u64>::new();
+        for (identity, version) in existing_versions.keys() {
             let tombstoned = max_tombstones
-                .get(key)
+                .get(identity)
                 .map(|t| *t >= *version)
                 .unwrap_or(false);
             if tombstoned {
                 continue;
             }
             latest
-                .entry(key.clone())
+                .entry(*identity)
                 .and_modify(|v| {
                     if *version > *v {
                         *v = *version;
@@ -449,69 +665,104 @@ impl GraphNamespacePublisher {
 
         // For tables that have only tombstones (no visible entry), surface the
         // tombstone version so callers see a non-zero `actual`.
-        for (key, tombstone) in &max_tombstones {
-            latest.entry(key.clone()).or_insert(*tombstone);
+        for (identity, tombstone) in &max_tombstones {
+            latest.entry(*identity).or_insert(*tombstone);
         }
 
         latest
+    }
+
+    fn is_live_identity(
+        identity: TableIdentity,
+        existing_versions: &HashMap<(TableIdentity, u64), SubTableEntry>,
+        existing_tombstones: &HashMap<(TableIdentity, u64), ()>,
+    ) -> bool {
+        let latest_version = existing_versions
+            .keys()
+            .filter_map(|(candidate, version)| (*candidate == identity).then_some(*version))
+            .max();
+        let latest_tombstone = existing_tombstones
+            .keys()
+            .filter_map(|(candidate, version)| (*candidate == identity).then_some(*version))
+            .max();
+        latest_version
+            .map(|version| latest_tombstone.map(|t| t < version).unwrap_or(true))
+            .unwrap_or(false)
     }
 
     /// Build the inputs for [`assemble_manifest_state`] from the pre-publish state
     /// unioned with the pending rows about to be committed — the in-memory basis
     /// for the post-publish `known_state` fold (RFC-013 PR2 #1b), so the caller
     /// skips the O(fragments) re-scan. Mirrors `read_manifest_scan`'s row handling
-    /// exactly so the result is byte-identical: `table_path` resolves through
-    /// `table_locations` = `registered_tables` UNION the pending `OBJECT_TYPE_TABLE`
-    /// rows (a freshly-registered table is not yet in `registered_tables`);
+    /// exactly so the result is byte-identical: current aliases and paths resolve
+    /// through `registrations` = `registered_tables` UNION the pending
+    /// `OBJECT_TYPE_TABLE` rows (including a rename);
     /// `version_metadata` parses the SAME JSON string a re-scan would read. Pending
     /// `OBJECT_TYPE_TABLE` rows feed only `table_locations`; lineage rows
     /// (`graph_commit`/`graph_head`) are not manifest-state entries.
     fn fold_inputs(
-        existing_versions: &HashMap<(String, u64), SubTableEntry>,
-        existing_tombstones: &HashMap<(String, u64), ()>,
+        existing_versions: &HashMap<(TableIdentity, u64), SubTableEntry>,
+        existing_tombstones: &HashMap<(TableIdentity, u64), ()>,
         rows: &[PendingVersionRow],
-        registered_tables: &HashMap<String, String>,
-    ) -> Result<(Vec<SubTableEntry>, Vec<(String, u64)>)> {
-        let mut table_locations: HashMap<String, String> = registered_tables.clone();
+        registered_tables: &HashMap<TableIdentity, TableRegistration>,
+    ) -> Result<FoldedPublishInputs> {
+        let mut registrations = registered_tables.clone();
         for row in rows {
             if row.object_type == OBJECT_TYPE_TABLE {
-                if let Some(location) = &row.location {
-                    table_locations.insert(row.table_key.clone(), location.clone());
-                }
+                let identity = row.identity.ok_or_else(|| {
+                    OmniError::manifest_internal(format!(
+                        "post-publish fold: table row missing identity for {}",
+                        row.table_key
+                    ))
+                })?;
+                let location = row.location.clone().ok_or_else(|| {
+                    OmniError::manifest_internal(format!(
+                        "post-publish fold: table row missing path for {}",
+                        row.table_key
+                    ))
+                })?;
+                registrations.insert(
+                    identity,
+                    TableRegistration {
+                        identity,
+                        table_key: row.table_key.clone(),
+                        table_path: location,
+                    },
+                );
             }
         }
 
-        // Key version entries by `(table_key, table_version)` so a pending row at
+        // Key version entries by `(identity, table_version)` so a pending row at
         // the SAME version REPLACES the pre-publish entry — modelling merge-insert
-        // `UpdateAll` on the shared, deterministic `version_object_id(table_key,
+        // `UpdateAll` on the shared, deterministic `version_object_id(identity,
         // version)`. Load-bearing for the owner-branch handoff
         // (`is_owner_branch_handoff`): a handoff updates a `table_version` row in
         // place at the same version with a new `table_branch`, so `__manifest` ends
         // with ONE row carrying the new branch and a re-scan reflects it; appending
         // the pending row instead (and letting `assemble_manifest_state` keep the
         // first equal-version entry) would leave `known_state` on the stale fork.
-        let mut version_map: HashMap<(String, u64), SubTableEntry> = existing_versions.clone();
-        let mut tombstones: Vec<(String, u64)> = existing_tombstones
+        let mut version_map: HashMap<(TableIdentity, u64), SubTableEntry> =
+            existing_versions.clone();
+        let mut tombstones: Vec<(TableIdentity, u64)> = existing_tombstones
             .keys()
-            .map(|(key, version)| (key.clone(), *version))
+            .map(|(identity, version)| (*identity, *version))
             .collect();
 
         for row in rows {
             match row.object_type.as_str() {
                 OBJECT_TYPE_TABLE_VERSION => {
+                    let identity = row.identity.ok_or_else(|| {
+                        OmniError::manifest_internal(format!(
+                            "post-publish fold: table_version row missing identity for {}",
+                            row.table_key
+                        ))
+                    })?;
                     let table_version = row.table_version.ok_or_else(|| {
                         OmniError::manifest_internal(format!(
                             "post-publish fold: table_version row missing version for {}",
                             row.table_key
                         ))
                     })?;
-                    let table_path =
-                        table_locations.get(&row.table_key).cloned().ok_or_else(|| {
-                            OmniError::manifest_internal(format!(
-                                "post-publish fold: missing table row for {}",
-                                row.table_key
-                            ))
-                        })?;
                     let metadata_json = row.metadata.as_deref().ok_or_else(|| {
                         OmniError::manifest_internal(format!(
                             "post-publish fold: table_version row missing metadata for {}",
@@ -519,10 +770,11 @@ impl GraphNamespacePublisher {
                         ))
                     })?;
                     version_map.insert(
-                        (row.table_key.clone(), table_version),
+                        (identity, table_version),
                         SubTableEntry {
+                            identity,
                             table_key: row.table_key.clone(),
-                            table_path,
+                            table_path: String::new(),
                             table_version,
                             table_branch: row.table_branch.clone(),
                             row_count: row.row_count.ok_or_else(|| {
@@ -536,19 +788,29 @@ impl GraphNamespacePublisher {
                     );
                 }
                 OBJECT_TYPE_TABLE_TOMBSTONE => {
+                    let identity = row.identity.ok_or_else(|| {
+                        OmniError::manifest_internal(format!(
+                            "post-publish fold: tombstone row missing identity for {}",
+                            row.table_key
+                        ))
+                    })?;
                     let tombstone_version = row.table_version.ok_or_else(|| {
                         OmniError::manifest_internal(format!(
                             "post-publish fold: tombstone row missing version for {}",
                             row.table_key
                         ))
                     })?;
-                    tombstones.push((row.table_key.clone(), tombstone_version));
+                    tombstones.push((identity, tombstone_version));
                 }
                 _ => {}
             }
         }
 
-        Ok((version_map.into_values().collect(), tombstones))
+        Ok((
+            registrations,
+            version_map.into_values().collect(),
+            tombstones,
+        ))
     }
 
     /// Compare each caller-supplied expectation against the manifest's current
@@ -556,18 +818,103 @@ impl GraphNamespacePublisher {
     /// typed `ExpectedVersionMismatch` (`actual = 0` if the table isn't in the
     /// manifest at all).
     fn check_expected_table_versions(
-        latest_per_table: &HashMap<String, u64>,
-        expected: &HashMap<String, u64>,
+        latest_per_table: &HashMap<TableIdentity, u64>,
+        registrations: &HashMap<TableIdentity, TableRegistration>,
+        expected: &ExpectedTableVersions,
     ) -> Result<()> {
-        for (table_key, expected_version) in expected {
-            let actual = latest_per_table.get(table_key).copied().unwrap_or(0);
-            if actual != *expected_version {
+        for (identity, expectation) in expected {
+            identity.validate()?;
+            if let Some(registration) = registrations.get(identity) {
+                if registration.table_key != expectation.table_key {
+                    return Err(OmniError::manifest_read_set_changed(
+                        format!("table_binding:{identity}"),
+                        Some(expectation.table_key.clone()),
+                        Some(registration.table_key.clone()),
+                    ));
+                }
+            }
+            let actual = latest_per_table.get(identity).copied().unwrap_or(0);
+            if actual != expectation.table_version {
                 return Err(OmniError::manifest_expected_version_mismatch(
-                    table_key.clone(),
-                    *expected_version,
+                    expectation.table_key.clone(),
+                    expectation.table_version,
                     actual,
                 ));
             }
+        }
+        Ok(())
+    }
+
+    /// Check authority inside the publisher retry loop before pending rows are
+    /// built. The graph head comes from the SAME scan used to build this CAS
+    /// attempt; Lance's native branch identifier is re-read from the ref. Thus a
+    /// row-level-CAS loser with an exact expectation cannot silently re-parent
+    /// on its next attempt.
+    async fn check_publish_precondition(
+        &self,
+        dataset: &Dataset,
+        graph_heads: &HashMap<String, String>,
+        precondition: &PublishPrecondition,
+    ) -> Result<()> {
+        let PublishPrecondition::ExactGraphHead(expected) = precondition else {
+            return Ok(());
+        };
+
+        let expected_branch = expected
+            .branch
+            .as_deref()
+            .filter(|branch| *branch != "main");
+        if expected_branch != self.branch.as_deref() {
+            return Err(OmniError::manifest_internal(format!(
+                "publish graph-head precondition targets branch '{}' but publisher is bound to '{}'",
+                expected_branch.unwrap_or("main"),
+                self.branch.as_deref().unwrap_or("main"),
+            )));
+        }
+
+        let branch_identity_member =
+            format!("branch_identifier:{}", expected_branch.unwrap_or("main"));
+        let expected_branch_identifier = serde_json::to_string(&expected.branch_identifier)
+            .map_err(|e| {
+                OmniError::manifest_internal(format!(
+                    "failed to encode expected Lance branch identifier: {e}"
+                ))
+            })?;
+        let actual_branch_identifier = match dataset.branch_identifier().await {
+            Ok(identifier) => identifier,
+            Err(LanceError::RefNotFound { .. }) => {
+                return Err(OmniError::manifest_read_set_changed(
+                    branch_identity_member,
+                    Some(expected_branch_identifier),
+                    None,
+                ));
+            }
+            Err(err) => return Err(OmniError::Lance(err.to_string())),
+        };
+        if actual_branch_identifier != expected.branch_identifier {
+            let actual = serde_json::to_string(&actual_branch_identifier).map_err(|e| {
+                OmniError::manifest_internal(format!(
+                    "failed to encode current Lance branch identifier: {e}"
+                ))
+            })?;
+            return Err(OmniError::manifest_read_set_changed(
+                branch_identity_member,
+                Some(expected_branch_identifier),
+                Some(actual),
+            ));
+        }
+
+        let object_id = expected.object_id();
+        let branch_key = object_id
+            .strip_prefix("graph_head:")
+            .expect("graph_head_object_id always supplies the prefix");
+        let actual = graph_heads.get(branch_key).cloned();
+        if actual != expected.head_commit_id {
+            return Err(OmniError::manifest_read_set_changed(
+                object_id,
+                expected.head_commit_id.clone(),
+                actual,
+            ));
         }
         Ok(())
     }
@@ -606,14 +953,24 @@ impl GraphNamespacePublisher {
         &self,
         requests: &[CreateTableVersionRequest],
     ) -> Result<Dataset> {
+        let registrations = self.load_publish_state().await?.registered_tables;
         let changes = requests
             .iter()
-            .cloned()
             .map(|request| {
                 let (table_key, table_version, row_count, table_branch, version_metadata) =
-                    parse_namespace_version_request(&request)
+                    parse_namespace_version_request(request)
                         .map_err(|e| OmniError::Lance(e.to_string()))?;
+                let identity = registrations
+                    .values()
+                    .find(|registration| registration.table_key == table_key)
+                    .map(|registration| registration.identity)
+                    .ok_or_else(|| {
+                        OmniError::manifest(format!(
+                            "test namespace request references unknown table alias {table_key}"
+                        ))
+                    })?;
                 Ok(ManifestChange::Update(SubTableUpdate {
+                    identity,
                     table_key,
                     table_version,
                     table_branch,
@@ -638,6 +995,7 @@ fn lineage_part_to_pending(part: GraphLineageRowPart) -> PendingVersionRow {
         location: None,
         metadata: Some(part.metadata),
         table_key: String::new(),
+        identity: None,
         table_version: part.table_version,
         table_branch: part.table_branch,
         row_count: None,
@@ -671,13 +1029,18 @@ pub(crate) fn map_lance_publish_error(err: LanceError) -> OmniError {
 
 #[async_trait]
 impl ManifestBatchPublisher for GraphNamespacePublisher {
-    async fn publish(
+    async fn publish_with_precondition(
         &self,
         changes: &[ManifestChange],
-        expected_table_versions: &HashMap<String, u64>,
+        expected_table_versions: &ExpectedTableVersions,
         lineage: Option<&LineageIntent>,
+        precondition: &PublishPrecondition,
     ) -> Result<PublishOutcome> {
-        if changes.is_empty() && expected_table_versions.is_empty() && lineage.is_none() {
+        if changes.is_empty()
+            && expected_table_versions.is_empty()
+            && lineage.is_none()
+            && matches!(precondition, PublishPrecondition::Any)
+        {
             // Defensive no-op (never reached from `commit_changes_with_lineage`,
             // which short-circuits the all-empty case): state is unchanged, so a
             // re-scan here is acceptable.
@@ -709,14 +1072,26 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
                 existing_versions,
                 existing_tombstones,
                 lineage_rows,
+                graph_heads,
             } = loaded;
 
+            // Exact logical authority is checked on EVERY attempt from this
+            // attempt's single manifest scan. In particular, a CAS retry after
+            // another writer creates or advances `graph_head:<branch>` fails
+            // here instead of transparently re-parenting the prepared intent.
+            self.check_publish_precondition(&dataset, &graph_heads, precondition)
+                .await?;
+
             let latest_per_table =
-                Self::latest_visible_per_table(&existing_versions, &existing_tombstones);
+                Self::latest_visible_per_identity(&existing_versions, &existing_tombstones);
             // Pre-check on every attempt against freshly loaded state so a
             // concurrent commit that broke the caller's expectation is
             // surfaced as `ExpectedVersionMismatch` rather than retried.
-            Self::check_expected_table_versions(&latest_per_table, expected_table_versions)?;
+            Self::check_expected_table_versions(
+                &latest_per_table,
+                &known_tables,
+                expected_table_versions,
+            )?;
 
             let mut rows = Self::build_pending_rows(
                 changes,
@@ -750,11 +1125,13 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
                 // from the loaded maps — no re-scan (RFC-013 PR2 #1b).
                 let known_state = assemble_manifest_state(
                     dataset.version().version,
+                    known_tables,
                     existing_versions.values().cloned().collect(),
                     existing_tombstones
                         .keys()
-                        .map(|(key, version)| (key.clone(), *version)),
-                );
+                        .map(|(identity, version)| (*identity, *version)),
+                    graph_heads,
+                )?;
                 return Ok(PublishOutcome {
                     dataset,
                     parent_commit_id,
@@ -765,16 +1142,38 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
             // Build the post-publish fold inputs from the pre-publish state ∪ the
             // rows we are about to commit, BEFORE `rows` is moved into merge_rows
             // (RFC-013 PR2 #1b). Recomputed per attempt from freshly-loaded state.
-            let (fold_entries, fold_tombstones) =
-                Self::fold_inputs(&existing_versions, &existing_tombstones, &rows, &known_tables)?;
+            let (fold_registrations, fold_entries, fold_tombstones) = Self::fold_inputs(
+                &existing_versions,
+                &existing_tombstones,
+                &rows,
+                &known_tables,
+            )?;
+            let mut fold_graph_heads = graph_heads;
+            if let Some(intent) = lineage {
+                fold_graph_heads.insert(
+                    intent
+                        .branch
+                        .as_deref()
+                        .unwrap_or(MAIN_BRANCH_HEAD_KEY)
+                        .to_string(),
+                    intent.graph_commit_id.clone(),
+                );
+            }
+            // Validate the complete post-batch fold before the physical merge.
+            // In particular, alias collisions must fail without advancing
+            // `__manifest`; discovering one after `merge_rows` would be an
+            // acknowledged-but-unreadable manifest commit.
+            let mut known_state = assemble_manifest_state(
+                dataset.version().version + 1,
+                fold_registrations,
+                fold_entries,
+                fold_tombstones,
+                fold_graph_heads,
+            )?;
 
             match self.merge_rows(dataset, rows).await {
                 Ok(new_dataset) => {
-                    let known_state = assemble_manifest_state(
-                        new_dataset.version().version,
-                        fold_entries,
-                        fold_tombstones,
-                    );
+                    known_state.version = new_dataset.version().version;
                     return Ok(PublishOutcome {
                         dataset: new_dataset,
                         parent_commit_id,

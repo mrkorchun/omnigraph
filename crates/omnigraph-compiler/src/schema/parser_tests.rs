@@ -238,6 +238,163 @@ last: String
 }
 
 #[test]
+fn test_reject_body_unique_containing_blob_property() {
+    for (case, input, property) in [
+        (
+            "node-single",
+            r#"
+node Document {
+payload: Blob
+@unique(payload)
+}
+"#,
+            "Document.payload",
+        ),
+        (
+            "node-composite",
+            r#"
+node Document {
+name: String
+payload: Blob?
+@unique(name, payload)
+}
+"#,
+            "Document.payload",
+        ),
+        (
+            "edge-single",
+            r#"
+node Document { name: String }
+edge Attaches: Document -> Document {
+payload: Blob
+@unique(payload)
+}
+"#,
+            "Attaches.payload",
+        ),
+        (
+            "edge-composite",
+            r#"
+node Document { name: String }
+edge Attaches: Document -> Document {
+payload: Blob?
+@unique(src, payload)
+}
+"#,
+            "Attaches.payload",
+        ),
+    ] {
+        let error = parse_schema_diagnostic(input).expect_err(case);
+        assert_eq!(
+            error.to_string(),
+            format!("parse error: @unique is not supported on blob property {property}"),
+            "{case}"
+        );
+    }
+}
+
+#[test]
+fn test_persisted_contract_parser_allows_only_historical_body_blob_unique() {
+    let historical_node = r#"
+node Document {
+payload: Blob?
+@unique(payload)
+}
+"#;
+    let historical_edge = r#"
+node Document { name: String }
+edge Attaches: Document -> Document {
+payload: Blob?
+@unique(src, payload)
+}
+"#;
+    for historical in [historical_node, historical_edge] {
+        assert!(parse_schema(historical).is_err());
+        assert!(parse_persisted_schema_contract(historical).is_ok());
+    }
+
+    // Property-level Blob annotations were never admitted by the old parser;
+    // the compatibility path must not widen that boundary.
+    let never_admitted = r#"
+node Document {
+payload: Blob? @unique
+}
+"#;
+    let error = parse_persisted_schema_contract(never_admitted).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("@unique is not supported on blob property Document.payload")
+    );
+}
+
+#[test]
+fn test_existing_blob_key_index_and_embed_refusals_remain_pinned() {
+    let cases = [
+        (
+            "node body key",
+            r#"
+node Document {
+payload: Blob
+@key(payload)
+}
+"#,
+            "@key is not supported on blob property Document.payload",
+        ),
+        (
+            "node body index",
+            r#"
+node Document {
+payload: Blob
+@index(payload)
+}
+"#,
+            "@index is not supported on blob property Document.payload",
+        ),
+        (
+            "edge body index",
+            r#"
+node Document { name: String }
+edge Attaches: Document -> Document {
+payload: Blob
+@index(payload)
+}
+"#,
+            "@index is not supported on blob property Attaches.payload",
+        ),
+        (
+            "Blob embed target",
+            r#"
+node Document {
+title: String
+payload: Blob @embed(title)
+}
+"#,
+            "@embed is not supported on blob property Document.payload",
+        ),
+        (
+            "Blob embed source",
+            r#"
+node Document {
+payload: Blob
+embedding: Vector(3) @embed(payload)
+}
+"#,
+            "@embed source property Document.payload must be String",
+        ),
+    ];
+
+    for (case, input, expected) in cases {
+        let error = parse_schema_diagnostic(input).expect_err(case);
+        assert_eq!(
+            error.to_string(),
+            format!("parse error: {expected}"),
+            "{case}"
+        );
+    }
+}
+
+#[test]
 fn test_parse_body_constraint_index_composite() {
     let input = r#"
 node Event {
@@ -614,6 +771,31 @@ edge ConnectedTo: Account -> Account @rename_from("Knows")
             assert_eq!(e.annotations[0].value.as_deref(), Some("Knows"));
         }
         _ => panic!("expected Edge"),
+    }
+}
+
+#[test]
+fn test_reject_malformed_rename_annotations_on_types_and_properties() {
+    for input in [
+        "node Account @rename_from {}",
+        "node Account @rename_from(\"\") {}",
+        "node Account @rename_from(\"User\", \"Member\") {}",
+        "node Account @rename_from(\"User\", typo=\"ignored\") {}",
+        "node Account @rename_from(\"User\") @rename_from(\"Member\") {}",
+        "node Account { name: String @rename_from }",
+        "node Account { name: String @rename_from(\"\") }",
+        "node Account { name: String @rename_from(\"old\", typo=\"ignored\") }",
+        "node Account { name: String @rename_from(\"old\") @rename_from(\"legacy\") }",
+        "node Account {} edge Connected: Account -> Account @rename_from",
+        "node Account {} edge Connected: Account -> Account @rename_from(\"\")",
+        "node Account {} edge Connected: Account -> Account @rename_from(\"Old\", typo=\"ignored\")",
+        "node Account {} edge Connected: Account -> Account @rename_from(\"Old\") @rename_from(\"Legacy\")",
+    ] {
+        let error = parse_schema(input).unwrap_err();
+        assert!(
+            error.to_string().contains("rename_from"),
+            "expected a rename-specific error for {input:?}, got: {error}"
+        );
     }
 }
 
@@ -1012,4 +1194,32 @@ fn test_parse_error_diagnostic_has_span() {
     let input = "node { }";
     let err = parse_schema_diagnostic(input).unwrap_err();
     assert!(err.span.is_some());
+}
+
+#[test]
+fn test_reject_lance_virtual_system_column_property_names() {
+    const RESERVED: [&str; 5] = [
+        "_rowid",
+        "_rowaddr",
+        "_rowoffset",
+        "_row_created_at_version",
+        "_row_last_updated_at_version",
+    ];
+
+    for name in RESERVED {
+        let declarations = [
+            format!("interface I {{ {name}: String }}"),
+            format!("node N {{ {name}: String }}"),
+            format!("node N {{}} edge E: N -> N {{ {name}: String }}"),
+        ];
+        for source in declarations {
+            let error = parse_schema(&source).unwrap_err().to_string();
+            assert!(error.contains("reserved"), "unexpected error: {error}");
+            assert!(error.contains(name), "unexpected error: {error}");
+            assert!(error.contains("exported"), "unexpected error: {error}");
+        }
+    }
+
+    parse_schema("node N { _row_id: String _rowid2: String _ROWID: String }")
+        .expect("only the five exact, case-sensitive Lance names are reserved");
 }

@@ -7,8 +7,18 @@
 > below are historical: the remaining `optimize` / `cleanup` internal-table scope is
 > **`__manifest`-only**, and the per-write `_graph_commits` scan term is gone. See
 > [invariants.md](invariants.md) and [versioning.md](versioning.md).
+>
+> **RFC-028 identity update (2026-07-15):** table-version object IDs and folds now
+> use `(stable_table_id, table_incarnation_id, version)`. Any older passage below
+> that keys a current table lifetime by mutable `table_key` is historical.
+>
+> **RFC-026 disposition (2026-08-06):** the MemWAL/LSM thread mentioned in this
+> record was implemented experimentally and rejected. Current bounded graph
+> batches reuse ordinary commit-visible Load; see [wal-removal.md](wal-removal.md).
 
-**Status:** Proposed
+**Status:** Historical design record (partially implemented); current write and
+identity contracts are [RFC-022](../rfcs/0022-unified-write-path.md) and
+[RFC-028](../rfcs/0028-stable-schema-identity.md).
 **Author(s):** write-path latency investigation (handoff + multi-agent validation)
 **Date:** 2026-06-19
 **Audience:** engine / storage maintainers
@@ -959,7 +969,8 @@ DB-canon review flags three places not to over-claim:
   (`check_expected_table_versions`, `publisher.rs:353`) was prototyped exactly; debug
   confirmed the pins reach the check, **and both writers still committed — the orphan
   persisted.** Every publish writes a *unique per-`object_id` row* into `__manifest`
-  (merge key `object_id = version_object_id(table, version)`). Two disjoint-table
+  (the current merge key derives from stable table ID + incarnation + version;
+  the implementation at the time used `version_object_id(table_key, version)`). Two disjoint-table
   writers (`node:Person` vs `edge:Knows`) touch **no common row**, so Lance's
   row-level merge-insert CAS commits both with **no conflict**, the publisher's retry
   loop **never fires**, and `check_expected_table_versions` — a **non-atomic
@@ -1233,8 +1244,9 @@ performed anyway).
   `iss-overwrite-orphans-committed-edges` (the *sequential* face; fix =
   **inbound-RI validation on node removal**, ships independently, no contention row).
   *(`iss-984` — remote branch-merge idempotency — is unrelated; not a write-skew.)*
-- Blockers: `blk-lance-6658` (shipped 7.0.0), `blk-lance-6666` (open, vector
-  index two-phase), `blk-lance-blob-compaction`.
+- Blockers: `blk-lance-6658` (shipped 7.0.0), `blk-lance-6666` (still relevant
+  to generic multi-segment exact publication, but no longer a blocker for the
+  engine's full-table vector shape), `blk-lance-blob-compaction`.
 - Epics: `epc-bulk-data-plane`, `epc-lance-v7-migration`, `epc-783` (reliability
   harness), `epc-929` (Quint verification).
 
@@ -1387,7 +1399,8 @@ new item (Q6), surfaced by peer review, remains genuinely open.
    two-phase via MR-A / `iss-950` (now unblocked — `blk-lance-6658` shipped); **D2
    retires then** (`enforce_no_mixed_destructive_constructive`,
    `exec/mutation.rs:640-673`). `TableAction::CreateVectorIndex` stays inline until
-   `blk-lance-6666` ships (`iss-848` reconciler path).
+   `iss-848` migrates beta.21's staged full-table shape; `blk-lance-6666` remains
+   relevant only to generic multi-segment exact publication.
 
 **Resolved post-review:**
 

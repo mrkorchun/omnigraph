@@ -64,7 +64,10 @@ fn remote_server_and_cli_end_to_end_flow() {
     let cluster = converged_loaded_cluster(GRAPH_ID, None);
     let server = spawn_server_with_cluster(cluster.path());
     // The served graph's storage root — used for embedded-side cross checks.
-    let served_root = cluster.path().join("graphs").join(format!("{GRAPH_ID}.omni"));
+    let served_root = cluster
+        .path()
+        .join("graphs")
+        .join(format!("{GRAPH_ID}.omni"));
     let temp = tempfile::tempdir().unwrap();
     let mutation_file = temp.path().join("system-remote-change.gq");
     fs::write(
@@ -132,6 +135,10 @@ query insert_person($name: String, $age: I32) {
     assert_eq!(read_payload, local_read);
     assert_eq!(read_payload["row_count"], 1);
     assert_eq!(read_payload["rows"][0]["p.name"], "Alice");
+    assert!(
+        read_payload["graph_commit_id"].as_str().is_some(),
+        "remote CLI reads must use canonical /query and retain its conditional-write token"
+    );
 
     // Served write: no `--as` (the server resolves the actor; here the server
     // is `--unauthenticated`, so the actor is the server default).
@@ -149,6 +156,8 @@ query insert_person($name: String, $age: I32) {
             .arg("--json"),
     ));
     assert_eq!(change_payload["affected_nodes"], 1);
+    assert!(change_payload["commit"]["graph_commit_id"].is_string());
+    assert!(change_payload["commit"]["manifest_version"].is_number());
 
     let query_source = fs::read_to_string(fixture("test.gq")).unwrap();
     let http_read = client
@@ -167,6 +176,10 @@ query insert_person($name: String, $age: I32) {
         .unwrap();
     assert_eq!(http_read["row_count"], 1);
     assert_eq!(http_read["rows"][0]["p.name"], "Mina");
+    assert!(
+        http_read.get("graph_commit_id").is_none(),
+        "deprecated /read must preserve its byte-stable legacy body"
+    );
 
     let local_verify = parse_stdout_json(&output_success(
         cli()
@@ -244,7 +257,10 @@ query insert_person($name: String, $age: I32) {
         }))
         .send()
         .unwrap();
-    assert_eq!(http_query_mutation.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        http_query_mutation.status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
 }
 
 #[test]
@@ -252,7 +268,10 @@ query insert_person($name: String, $age: I32) {
 fn remote_schema_apply_via_cli_updates_graph() {
     let cluster = converged_loaded_cluster(GRAPH_ID, None);
     let server = spawn_server_with_cluster(cluster.path());
-    let served_root = cluster.path().join("graphs").join(format!("{GRAPH_ID}.omni"));
+    let served_root = cluster
+        .path()
+        .join("graphs")
+        .join(format!("{GRAPH_ID}.omni"));
     let temp = tempfile::tempdir().unwrap();
     let next_schema = temp.path().join("next.pg");
     fs::write(
@@ -759,6 +778,8 @@ fn remote_ingest_creates_review_branch_and_keeps_it_readable() {
     assert_eq!(ingest_payload["branch"], "feature-ingest");
     assert_eq!(ingest_payload["base_branch"], "main");
     assert_eq!(ingest_payload["branch_created"], true);
+    assert!(ingest_payload["commit"]["graph_commit_id"].is_string());
+    assert!(ingest_payload["commit"]["manifest_version"].is_number());
     assert_eq!(ingest_payload["mode"], "merge");
     assert_eq!(ingest_payload["tables"][0]["table_key"], "node:Person");
     assert_eq!(ingest_payload["tables"][0]["rows_loaded"], 2);
@@ -854,6 +875,8 @@ fn remote_load_round_trips_and_requires_from_for_new_branches() {
     assert_eq!(payload["base_branch"], "main");
     assert_eq!(payload["branch_created"], true);
     assert_eq!(payload["nodes_loaded"], 1);
+    assert!(payload["commit"]["graph_commit_id"].is_string());
+    assert!(payload["commit"]["manifest_version"].is_number());
 
     let snapshot = parse_stdout_json(&output_success(
         cli()
@@ -1136,7 +1159,11 @@ fn graphs_list_against_multi_graph_server() {
     let cfg_dir = tempfile::tempdir().unwrap();
     let dir = cfg_dir.path();
     fs::copy(fixture("test.pg"), dir.join("alpha.pg")).unwrap();
-    fs::write(dir.join("server.policy.yaml"), GRAPH_LIST_SERVER_POLICY_YAML).unwrap();
+    fs::write(
+        dir.join("server.policy.yaml"),
+        GRAPH_LIST_SERVER_POLICY_YAML,
+    )
+    .unwrap();
     fs::write(
         dir.join("cluster.yaml"),
         "version: 1\nmetadata:\n  name: sys\nstate:\n  backend: cluster\n  lock: true\ngraphs:\n  alpha:\n    schema: ./alpha.pg\npolicies:\n  server:\n    file: ./server.policy.yaml\n    applies_to: [cluster]\n",
@@ -1191,6 +1218,106 @@ fn graphs_list_against_multi_graph_server() {
     assert!(
         stderr.contains("alpha") && stderr.contains("--graph <id>"),
         "expected a candidate-listing error naming alpha; got: {stderr}"
+    );
+
+    drop(server);
+}
+
+/// GitHub #365: a lost `--if-commit` compare-and-swap exits with code 4 and,
+/// under `--json`, emits the structured `precondition_failure` body on
+/// stdout. Guards the CLI's typed-error downcast seam: a wrapped error on
+/// that path degrades exit 4 to the generic 1.
+#[test]
+#[ignore = "requires loopback socket permissions in sandboxed runners"]
+fn mutate_if_commit_lost_cas_exits_4_issue_365() {
+    const FIND_ALICE: &str =
+        "query find($name: String) { match { $p: Person { name: $name } } return { $p.age } }";
+    const ADD_PERSON: &str =
+        "query add($name: String, $age: I32) { insert Person { name: $name, age: $age } }";
+    fn mutate_cmd(base_url: &str, name: &str, if_commit: Option<&str>) -> std::process::Output {
+        let mut cmd = cli();
+        cmd.arg("mutate")
+            .arg("--server")
+            .arg(base_url)
+            .arg("--graph")
+            .arg(GRAPH_ID)
+            .arg("-e")
+            .arg(ADD_PERSON)
+            .arg("--params")
+            .arg(format!(r#"{{"name":"{name}","age":40}}"#))
+            .arg("--json");
+        if let Some(id) = if_commit {
+            cmd.arg("--if-commit").arg(id);
+        }
+        cmd.output().unwrap()
+    }
+
+    let cluster = converged_loaded_cluster(GRAPH_ID, None);
+    let server = spawn_server_with_cluster(cluster.path());
+
+    // The read response itself carries the graph commit id of the snapshot
+    // the rows came from.
+    let read = parse_stdout_json(&output_success(
+        cli()
+            .arg("query")
+            .arg("--server")
+            .arg(&server.base_url)
+            .arg("--graph")
+            .arg(GRAPH_ID)
+            .arg("-e")
+            .arg(FIND_ALICE)
+            .arg("--params")
+            .arg(r#"{"name":"Alice"}"#)
+            .arg("--json"),
+    ));
+    let stale_id = read["graph_commit_id"]
+        .as_str()
+        .expect("read response must carry graph_commit_id")
+        .to_string();
+
+    // Another writer advances the head past the id this caller read.
+    let winner = mutate_cmd(&server.base_url, "CasWinner", None);
+    assert!(
+        winner.status.success(),
+        "plain mutate failed: {}",
+        String::from_utf8_lossy(&winner.stderr)
+    );
+
+    // Lost CAS: exit code 4, structured body on stdout.
+    let lost = mutate_cmd(&server.base_url, "CasLoser", Some(&stale_id));
+    assert_eq!(
+        lost.status.code(),
+        Some(4),
+        "lost --if-commit must exit 4; stderr: {}",
+        String::from_utf8_lossy(&lost.stderr)
+    );
+    let body: serde_json::Value = serde_json::from_slice(&lost.stdout)
+        .expect("--json must emit the structured body on stdout");
+    assert_eq!(body["precondition_failure"]["expected"], json!(stale_id));
+
+    // An id from a fresh read passes with exit 0.
+    let read = parse_stdout_json(&output_success(
+        cli()
+            .arg("query")
+            .arg("--server")
+            .arg(&server.base_url)
+            .arg("--graph")
+            .arg(GRAPH_ID)
+            .arg("-e")
+            .arg(FIND_ALICE)
+            .arg("--params")
+            .arg(r#"{"name":"Alice"}"#)
+            .arg("--json"),
+    ));
+    let fresh_id = read["graph_commit_id"]
+        .as_str()
+        .expect("read response must carry graph_commit_id")
+        .to_string();
+    let won = mutate_cmd(&server.base_url, "CasLoser", Some(&fresh_id));
+    assert!(
+        won.status.success(),
+        "current --if-commit must pass; stderr: {}",
+        String::from_utf8_lossy(&won.stderr)
     );
 
     drop(server);

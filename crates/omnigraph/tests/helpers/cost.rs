@@ -21,7 +21,11 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
+use lance::Dataset;
+use lance::dataset::builder::DatasetBuilder;
 use lance::io::WrappingObjectStore;
+use lance::session::Session;
+use lance_io::object_store::ObjectStoreParams;
 use lance_io::utils::tracking_store::IOTracker;
 use object_store::path::Path;
 use object_store::{
@@ -36,6 +40,185 @@ use omnigraph::instrumentation::{
 use omnigraph::loader::{LoadMode, load_jsonl};
 
 use super::{MUTATION_QUERIES, TEST_DATA, TEST_SCHEMA, init_and_load, mixed_params};
+
+/// Open a Lance dataset with its object-store tracker installed before the
+/// first manifest load. Cost fixtures must use this seam for cold-open evidence;
+/// wrapping an already-open handle misses latest-manifest resolution entirely.
+pub async fn open_tracked_lance_dataset(
+    uri: &str,
+    session: Arc<Session>,
+    tracker: &IOTracker,
+) -> lance::Result<Dataset> {
+    DatasetBuilder::from_uri(uri)
+        .with_session(session)
+        .with_store_params(ObjectStoreParams {
+            object_store_wrapper: Some(Arc::new(tracker.clone())),
+            ..Default::default()
+        })
+        .load()
+        .await
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AttemptOutcome {
+    Pending,
+    Success,
+    NotFound,
+    Error,
+    StreamStarted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectStoreAttempt {
+    pub method: &'static str,
+    pub path: Path,
+    pub outcome: AttemptOutcome,
+}
+
+/// Records object-store read attempts, including failed/NotFound HEADs.
+///
+/// Lance's `IOTracker` intentionally records only successful `get_opts`
+/// results. Recovery classifiers need the attempted exact-key shape too,
+/// because an expected NotFound is part of their proof. This wrapper records
+/// before forwarding and then annotates the outcome.
+#[derive(Debug, Default, Clone)]
+pub struct AttemptTracker(Arc<Mutex<Vec<ObjectStoreAttempt>>>);
+
+impl AttemptTracker {
+    fn begin(&self, method: &'static str, path: Path) -> usize {
+        let mut attempts = self.0.lock().unwrap();
+        let index = attempts.len();
+        attempts.push(ObjectStoreAttempt {
+            method,
+            path,
+            outcome: AttemptOutcome::Pending,
+        });
+        index
+    }
+
+    fn finish<T>(&self, index: usize, result: &OSResult<T>) {
+        let outcome = match result {
+            Ok(_) => AttemptOutcome::Success,
+            Err(object_store::Error::NotFound { .. }) => AttemptOutcome::NotFound,
+            Err(_) => AttemptOutcome::Error,
+        };
+        self.0.lock().unwrap()[index].outcome = outcome;
+    }
+
+    fn record_stream(&self, method: &'static str, path: Path) {
+        self.0.lock().unwrap().push(ObjectStoreAttempt {
+            method,
+            path,
+            outcome: AttemptOutcome::StreamStarted,
+        });
+    }
+
+    pub fn incremental_attempts(&self) -> Vec<ObjectStoreAttempt> {
+        std::mem::take(&mut *self.0.lock().unwrap())
+    }
+}
+
+impl WrappingObjectStore for AttemptTracker {
+    fn wrap(&self, _store_prefix: &str, target: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
+        Arc::new(AttemptTrackingStore {
+            target,
+            tracker: self.clone(),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct AttemptTrackingStore {
+    target: Arc<dyn ObjectStore>,
+    tracker: AttemptTracker,
+}
+
+impl fmt::Display for AttemptTrackingStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "AttemptTrackingStore({})", self.target)
+    }
+}
+
+#[async_trait]
+impl ObjectStore for AttemptTrackingStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> OSResult<PutResult> {
+        self.target.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> OSResult<Box<dyn MultipartUpload>> {
+        self.target.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
+        let method = if options.head { "head" } else { "get_opts" };
+        let index = self.tracker.begin(method, location.clone());
+        let result = self.target.get_opts(location, options).await;
+        self.tracker.finish(index, &result);
+        result
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, OSResult<Path>>,
+    ) -> BoxStream<'static, OSResult<Path>> {
+        self.target.delete_stream(locations)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+        self.tracker
+            .record_stream("list", prefix.cloned().unwrap_or_default());
+        self.target.list(prefix)
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, OSResult<ObjectMeta>> {
+        self.tracker
+            .record_stream("list_with_offset", prefix.cloned().unwrap_or_default());
+        self.target.list_with_offset(prefix, offset)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
+        let index = self
+            .tracker
+            .begin("list_with_delimiter", prefix.cloned().unwrap_or_default());
+        let result = self.target.list_with_delimiter(prefix).await;
+        self.tracker.finish(index, &result);
+        result
+    }
+
+    async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> OSResult<()> {
+        self.target.copy_opts(from, to, options).await
+    }
+}
+
+pub async fn open_attempt_tracked_lance_dataset_at_version(
+    uri: &str,
+    version: u64,
+    session: Arc<Session>,
+    tracker: &AttemptTracker,
+) -> lance::Result<Dataset> {
+    DatasetBuilder::from_uri(uri)
+        .with_version(version)
+        .with_session(session)
+        .with_store_params(ObjectStoreParams {
+            object_store_wrapper: Some(Arc::new(tracker.clone())),
+            ..Default::default()
+        })
+        .load()
+        .await
+}
 
 /// Object-store op counts for one measured operation, by table class — the
 /// vocabulary cost tests assert in (vs raw `IOTracker::stats().read_iops`).
@@ -65,6 +248,10 @@ pub struct IoCounts {
     /// Internal/system-table (`__manifest`) open CALL count — the complement of
     /// `data_open_count` (publisher CAS).
     pub internal_open_count: u64,
+    /// Full `__manifest` row-scan invocation count. Unlike object-store reads,
+    /// this distinguishes one coherent state+lineage scan from two projections
+    /// over the same already-open handle.
+    pub manifest_scan_count: u64,
 }
 
 impl IoCounts {
@@ -78,8 +265,13 @@ impl IoCounts {
 pub struct StagedCounts {
     pub stage_append: u64,
     pub stage_merge_insert: u64,
-    pub create_vector_index: u64,
+    pub stage_fenced_insert: u64,
+    pub stage_known_present_update: u64,
+    pub stage_vector_index: u64,
     pub scan_staged_combined: u64,
+    /// Ordered table cursors opened by branch-merge row selection. A scalar
+    /// three-way merge needs exactly base/source/target once each.
+    pub ordered_cursor_scan: u64,
 }
 
 // ── Path-classifying data-table read counter ──
@@ -202,7 +394,8 @@ impl ObjectStore for PrefixCountingStore {
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
-        self.counter.record_read(&prefix.cloned().unwrap_or_default());
+        self.counter
+            .record_read(&prefix.cloned().unwrap_or_default());
         self.target.list(prefix)
     }
 
@@ -211,12 +404,14 @@ impl ObjectStore for PrefixCountingStore {
         prefix: Option<&Path>,
         offset: &Path,
     ) -> BoxStream<'static, OSResult<ObjectMeta>> {
-        self.counter.record_read(&prefix.cloned().unwrap_or_default());
+        self.counter
+            .record_read(&prefix.cloned().unwrap_or_default());
         self.target.list_with_offset(prefix, offset)
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
-        self.counter.record_read(&prefix.cloned().unwrap_or_default());
+        self.counter
+            .record_read(&prefix.cloned().unwrap_or_default());
         self.target.list_with_delimiter(prefix).await
     }
 
@@ -275,6 +470,24 @@ pub async fn cost_harness<F: Future>(body: F) -> F::Output {
         .await
 }
 
+/// Run a body with persistent raw Lance trackers for the data-table and graph-
+/// manifest stores. This is the shared wiring seam for instruments that need
+/// request-path attribution beyond [`IoCounts`] (for example recovery-object,
+/// table-data, and PK-sidecar terms). The caller owns tracker resets and
+/// classification; probe construction remains centralized here.
+pub async fn with_raw_io_trackers<F: Future>(
+    table: &IOTracker,
+    manifest: &IOTracker,
+    body: F,
+) -> F::Output {
+    let probes = QueryIoProbes {
+        table_wrapper: Some(Arc::new(table.clone()) as Arc<dyn WrappingObjectStore>),
+        manifest_wrapper: Some(Arc::new(manifest.clone()) as Arc<dyn WrappingObjectStore>),
+        ..Default::default()
+    };
+    with_query_io_probes(probes, body).await
+}
+
 /// The tracker handles backing one measurement; read once into [`IoCounts`]. Data,
 /// probe, and open counters are fresh per op; the `__manifest` tracker is the ambient
 /// ground-truth one when inside `cost_harness`, else fresh.
@@ -284,6 +497,7 @@ struct OpProbes {
     probe_count: Arc<AtomicU64>,
     data_open_count: Arc<AtomicU64>,
     internal_open_count: Arc<AtomicU64>,
+    manifest_scan_count: Arc<AtomicU64>,
 }
 
 impl OpProbes {
@@ -302,6 +516,7 @@ impl OpProbes {
             probe_count: Arc::new(AtomicU64::new(0)),
             data_open_count: Arc::new(AtomicU64::new(0)),
             internal_open_count: Arc::new(AtomicU64::new(0)),
+            manifest_scan_count: Arc::new(AtomicU64::new(0)),
         };
         let probes = QueryIoProbes {
             manifest_wrapper: Some(Arc::new(h.manifest.clone()) as Arc<dyn WrappingObjectStore>),
@@ -309,6 +524,7 @@ impl OpProbes {
             probe_count: Arc::clone(&h.probe_count),
             data_open_count: Arc::clone(&h.data_open_count),
             internal_open_count: Arc::clone(&h.internal_open_count),
+            manifest_scan_count: Arc::clone(&h.manifest_scan_count),
             // graph_build_count / graph_edges_built unused by this harness.
             ..Default::default()
         };
@@ -339,6 +555,7 @@ impl OpProbes {
             version_probes: self.probe_count.load(Ordering::Relaxed),
             data_open_count: self.data_open_count.load(Ordering::Relaxed),
             internal_open_count: self.internal_open_count.load(Ordering::Relaxed),
+            manifest_scan_count: self.manifest_scan_count.load(Ordering::Relaxed),
         }
     }
 }
@@ -369,8 +586,11 @@ pub async fn measure_with_staged<F: Future>(op: F) -> (F::Output, IoCounts, Stag
     let staged = StagedCounts {
         stage_append: merge.stage_append_calls(),
         stage_merge_insert: merge.stage_merge_insert_calls(),
-        create_vector_index: merge.create_vector_index_calls(),
+        stage_fenced_insert: merge.stage_fenced_insert_calls(),
+        stage_known_present_update: merge.stage_known_present_update_calls(),
+        stage_vector_index: merge.stage_vector_index_calls(),
         scan_staged_combined: merge.scan_staged_combined_calls(),
+        ordered_cursor_scan: merge.ordered_cursor_scan_calls(),
     };
     (out, handles.counts(), staged)
 }
@@ -458,10 +678,10 @@ pub async fn local_graph(dir: &tempfile::TempDir) -> Omnigraph {
 pub async fn s3_graph(name: &str) -> Option<Omnigraph> {
     let bucket = std::env::var("OMNIGRAPH_S3_TEST_BUCKET").ok()?;
     let uri = format!("s3://{bucket}/cost-tests/{name}-{}", std::process::id());
-    let mut db = Omnigraph::init(&uri, TEST_SCHEMA)
+    let db = Omnigraph::init(&uri, TEST_SCHEMA)
         .await
         .expect("OMNIGRAPH_S3_TEST_BUCKET is set but S3 graph init failed");
-    load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite)
+    load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
         .await
         .expect("OMNIGRAPH_S3_TEST_BUCKET is set but S3 seed load failed");
     Some(db)

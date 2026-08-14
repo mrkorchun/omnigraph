@@ -1,38 +1,25 @@
 //! Storage trait surface — MR-793.
 //!
 //! `TableStorage` is the engine-internal trait that exposes the
-//! staged-write primitives (`stage_append`, `stage_merge_insert`,
-//! `stage_overwrite`, `stage_create_btree_index`,
-//! `stage_create_inverted_index`) plus `commit_staged` as the canonical
-//! way for new engine writers to advance Lance HEAD without coupling
+//! staged-write primitives (`stage_append`, `stage_keyed_write`,
+//! `stage_merge_insert`, `stage_overwrite`, `stage_create_indices`) plus
+//! `commit_staged` as the canonical way for new engine writers to advance
+//! Lance HEAD without coupling
 //! "write bytes" with "advance HEAD" in one Lance API call.
 //!
-//! ## Inline-commit residuals live on a separate trait
-//!
-//! The inline-commit writes that Lance cannot yet express as
-//! stage-then-commit are NOT on `TableStorage`. They sit on
-//! [`InlineCommitResidual`], reachable only via
-//! `Omnigraph::storage_inline_residual()`, so the default `db.storage()`
-//! surface is staged-only and cannot couple "write bytes" with "advance
-//! HEAD" — MR-793 acceptance §1 closes by construction. The sole remaining
-//! residual:
-//!
-//! * `create_vector_index` — segment-commit-path needs
-//!   `build_index_metadata_from_segments`, still `pub(crate)` in Lance
-//!   7.0.0 ([#6666](https://github.com/lance-format/lance/issues/6666),
-//!   open). Scalar indices already stage.
-//!
-//! `delete_where` was the other residual until MR-A: Lance 7.0's
+//! `delete_where` was the final data-write residual until MR-A: Lance 7.0's
 //! `DeleteBuilder::execute_uncommitted` (#6658) made delete a staged write
 //! (`TableStorage::stage_delete` → `commit_staged`), so delete no longer
-//! advances Lance HEAD inline and the residual is gone.
+//! advances Lance HEAD inline. Pinned Lance's public full-table index
+//! `execute_uncommitted` shape now does the same for BTREE, FTS, and vector
+//! index builds. There is no separate inline-commit storage surface left.
 //!
-//! Each is named honestly at its call site; the forbidden-API guard test
-//! catches direct lance::* misuse outside the storage layer.
+//! The forbidden-API guard test catches direct lance::* misuse outside the
+//! storage layer.
 //!
 //! ## Sealed
 //!
-//! Both `TableStorage` and `InlineCommitResidual` are `: sealed::Sealed`.
+//! `TableStorage` is `: sealed::Sealed`.
 //! Only types in this crate can implement them, so a downstream crate
 //! cannot subvert the contract by providing its own impl.
 //!
@@ -49,9 +36,9 @@
 //! Phases 1a / 2 / 4 / 5 / 6 landed in MR-793 PR #70 (trait scaffolding,
 //! staged primitives, migration of `ensure_indices` / `branch_merge` /
 //! `schema_apply` onto the staged surface). Phase 1b (call-site
-//! conversion) and Phase 9 landed in MR-854, which also split the
-//! inline-commit residuals onto `InlineCommitResidual` so `db.storage()`
-//! is staged-only. Phase 7 (recovery reconciler) shipped as MR-847;
+//! conversion) and Phase 9 landed in MR-854, which made `db.storage()`
+//! staged-only. The exact EnsureIndices adapter later retired the final
+//! inline-commit residual. Phase 7 (recovery reconciler) shipped as MR-847;
 //! Phase 8 (index reconciler) is tracked as MR-848.
 
 use std::fmt::Debug;
@@ -60,13 +47,53 @@ use std::sync::Arc;
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
+use datafusion::physical_plan::SendableRecordBatchStream;
 use lance::Dataset;
 use lance::dataset::scanner::{ColumnOrdering, DatasetRecordBatchStream};
+#[cfg(test)]
 use lance::dataset::{WhenMatched, WhenNotMatched};
 
 use crate::db::{Snapshot, SubTableEntry};
-use crate::error::Result;
-use crate::table_store::{StagedWrite, TableState, TableStore};
+use crate::error::{OmniError, Result};
+use crate::table_store::{
+    ExternalBlobPreflight, StagedTransactionIdentity, StagedWrite, TableState, TableStore,
+};
+
+/// One fenced merge chunk is bounded in both rows and materialized Arrow
+/// bytes. The byte ceiling bounds the staging adapter; the row ceiling
+/// prevents pathological tiny-row filter expressions and keeps evidence
+/// repeatable. Callers must also bound parsing/materialization before this
+/// final Arrow-sized check.
+pub(crate) const KEYED_WRITE_MAX_ROWS: usize = 8192;
+pub(crate) const KEYED_WRITE_MAX_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Resource budget for a pending-aware keyed scan that will feed one mutation
+/// table transaction.
+///
+/// `initial_rows` accounts for batches already accumulated on this table;
+/// `initial_bytes` accounts for every table already retained by the graph
+/// mutation. A later `update` allocates another full-row batch before the
+/// end-of-query dedupe, so its matched committed/pending view must fit in the
+/// remaining operation byte budget rather than receiving a fresh 32-MiB
+/// allowance per table. Keeping this value on the sealed storage boundary
+/// makes the bounded streaming scan part of the only production
+/// read-modify-write path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingScanBudget {
+    pub(crate) table_key: String,
+    pub(crate) initial_rows: u64,
+    pub(crate) initial_bytes: u64,
+}
+
+impl PendingScanBudget {
+    pub(crate) fn new(table_key: impl Into<String>, initial_rows: u64, initial_bytes: u64) -> Self {
+        Self {
+            table_key: table_key.into(),
+            initial_rows,
+            initial_bytes,
+        }
+    }
+}
 
 // ─── sealed module ──────────────────────────────────────────────────────────
 
@@ -80,38 +107,146 @@ pub(crate) mod sealed {
     impl Sealed for crate::table_store::TableStore {}
 }
 
+/// One physical index artifact to include in a staged table-level index
+/// transaction.
+///
+/// A non-empty slice of these specs is built against one pinned Lance dataset
+/// version and published by [`TableStorage::stage_create_indices`] as one
+/// transaction. The type deliberately describes only the full-table shapes
+/// OmniGraph owns today; generic prebuilt/multi-segment publication remains
+/// outside this storage contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndexBuildSpec {
+    /// `name: None` keeps Lance's default index name (`{column}_idx`).
+    /// An explicit name is REQUIRED whenever the column already carries an
+    /// index of another kind under the default name: Lance's `replace(true)`
+    /// removes existing indexes BY NAME, so an unnamed second build would
+    /// silently replace the first index instead of coexisting with it
+    /// (pinned by `lance_surface_guards::second_index_on_column_requires_explicit_distinct_name`).
+    BTree {
+        column: String,
+        name: Option<String>,
+    },
+    FullText {
+        column: String,
+    },
+    Vector {
+        column: String,
+    },
+}
+
+/// Logical semantics for an RFC-023 keyed write.
+///
+/// The storage adapter, rather than its callers, maps these modes onto Lance's
+/// merge-insert actions.  This keeps `id` as the only expressible key and
+/// prevents a caller from accidentally weakening strict insert into upsert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyedWriteSemantics {
+    /// Insert every source row and reject an `id` already present at the pinned
+    /// base.  A proven pre-existing match surfaces `OmniError::KeyConflict`.
+    StrictInsert,
+    /// Insert new ids and replace the full row for ids already present.
+    Upsert,
+    /// Replace full rows only for ids already proven present by a coherent
+    /// merge classification. Missing ids are an internal read-set change,
+    /// never inserts.
+    KnownPresentUpdate,
+}
+
+/// One exact chunk admitted to the join-free strict-insert adapter by the
+/// branch-merge provenance proof.
+///
+/// The batch is owned by this opaque capability instead of travelling beside a
+/// reusable zero-sized token. Construction binds it to the current target
+/// version and complete physical schema, so an accidental in-crate reuse
+/// against another table/version cannot reach Lance staging. Downstream users
+/// cannot construct it because the storage trait is sealed and the constructor
+/// remains crate-private; the structural protocol test pins the one production
+/// mint site to the verified branch-merge path.
+#[derive(Debug)]
+pub struct ProvenInsertChunk {
+    table_key: String,
+    batch: RecordBatch,
+    expected_target_version: u64,
+    expected_schema_preorder_ids: Vec<u32>,
+    expected_stable_row_ids: bool,
+    chunk_index: usize,
+}
+
+impl ProvenInsertChunk {
+    pub(crate) fn from_verified_history(
+        target: &SnapshotHandle,
+        table_key: &str,
+        batch: RecordBatch,
+        chunk_index: usize,
+    ) -> Result<Self> {
+        let expected_schema_preorder_ids = target
+            .dataset()
+            .schema()
+            .fields_pre_order()
+            .map(|field| {
+                u32::try_from(field.id).map_err(|_| {
+                    OmniError::manifest_internal(format!(
+                        "proven insert chunk encountered negative field id {}",
+                        field.id
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            table_key: table_key.to_string(),
+            batch,
+            expected_target_version: target.version(),
+            expected_schema_preorder_ids,
+            expected_stable_row_ids: target.uses_stable_row_ids(),
+            chunk_index,
+        })
+    }
+
+    pub(crate) fn into_parts(self) -> (String, RecordBatch, u64, Vec<u32>, bool, usize) {
+        (
+            self.table_key,
+            self.batch,
+            self.expected_target_version,
+            self.expected_schema_preorder_ids,
+            self.expected_stable_row_ids,
+            self.chunk_index,
+        )
+    }
+}
+
 // ─── opaque handles ────────────────────────────────────────────────────────
 
 /// Opaque handle to a snapshot of a single sub-table dataset at a
 /// specific version.
 ///
-/// Engine code never sees `lance::Dataset` directly; it holds
-/// `SnapshotHandle` and passes it back to `TableStorage` methods.
-/// Inside this crate, `pub(crate)` accessors expose the inner
-/// `Arc<Dataset>` to the `TableStorage` impl.
+/// Engine code normally holds `SnapshotHandle` and passes it back to
+/// `TableStorage` methods. The inner field is private. A small set of
+/// `pub(crate)` accessors remains for the trait implementation and explicitly
+/// registered read/maintenance exceptions; `tests/forbidden_apis.rs` pins
+/// every call site by file and count.
 #[derive(Debug, Clone)]
 pub struct SnapshotHandle {
-    pub(crate) inner: Arc<Dataset>,
+    inner: Arc<Dataset>,
 }
 
 impl SnapshotHandle {
-    /// Construct from a Lance dataset. `pub(crate)` — only
-    /// `TableStore` should produce these.
+    /// Construct from a Lance dataset. `pub(crate)` for the storage
+    /// implementation and explicitly registered writer bridges.
     pub(crate) fn new(ds: Dataset) -> Self {
         Self {
             inner: Arc::new(ds),
         }
     }
 
-    /// Borrow the underlying Lance dataset. `pub(crate)` so only the
-    /// `TableStorage` impl in this crate can reach through.
+    /// Borrow the underlying Lance dataset. Calls outside this module are
+    /// enumerated as read-only or maintenance exceptions by the protocol guard.
     pub(crate) fn dataset(&self) -> &Dataset {
         &self.inner
     }
 
-    /// Take ownership of the inner `Arc<Dataset>`. Used by the
-    /// `TableStorage` impl when an op needs to mutate the dataset in
-    /// place (commit a staged write, append, overwrite, …).
+    /// Take ownership of the inner `Arc<Dataset>`. Used by the `TableStorage`
+    /// impl for staged commits and by the registered read-only blob accessor.
     ///
     /// Performance note: callers consume the returned `Arc` via
     /// `Arc::try_unwrap(...).unwrap_or_else(|arc| (*arc).clone())`. The
@@ -126,9 +261,9 @@ impl SnapshotHandle {
     }
 
     /// Take ownership of the inner `Dataset` by unwrapping the `Arc`
-    /// (or cloning if the snapshot is shared). `pub(crate)` — used
-    /// only by the maintenance path (`optimize`, `cleanup`) which
-    /// must hand `&mut Dataset` to Lance compaction / cleanup APIs
+    /// (or cloning if the snapshot is shared). `pub(crate)` — used only by
+    /// Optimize's registered physical-maintenance paths, which must hand
+    /// `&mut Dataset` to Lance compaction APIs
     /// that the `TableStorage` trait does not (and should not)
     /// surface. Engine code that participates in the staged-write
     /// invariant must stay on the trait methods.
@@ -162,7 +297,7 @@ impl SnapshotHandle {
 /// `pub(crate)`.
 #[derive(Debug, Clone)]
 pub struct StagedHandle {
-    pub(crate) inner: StagedWrite,
+    inner: StagedWrite,
 }
 
 impl StagedHandle {
@@ -174,6 +309,62 @@ impl StagedHandle {
     pub(crate) fn into_staged(self) -> StagedWrite {
         self.inner
     }
+
+    /// Lance transaction identity captured when this effect was staged.
+    pub fn transaction_identity(&self) -> StagedTransactionIdentity {
+        self.inner.transaction_identity()
+    }
+
+    /// Remove the exact strict-insert ids before the staged transaction is
+    /// consumed by commit. They are retained only for the fresh-authority
+    /// conflict re-probe; Lance's commit packet does not consume them.
+    pub(crate) fn take_strict_source_ids(&mut self) -> Option<Vec<String>> {
+        self.inner.take_strict_source_ids()
+    }
+
+    /// Replace Lance's random transaction UUID with the identity durably armed
+    /// before a deferred first-touch fork. The read version must still match.
+    pub(crate) fn bind_transaction_identity(
+        &mut self,
+        planned: &StagedTransactionIdentity,
+    ) -> Result<()> {
+        self.inner.bind_transaction_identity(planned)
+    }
+}
+
+/// Result of the no-conflict-retry commit path used by RFC-022-enrolled
+/// writers. `is_exact` checks both transaction identity and achieved version:
+/// Lance's initial conflict-resolution pass can preserve `(read_version, uuid)`
+/// while committing at a later version. The table effect is durable when that
+/// happens, so the caller must leave its recovery sidecar armed.
+#[derive(Debug)]
+pub struct ExactCommitOutcome {
+    snapshot: SnapshotHandle,
+    planned_transaction: StagedTransactionIdentity,
+    committed_transaction: StagedTransactionIdentity,
+}
+
+impl ExactCommitOutcome {
+    pub fn is_exact(&self) -> bool {
+        self.planned_transaction == self.committed_transaction
+            && self.snapshot.version() == self.planned_transaction.read_version + 1
+    }
+
+    pub fn planned_transaction(&self) -> &StagedTransactionIdentity {
+        &self.planned_transaction
+    }
+
+    pub fn committed_transaction(&self) -> &StagedTransactionIdentity {
+        &self.committed_transaction
+    }
+
+    pub fn committed_version(&self) -> u64 {
+        self.snapshot.version()
+    }
+
+    pub fn into_snapshot(self) -> SnapshotHandle {
+        self.snapshot
+    }
 }
 
 /// Helper: clone the inner `StagedWrite` out of each `StagedHandle` and
@@ -183,6 +374,9 @@ impl StagedHandle {
 /// pay a clone cost per element. `StagedWrite::clone` is cheap because
 /// `Transaction`, commit metadata, and `Vec<Fragment>` are shallow-clone
 /// friendly.
+// Staged-write helper retained alongside the sealed storage surface (it
+// adapts `StagedHandle`s for `stage_append`'s `prior_stages`).
+#[allow(dead_code)]
 pub(crate) fn staged_handles_as_writes(handles: &[StagedHandle]) -> Vec<StagedWrite> {
     handles.iter().map(|h| h.inner.clone()).collect()
 }
@@ -215,6 +409,10 @@ pub enum ForkOutcome<D> {
 /// `TableStore` is the only `impl`. The trait is sealed; the inline
 /// Lance APIs are not reachable through trait dispatch. New writers that
 /// might advance Lance HEAD MUST add a staged-shape method here.
+// Sealed storage surface: the trait defines the full staged-write
+// vocabulary, so not every method has a caller. Pinned by name in
+// tests/forbidden_apis.rs — deleting one shrinks the audited gateway.
+#[allow(dead_code)]
 #[async_trait]
 pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
     // ── Snapshot opens (no HEAD advance) ────────────────────────────────
@@ -233,6 +431,14 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         branch: Option<&str>,
     ) -> Result<SnapshotHandle>;
 
+    /// Native identity of the branch backing an already-open snapshot. Used
+    /// by recovery-enrolled first-touch effects to confirm the exact ref they
+    /// created, closing delete/recreate ABA during later recovery.
+    async fn branch_identifier(
+        &self,
+        snapshot: &SnapshotHandle,
+    ) -> Result<lance::dataset::refs::BranchIdentifier>;
+
     async fn fork_branch_from_state(
         &self,
         dataset_uri: &str,
@@ -242,14 +448,13 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         target_branch: &str,
     ) -> Result<ForkOutcome<SnapshotHandle>>;
 
-    async fn delete_branch(&self, dataset_uri: &str, branch: &str) -> Result<()>;
-
-    /// Idempotent variant of `delete_branch` used by the best-effort fork
-    /// reclaim under branch delete (`db/omnigraph.rs::cleanup_deleted_branch_tables`)
-    /// and by the orphan-fork reconciler in `optimize`. Tolerates an
-    /// already-absent branch (both Lance's `RefNotFound` and the local-store
-    /// `NotFound` quirk on a missing `tree/{branch}/` dir). A still-referenced
-    /// branch (`RefConflict`) still surfaces as `OmniError::Lance`.
+    /// Idempotent branch-tree reclaim used by the best-effort fork cleanup
+    /// under branch delete (`db/omnigraph.rs::cleanup_deleted_branch_tables`)
+    /// and by the orphan-fork reconciler in `optimize`. Beta.21 makes an
+    /// already-absent native branch/ref tree a success; OmniGraph additionally
+    /// normalizes a raced `RefNotFound` / `NotFound` from the non-atomic native
+    /// branch-contents delete. A still-referenced branch (`RefConflict`) or live
+    /// physical path-child remains an error.
     async fn force_delete_branch(&self, dataset_uri: &str, branch: &str) -> Result<()>;
 
     /// List the named Lance branches present on the dataset at `dataset_uri`.
@@ -322,6 +527,22 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         projection: Option<&[&str]>,
         filter: Option<&str>,
         key_column: Option<&str>,
+        budget: PendingScanBudget,
+    ) -> Result<Vec<RecordBatch>>;
+
+    /// Full-schema blob-aware sibling of `scan_with_pending` for mutation
+    /// updates. The committed predicate scan retains row ids without projecting
+    /// blobs; only matched rows are then taken and rebuilt as Lance's logical
+    /// blob input arrays before unioning the in-memory pending view. This keeps
+    /// the eventual merge source schema independent of scalar-index state.
+    async fn scan_with_pending_materialized_blobs(
+        &self,
+        snapshot: &SnapshotHandle,
+        pending: &[RecordBatch],
+        pending_schema: Option<SchemaRef>,
+        filter: Option<&str>,
+        key_column: Option<&str>,
+        budget: PendingScanBudget,
     ) -> Result<Vec<RecordBatch>>;
 
     async fn first_row_id_for_filter(
@@ -330,11 +551,73 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         filter: &str,
     ) -> Result<Option<u64>>;
 
+    /// Return one exact source id already present in this manifest-pinned
+    /// table image. RFC-023 uses this after an effect-free substrate conflict
+    /// to distinguish a logical duplicate from unrelated physical movement.
+    async fn first_existing_id(
+        &self,
+        snapshot: &SnapshotHandle,
+        source_ids: &[String],
+    ) -> Result<Option<String>>;
+
     async fn table_state(&self, dataset_uri: &str, snapshot: &SnapshotHandle)
     -> Result<TableState>;
 
+    /// Stage a first-touch dataset creation. This may write unreferenced data
+    /// files, but no Lance manifest/HEAD exists until
+    /// [`Self::commit_staged_create_exact`] succeeds.
+    async fn stage_create(&self, dataset_uri: &str, batch: RecordBatch) -> Result<StagedHandle>;
+
+    /// Atomically create version 1 from a staged read-version-0 transaction.
+    /// Lance conflict retries are disabled so a concurrently-created dataset
+    /// is rejected rather than overwritten.
+    async fn commit_staged_create_exact(
+        &self,
+        dataset_uri: &str,
+        staged: StagedHandle,
+    ) -> Result<ExactCommitOutcome>;
+
     // ── Staged writes (no HEAD advance) ────────────────────────────────
 
+    /// Resolve bounded keyed-source inputs that require pre-stage I/O (today,
+    /// absolute blob URIs) without writing Lance files or advancing HEAD.
+    /// Deferred first-touch writers call this before recovery arm because the
+    /// target ref needed by `stage_keyed_write` does not exist yet.
+    async fn prepare_keyed_write_batch(
+        &self,
+        table_key: &str,
+        batch: RecordBatch,
+    ) -> Result<RecordBatch>;
+
+    /// Authorize and probe the complete operation's distinct external Blob
+    /// sources before any participant writes staged files.
+    async fn preflight_external_blob_uris(&self, uris: &[String]) -> Result<ExternalBlobPreflight>;
+
+    /// Materialize one keyed source batch from an operation-wide preflight
+    /// proof without repeating source HEAD requests.
+    async fn prepare_keyed_write_batch_with_preflight(
+        &self,
+        table_key: &str,
+        batch: RecordBatch,
+        preflight: &ExternalBlobPreflight,
+    ) -> Result<RecordBatch>;
+
+    /// Rewrite retained Overwrite URI cells to the exact normalized targets
+    /// admitted by an operation-wide preflight, without reading payloads.
+    fn prepare_overwrite_blob_references_with_preflight(
+        &self,
+        table_key: &str,
+        batch: RecordBatch,
+        preflight: &ExternalBlobPreflight,
+    ) -> Result<RecordBatch>;
+
+    /// Validate the physical key contract shared by every v6 graph-table
+    /// write batch: exact Utf8 `id`, no nulls, and no duplicate ids within the
+    /// batch. Callers preparing a deferred first-touch or Overwrite plan must
+    /// invoke this before recovery is armed or a native branch ref is created.
+    fn validate_keyed_write_batch(&self, table_key: &str, batch: &RecordBatch) -> Result<()>;
+
+    #[cfg(test)]
     async fn stage_append(
         &self,
         snapshot: &SnapshotHandle,
@@ -344,6 +627,7 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
 
     /// Append `source`'s rows into `snapshot`'s table, streaming so the whole
     /// row set is never materialized in memory (see `TableStore::stage_append_stream`).
+    #[cfg(test)]
     async fn stage_append_stream(
         &self,
         snapshot: &SnapshotHandle,
@@ -351,6 +635,76 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         prior_stages: &[StagedHandle],
     ) -> Result<StagedHandle>;
 
+    /// Stage one RFC-023 fenced keyed write from an in-memory batch.
+    ///
+    /// This production adapter accepts only the graph `id` key and checks that
+    /// the target dataset declares exactly that unenforced primary key.
+    /// Insertion-capable Upsert forces Lance's filter-bearing non-index route;
+    /// known-present update-only staging may use the indexed route because
+    /// `DoNothing` makes insertion structurally unreachable.
+    async fn stage_keyed_write(
+        &self,
+        snapshot: SnapshotHandle,
+        table_key: &str,
+        batch: RecordBatch,
+        semantics: KeyedWriteSemantics,
+    ) -> Result<StagedHandle>;
+
+    /// Stage a provenance-proven strict insert without re-running Lance's
+    /// target merge join or exact target-membership preflight. The caller's
+    /// complete durable absence proof and final target-incarnation/baseline
+    /// gates discharge that repeated lookup. The adapter commits a Lance
+    /// `Update` carrying the inserted-row key filter, so concurrent key
+    /// conflicts remain loud.
+    async fn stage_proven_strict_insert(
+        &self,
+        snapshot: SnapshotHandle,
+        chunk: ProvenInsertChunk,
+    ) -> Result<StagedHandle>;
+
+    /// Test-only streaming-source sibling of [`Self::stage_keyed_write`].
+    ///
+    /// `source` must be a trusted graph dataset with the same exact-id PK
+    /// contract. It is scanned twice: once in bounded id-only batches for
+    /// validation / strict preflight, then through the existing blob-aware
+    /// rewrite stream. Neither ordinary nor blob rows are collected into one
+    /// delta-wide batch.
+    #[cfg(test)]
+    async fn stage_keyed_write_stream(
+        &self,
+        snapshot: SnapshotHandle,
+        table_key: &str,
+        source: &SnapshotHandle,
+        semantics: KeyedWriteSemantics,
+    ) -> Result<StagedHandle>;
+
+    /// Blob-aware full-row stream with an explicit batch ceiling. Branch
+    /// adoption uses this to turn a large all-new delta into an exact recovery
+    /// chain of bounded fenced writes instead of one delta-wide hash join.
+    async fn scan_stream_for_rewrite_bounded(
+        &self,
+        source: &SnapshotHandle,
+        batch_rows: usize,
+        batch_bytes: u64,
+    ) -> Result<SendableRecordBatchStream>;
+
+    /// Stream a provenance-proven pure-insert source interval as bounded
+    /// full-row batches for the existing per-chunk strict keyed writer.
+    /// `source` must be pinned at `end_version`; only rows whose
+    /// `_row_created_at_version` lies in `(begin_version, end_version]` are
+    /// emitted. Blob materialization consumes the caller's operation-wide
+    /// external-source proof, so it never repeats policy checks or HEADs per
+    /// row. This read-only primitive writes no files and advances no HEAD.
+    async fn scan_proven_insert_delta_bounded(
+        &self,
+        source: &SnapshotHandle,
+        table_key: &str,
+        begin_version: u64,
+        end_version: u64,
+        external_preflight: &ExternalBlobPreflight,
+    ) -> Result<SendableRecordBatchStream>;
+
+    #[cfg(test)]
     async fn stage_merge_insert(
         &self,
         snapshot: SnapshotHandle,
@@ -365,6 +719,15 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         snapshot: SnapshotHandle,
         staged: StagedHandle,
     ) -> Result<SnapshotHandle>;
+
+    /// Commit one staged effect with Lance conflict retries disabled and expose
+    /// the transaction identity that actually landed. Legacy callers retain
+    /// `commit_staged`; RFC-022 adapters opt into this method explicitly.
+    async fn commit_staged_exact(
+        &self,
+        snapshot: SnapshotHandle,
+        staged: StagedHandle,
+    ) -> Result<ExactCommitOutcome>;
 
     /// Stage an overwrite (Operation::Overwrite). MR-793 Phase 2.
     async fn stage_overwrite(
@@ -382,28 +745,16 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         filter: &str,
     ) -> Result<Option<StagedHandle>>;
 
-    /// Stage a BTREE scalar index build. MR-793 Phase 2.
-    async fn stage_create_btree_index(
+    /// Stage every requested full-table index in one Lance transaction.
+    /// Building the index files does not advance HEAD; the returned handle is
+    /// committed through `commit_staged` or `commit_staged_exact`.
+    async fn stage_create_indices(
         &self,
         snapshot: &SnapshotHandle,
-        columns: &[&str],
-    ) -> Result<StagedHandle>;
-
-    /// Stage an INVERTED (FTS) scalar index build. MR-793 Phase 2.
-    async fn stage_create_inverted_index(
-        &self,
-        snapshot: &SnapshotHandle,
-        column: &str,
+        specs: &[IndexBuildSpec],
     ) -> Result<StagedHandle>;
 
     // ── Index presence (reads, no HEAD advance) ──────────────────────
-    //
-    // The inline-commit residual (`create_vector_index`) is deliberately NOT
-    // on this trait. It lives on
-    // the separate `InlineCommitResidual` trait, reachable only through
-    // `Omnigraph::storage_inline_residual()`. As a result the default
-    // `db.storage()` surface cannot couple "write bytes" with "advance HEAD"
-    // — closing MR-793 acceptance §1 by construction rather than by review.
 
     async fn has_btree_index(&self, snapshot: &SnapshotHandle, column: &str) -> Result<bool>;
     async fn has_fts_index(&self, snapshot: &SnapshotHandle, column: &str) -> Result<bool>;
@@ -433,33 +784,22 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         order_by: Option<Vec<ColumnOrdering>>,
         with_row_id: bool,
     ) -> Result<DatasetRecordBatchStream>;
-}
 
-// ─── InlineCommitResidual trait ────────────────────────────────────────────
-
-/// Inline-commit residual surface: the writes Lance cannot yet express as a
-/// stage-then-commit pair, so they advance Lance HEAD as a side effect of
-/// writing. Kept OFF `TableStorage` and reachable only through
-/// `Omnigraph::storage_inline_residual()`, so the default `db.storage()` path
-/// is staged-only and a new writer cannot reintroduce the write+commit coupling
-/// by accident (MR-793 acceptance §1, by construction).
-///
-/// Residual reasons (each is named honestly at its call site):
-/// * `create_vector_index` — vector-index segment-commit needs
-///   `build_index_metadata_from_segments`, still `pub(crate)` in Lance 7.0.0
-///   (Lance #6666). Scalar indices already stage.
-///
-/// `delete_where` used to live here, but Lance 7.0's
-/// `DeleteBuilder::execute_uncommitted` (#6658) made delete a staged write
-/// (`TableStorage::stage_delete` → `commit_staged`); it was retired in MR-A so
-/// delete no longer advances Lance HEAD inline.
-#[async_trait]
-pub(crate) trait InlineCommitResidual: sealed::Sealed + Send + Sync + Debug {
-    async fn create_vector_index(
+    /// Streaming sibling with an explicit initial row estimate and approximate
+    /// decoded-byte target. Lance's byte target overrides the row setting;
+    /// neither setting is a hard limit, and Lance may emit a larger batch.
+    /// Callers with a retained
+    /// resource budget must charge the actual emitted batch before keeping it.
+    async fn scan_stream_bounded(
         &self,
-        snapshot: SnapshotHandle,
-        column: &str,
-    ) -> Result<SnapshotHandle>;
+        snapshot: &SnapshotHandle,
+        projection: Option<&[&str]>,
+        filter: Option<&str>,
+        order_by: Option<Vec<ColumnOrdering>>,
+        with_row_id: bool,
+        batch_rows: usize,
+        batch_bytes: u64,
+    ) -> Result<DatasetRecordBatchStream>;
 }
 
 // ─── single impl: TableStore ──────────────────────────────────────────────
@@ -490,6 +830,17 @@ impl TableStorage for TableStore {
             .map(SnapshotHandle::new)
     }
 
+    async fn branch_identifier(
+        &self,
+        snapshot: &SnapshotHandle,
+    ) -> Result<lance::dataset::refs::BranchIdentifier> {
+        snapshot
+            .dataset()
+            .branch_identifier()
+            .await
+            .map_err(|error| OmniError::Lance(error.to_string()))
+    }
+
     async fn fork_branch_from_state(
         &self,
         dataset_uri: &str,
@@ -513,10 +864,6 @@ impl TableStorage for TableStore {
                 ForkOutcome::RefAlreadyExists => ForkOutcome::RefAlreadyExists,
             },
         )
-    }
-
-    async fn delete_branch(&self, dataset_uri: &str, branch: &str) -> Result<()> {
-        TableStore::delete_branch(self, dataset_uri, branch).await
     }
 
     async fn force_delete_branch(&self, dataset_uri: &str, branch: &str) -> Result<()> {
@@ -623,6 +970,7 @@ impl TableStorage for TableStore {
         projection: Option<&[&str]>,
         filter: Option<&str>,
         key_column: Option<&str>,
+        budget: PendingScanBudget,
     ) -> Result<Vec<RecordBatch>> {
         TableStore::scan_with_pending(
             self,
@@ -632,6 +980,28 @@ impl TableStorage for TableStore {
             projection,
             filter,
             key_column,
+            budget,
+        )
+        .await
+    }
+
+    async fn scan_with_pending_materialized_blobs(
+        &self,
+        snapshot: &SnapshotHandle,
+        pending: &[RecordBatch],
+        pending_schema: Option<SchemaRef>,
+        filter: Option<&str>,
+        key_column: Option<&str>,
+        budget: PendingScanBudget,
+    ) -> Result<Vec<RecordBatch>> {
+        TableStore::scan_with_pending_materialized_blobs(
+            self,
+            snapshot.dataset(),
+            pending,
+            pending_schema,
+            filter,
+            key_column,
+            budget,
         )
         .await
     }
@@ -644,6 +1014,14 @@ impl TableStorage for TableStore {
         TableStore::first_row_id_for_filter(self, snapshot.dataset(), filter).await
     }
 
+    async fn first_existing_id(
+        &self,
+        snapshot: &SnapshotHandle,
+        source_ids: &[String],
+    ) -> Result<Option<String>> {
+        TableStore::first_existing_id(snapshot.dataset(), source_ids).await
+    }
+
     async fn table_state(
         &self,
         dataset_uri: &str,
@@ -652,6 +1030,65 @@ impl TableStorage for TableStore {
         TableStore::table_state(self, dataset_uri, snapshot.dataset()).await
     }
 
+    async fn stage_create(&self, dataset_uri: &str, batch: RecordBatch) -> Result<StagedHandle> {
+        TableStore::stage_create(self, dataset_uri, batch)
+            .await
+            .map(StagedHandle::new)
+    }
+
+    async fn commit_staged_create_exact(
+        &self,
+        dataset_uri: &str,
+        staged: StagedHandle,
+    ) -> Result<ExactCommitOutcome> {
+        let planned_transaction = staged.transaction_identity();
+        let (dataset, committed_transaction) =
+            TableStore::commit_staged_create_exact(self, dataset_uri, staged.into_staged()).await?;
+        Ok(ExactCommitOutcome {
+            snapshot: SnapshotHandle::new(dataset),
+            planned_transaction,
+            committed_transaction,
+        })
+    }
+
+    async fn prepare_keyed_write_batch(
+        &self,
+        table_key: &str,
+        batch: RecordBatch,
+    ) -> Result<RecordBatch> {
+        TableStore::prepare_keyed_write_batch(self, table_key, batch).await
+    }
+
+    async fn preflight_external_blob_uris(&self, uris: &[String]) -> Result<ExternalBlobPreflight> {
+        TableStore::preflight_external_blob_uris(self, uris).await
+    }
+
+    async fn prepare_keyed_write_batch_with_preflight(
+        &self,
+        table_key: &str,
+        batch: RecordBatch,
+        preflight: &ExternalBlobPreflight,
+    ) -> Result<RecordBatch> {
+        TableStore::prepare_keyed_write_batch_with_preflight(self, table_key, batch, preflight)
+            .await
+    }
+
+    fn prepare_overwrite_blob_references_with_preflight(
+        &self,
+        table_key: &str,
+        batch: RecordBatch,
+        preflight: &ExternalBlobPreflight,
+    ) -> Result<RecordBatch> {
+        TableStore::prepare_overwrite_blob_references_with_preflight(
+            self, table_key, batch, preflight,
+        )
+    }
+
+    fn validate_keyed_write_batch(&self, table_key: &str, batch: &RecordBatch) -> Result<()> {
+        TableStore::validate_keyed_write_batch(self, table_key, batch)
+    }
+
+    #[cfg(test)]
     async fn stage_append(
         &self,
         snapshot: &SnapshotHandle,
@@ -664,6 +1101,7 @@ impl TableStorage for TableStore {
             .map(StagedHandle::new)
     }
 
+    #[cfg(test)]
     async fn stage_append_stream(
         &self,
         snapshot: &SnapshotHandle,
@@ -676,6 +1114,74 @@ impl TableStorage for TableStore {
             .map(StagedHandle::new)
     }
 
+    async fn stage_keyed_write(
+        &self,
+        snapshot: SnapshotHandle,
+        table_key: &str,
+        batch: RecordBatch,
+        semantics: KeyedWriteSemantics,
+    ) -> Result<StagedHandle> {
+        let ds = Arc::try_unwrap(snapshot.into_arc()).unwrap_or_else(|arc| (*arc).clone());
+        TableStore::stage_keyed_write(self, ds, table_key, batch, semantics)
+            .await
+            .map(StagedHandle::new)
+    }
+
+    async fn stage_proven_strict_insert(
+        &self,
+        snapshot: SnapshotHandle,
+        chunk: ProvenInsertChunk,
+    ) -> Result<StagedHandle> {
+        let ds = Arc::try_unwrap(snapshot.into_arc()).unwrap_or_else(|arc| (*arc).clone());
+        TableStore::stage_proven_strict_insert(self, ds, chunk)
+            .await
+            .map(StagedHandle::new)
+    }
+
+    #[cfg(test)]
+    async fn stage_keyed_write_stream(
+        &self,
+        snapshot: SnapshotHandle,
+        table_key: &str,
+        source: &SnapshotHandle,
+        semantics: KeyedWriteSemantics,
+    ) -> Result<StagedHandle> {
+        let ds = Arc::try_unwrap(snapshot.into_arc()).unwrap_or_else(|arc| (*arc).clone());
+        TableStore::stage_keyed_write_stream(self, ds, table_key, source.dataset(), semantics)
+            .await
+            .map(StagedHandle::new)
+    }
+
+    async fn scan_stream_for_rewrite_bounded(
+        &self,
+        source: &SnapshotHandle,
+        batch_rows: usize,
+        batch_bytes: u64,
+    ) -> Result<SendableRecordBatchStream> {
+        TableStore::scan_stream_for_rewrite_bounded(self, source.dataset(), batch_rows, batch_bytes)
+            .await
+    }
+
+    async fn scan_proven_insert_delta_bounded(
+        &self,
+        source: &SnapshotHandle,
+        table_key: &str,
+        begin_version: u64,
+        end_version: u64,
+        external_preflight: &ExternalBlobPreflight,
+    ) -> Result<SendableRecordBatchStream> {
+        TableStore::scan_proven_insert_delta_bounded(
+            self,
+            source.dataset(),
+            table_key,
+            begin_version,
+            end_version,
+            external_preflight,
+        )
+        .await
+    }
+
+    #[cfg(test)]
     async fn stage_merge_insert(
         &self,
         snapshot: SnapshotHandle,
@@ -701,6 +1207,22 @@ impl TableStorage for TableStore {
             .map(SnapshotHandle::new)
     }
 
+    async fn commit_staged_exact(
+        &self,
+        snapshot: SnapshotHandle,
+        staged: StagedHandle,
+    ) -> Result<ExactCommitOutcome> {
+        let planned_transaction = staged.transaction_identity();
+        let ds_arc = snapshot.into_arc();
+        let (dataset, committed_transaction) =
+            TableStore::commit_staged_exact(self, ds_arc, staged.into_staged()).await?;
+        Ok(ExactCommitOutcome {
+            snapshot: SnapshotHandle::new(dataset),
+            planned_transaction,
+            committed_transaction,
+        })
+    }
+
     async fn stage_overwrite(
         &self,
         snapshot: &SnapshotHandle,
@@ -721,22 +1243,12 @@ impl TableStorage for TableStore {
             .map(StagedHandle::new))
     }
 
-    async fn stage_create_btree_index(
+    async fn stage_create_indices(
         &self,
         snapshot: &SnapshotHandle,
-        columns: &[&str],
+        specs: &[IndexBuildSpec],
     ) -> Result<StagedHandle> {
-        TableStore::stage_create_btree_index(self, snapshot.dataset(), columns)
-            .await
-            .map(StagedHandle::new)
-    }
-
-    async fn stage_create_inverted_index(
-        &self,
-        snapshot: &SnapshotHandle,
-        column: &str,
-    ) -> Result<StagedHandle> {
-        TableStore::stage_create_inverted_index(self, snapshot.dataset(), column)
+        TableStore::stage_create_indices(self, snapshot.dataset(), specs)
             .await
             .map(StagedHandle::new)
     }
@@ -781,17 +1293,26 @@ impl TableStorage for TableStore {
         )
         .await
     }
-}
 
-#[async_trait]
-impl InlineCommitResidual for TableStore {
-    async fn create_vector_index(
+    async fn scan_stream_bounded(
         &self,
-        snapshot: SnapshotHandle,
-        column: &str,
-    ) -> Result<SnapshotHandle> {
-        let mut ds = Arc::try_unwrap(snapshot.into_arc()).unwrap_or_else(|arc| (*arc).clone());
-        TableStore::create_vector_index(self, &mut ds, column).await?;
-        Ok(SnapshotHandle::new(ds))
+        snapshot: &SnapshotHandle,
+        projection: Option<&[&str]>,
+        filter: Option<&str>,
+        order_by: Option<Vec<ColumnOrdering>>,
+        with_row_id: bool,
+        batch_rows: usize,
+        batch_bytes: u64,
+    ) -> Result<DatasetRecordBatchStream> {
+        TableStore::scan_stream_bounded(
+            snapshot.dataset(),
+            projection,
+            filter,
+            order_by,
+            with_row_id,
+            batch_rows,
+            batch_bytes,
+        )
+        .await
     }
 }

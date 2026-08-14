@@ -1,13 +1,17 @@
-//! Tests for the direct-publish write path: mutations and loads write
-//! directly to target tables and commit once via the publisher's
-//! `expected_table_versions` CAS. (History: this replaced the removed Run
-//! state machine / `__run__` staging branches / RunRecord — MR-771.)
+//! Tests for the direct-publish write path. Mutations and loads capture one
+//! branch-wide authority token, prepare exact per-table transactions, then
+//! acquire the root-shared schema → branch → sorted-table gates, revalidate,
+//! arm identity-bearing recovery-v9, commit the table effects, and publish once
+//! under the same exact-head/table precondition. (History: this replaced the
+//! removed Run state machine / `__run__` staging branches / RunRecord — MR-771.)
 //!
 //! What this file covers:
 //! - No `__run__*` branches are created by load or mutate.
 //! - Cancellation of a mutation future leaves no graph-level state.
-//! - Concurrent non-strict inserts/merges rebase under the per-table queue;
-//!   strict updates/deletes surface `ExpectedVersionMismatch` on stale state.
+//! - A pre-effect branch-authority change makes an upsert mutation/load discard
+//!   and fully reprepare with a bounded retry; strict insert conflicts return
+//!   `KeyConflict`, while Update/Delete/Overwrite authority movement surfaces
+//!   `ReadSetChanged`. Post-effect failures require recovery.
 //! - Failed mutations and loads leave the target unchanged.
 //! - Multi-statement mutations are atomic (one commit per query).
 //! - actor_id propagates through to the commit graph.
@@ -20,6 +24,7 @@ use omnigraph::db::commit_graph::CommitGraph;
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::OmniError;
 use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::{ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy};
 
 use helpers::*;
 
@@ -29,9 +34,9 @@ use helpers::*;
 async fn load_does_not_create_run_branch() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
 
-    load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite)
+    load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
 
@@ -59,7 +64,7 @@ async fn load_does_not_create_run_branch() {
 async fn mutation_does_not_create_run_branch() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     let result = db
         .mutate(
@@ -84,7 +89,7 @@ async fn mutation_does_not_create_run_branch() {
 #[tokio::test]
 async fn failed_mutation_leaves_target_unchanged() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     let err = db
         .mutate(
@@ -121,7 +126,7 @@ async fn failed_mutation_leaves_target_unchanged() {
 #[tokio::test]
 async fn multi_statement_mutation_is_atomic_with_read_your_writes() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     let result = db
         .mutate(
@@ -175,7 +180,7 @@ async fn multi_statement_mutation_is_atomic_with_read_your_writes() {
 #[tokio::test]
 async fn partial_failure_leaves_target_queryable_and_unblocks_next_mutation() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     // Op-1 stages a Person 'Eve' insert. Op-2 attempts an edge to
     // 'Missing' — fails at validate_edge_insert_endpoints because
@@ -242,17 +247,18 @@ async fn partial_failure_leaves_target_queryable_and_unblocks_next_mutation() {
     assert_eq!(frank.num_rows(), 1, "Frank must be visible after publish");
 }
 
-/// Stale non-strict writers rebase to the live manifest pin under the
-/// per-table queue instead of folding raw drift or returning a false 409.
-/// Strict update/delete semantics are covered by the consistency/server tests.
+/// Stale non-strict writers discard and reprepare their whole logical attempt
+/// from the live branch authority instead of rebasing an already-validated
+/// staged transaction or returning a false 409. Strict update/delete semantics
+/// are covered by the consistency/server tests.
 #[tokio::test]
-async fn stale_non_strict_insert_rebases_to_live_manifest_pin() {
+async fn stale_non_strict_insert_reprepares_from_live_branch_state() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_string_lossy().into_owned();
 
     {
-        let mut db = Omnigraph::init(&uri, TEST_SCHEMA).await.unwrap();
-        load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite)
+        let db = Omnigraph::init(&uri, TEST_SCHEMA).await.unwrap();
+        load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
             .await
             .unwrap();
     }
@@ -264,7 +270,7 @@ async fn stale_non_strict_insert_rebases_to_live_manifest_pin() {
 
     // Writer A advances the manifest by inserting a new Person.
     {
-        let mut db_a = Omnigraph::open(&uri).await.unwrap();
+        let db_a = Omnigraph::open(&uri).await.unwrap();
         db_a.mutate(
             "main",
             MUTATION_QUERIES,
@@ -276,9 +282,10 @@ async fn stale_non_strict_insert_rebases_to_live_manifest_pin() {
     }
 
     // Writer B's coordinator is still at the pre-A snapshot, but Insert is
-    // non-strict: commit_all re-reads the live manifest pin under the queue,
-    // verifies Lance HEAD equals that pin, and then lets Lance rebase the
-    // staged append.
+    // retryable: the RFC-022 adapter notices the authority change under the
+    // branch gate, discards B's prepared/staged attempt, and reruns the full
+    // operation from A's committed state. Lance never rebases a plan whose
+    // validation inputs are stale.
     db_b.mutate(
         "main",
         MUTATION_QUERIES,
@@ -321,8 +328,8 @@ async fn cancelled_mutation_future_leaves_no_state() {
     let uri = dir.path().to_string_lossy().into_owned();
 
     {
-        let mut db = Omnigraph::init(&uri, TEST_SCHEMA).await.unwrap();
-        load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite)
+        let db = Omnigraph::init(&uri, TEST_SCHEMA).await.unwrap();
+        load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
             .await
             .unwrap();
     }
@@ -334,7 +341,7 @@ async fn cancelled_mutation_future_leaves_no_state() {
 
     let uri_handle = uri.clone();
     let handle = tokio::spawn(async move {
-        let mut db = Omnigraph::open(&uri_handle).await.unwrap();
+        let db = Omnigraph::open(&uri_handle).await.unwrap();
         db.mutate(
             "main",
             MUTATION_QUERIES,
@@ -381,7 +388,7 @@ async fn cancelled_mutation_future_leaves_no_state() {
 async fn mutation_actor_id_lands_in_commit_graph() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     db.mutate_as(
         "main",
@@ -410,16 +417,14 @@ async fn mutation_actor_id_lands_in_commit_graph() {
 async fn repeated_loads_do_not_accumulate_branches() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
 
     for i in 0..10 {
         let payload = format!(
             r#"{{"type":"Person","data":{{"name":"p{}","age":{}}}}}"#,
             i, i
         );
-        load_jsonl(&mut db, &payload, LoadMode::Append)
-            .await
-            .unwrap();
+        load_jsonl(&db, &payload, LoadMode::Append).await.unwrap();
     }
 
     assert_eq!(db.branch_list().await.unwrap(), vec!["main".to_string()]);
@@ -432,7 +437,7 @@ async fn repeated_loads_do_not_accumulate_branches() {
 #[tokio::test]
 async fn public_branch_apis_reject_internal_system_refs() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     // `__run__*` is no longer reserved — creating it now succeeds.
     db.branch_create("__run__formerly_reserved")
@@ -515,13 +520,297 @@ query update_age_by_name($name: String, $age: I32) {
 }
 "#;
 
+fn bulk_insert_mutation(rows: usize) -> String {
+    let mut query = String::with_capacity(rows * 48);
+    query.push_str("query bulk_insert() {\n");
+    for row in 0..rows {
+        query.push_str(&format!("    insert Thing {{ key: \"mutation-{row}\" }}\n"));
+    }
+    query.push_str("}\n");
+    query
+}
+
+fn bulk_update_fixture(rows: usize) -> String {
+    let mut data = String::with_capacity(rows * 64);
+    for row in 0..rows {
+        data.push_str(&format!(
+            "{{\"type\":\"Thing\",\"data\":{{\"key\":\"update-{row}\"}}}}\n"
+        ));
+    }
+    data
+}
+
+/// Mutation staging shares the same inclusive 8,192-row keyed-write cap as
+/// bulk load. The rejected one-over query must remain entirely pre-effect: no
+/// recovery sidecar, table version, manifest version, or row may move.
+#[tokio::test]
+async fn mutation_keyed_write_row_cap_accepts_limit_and_rejects_one_over_pre_effect() {
+    const LIMIT: usize = 8192;
+    const SCHEMA: &str = "node Thing { key: String @key }\n";
+
+    let exact_dir = tempfile::tempdir().unwrap();
+    let exact = Omnigraph::init(exact_dir.path().to_str().unwrap(), SCHEMA)
+        .await
+        .unwrap();
+    let exact_result = exact
+        .mutate(
+            "main",
+            &bulk_insert_mutation(LIMIT),
+            "bulk_insert",
+            &params(&[]),
+        )
+        .await
+        .expect("the exact mutation keyed-row limit is inclusive");
+    assert_eq!(exact_result.affected_nodes, LIMIT);
+    assert_eq!(count_rows(&exact, "node:Thing").await, LIMIT);
+
+    let over_dir = tempfile::tempdir().unwrap();
+    let over = Omnigraph::init(over_dir.path().to_str().unwrap(), SCHEMA)
+        .await
+        .unwrap();
+    let before = snapshot_main(&over).await.unwrap();
+    let before_manifest = before.version();
+    let entry = before.entry("node:Thing").unwrap();
+    let before_table = entry.table_version;
+    let table_uri = format!(
+        "{}/{}",
+        over.uri().trim_end_matches('/'),
+        entry.table_path.trim_start_matches('/')
+    );
+    let before_head = Dataset::open(&table_uri).await.unwrap().version().version;
+    let error = over
+        .mutate(
+            "main",
+            &bulk_insert_mutation(LIMIT + 1),
+            "bulk_insert",
+            &params(&[]),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            OmniError::ResourceLimitExceeded {
+                ref resource,
+                limit: 8192,
+                actual: 8193,
+            } if resource == "keyed rows for node:Thing"
+        ),
+        "one-over mutation must return the typed keyed-row limit, got {error:?}"
+    );
+    let after = snapshot_main(&over).await.unwrap();
+    assert_eq!(after.version(), before_manifest);
+    assert_eq!(
+        after.entry("node:Thing").unwrap().table_version,
+        before_table
+    );
+    assert_eq!(
+        Dataset::open(&table_uri).await.unwrap().version().version,
+        before_head,
+        "one-over mutation must fail before a Lance table effect"
+    );
+    assert_eq!(count_rows(&over, "node:Thing").await, 0);
+    let recovery_dir = over_dir.path().join("__recovery");
+    assert!(
+        !recovery_dir.exists() || std::fs::read_dir(recovery_dir).unwrap().next().is_none(),
+        "one-over mutation must fail before writing a recovery sidecar"
+    );
+}
+
+/// Update predicate matching is itself a bounded allocation. The committed
+/// side must stream and charge rows before it is retained/concatenated, rather
+/// than first collecting an arbitrarily wide match set and relying on the
+/// later staging guard.
+#[tokio::test]
+async fn mutation_update_row_cap_accepts_limit_and_rejects_one_over_pre_effect() {
+    const LIMIT: usize = 8192;
+    const SCHEMA: &str = "node Thing { key: String @key marked: Bool? }\n";
+    const UPDATE_ALL: &str = r#"
+query update_all() {
+    update Thing set { marked: true } where key != ""
+}
+"#;
+
+    let exact_dir = tempfile::tempdir().unwrap();
+    let exact = Omnigraph::init(exact_dir.path().to_str().unwrap(), SCHEMA)
+        .await
+        .unwrap();
+    load_jsonl(&exact, &bulk_update_fixture(LIMIT), LoadMode::Overwrite)
+        .await
+        .unwrap();
+    let exact_result = exact
+        .mutate("main", UPDATE_ALL, "update_all", &params(&[]))
+        .await
+        .expect("the exact mutation update-row limit is inclusive");
+    assert_eq!(exact_result.affected_nodes, LIMIT);
+    assert_eq!(count_rows(&exact, "node:Thing").await, LIMIT);
+
+    let over_dir = tempfile::tempdir().unwrap();
+    let over = Omnigraph::init(over_dir.path().to_str().unwrap(), SCHEMA)
+        .await
+        .unwrap();
+    load_jsonl(&over, &bulk_update_fixture(LIMIT + 1), LoadMode::Overwrite)
+        .await
+        .unwrap();
+    let before = snapshot_main(&over).await.unwrap();
+    let before_manifest = before.version();
+    let entry = before.entry("node:Thing").unwrap();
+    let before_table = entry.table_version;
+    let table_uri = format!(
+        "{}/{}",
+        over.uri().trim_end_matches('/'),
+        entry.table_path.trim_start_matches('/')
+    );
+    let before_head = Dataset::open(&table_uri).await.unwrap().version().version;
+
+    let error = over
+        .mutate("main", UPDATE_ALL, "update_all", &params(&[]))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            OmniError::ResourceLimitExceeded {
+                ref resource,
+                limit: 8192,
+                actual: 8193,
+            } if resource == "keyed rows for node:Thing"
+        ),
+        "one-over update must return the typed keyed-row limit, got {error:?}"
+    );
+    let after = snapshot_main(&over).await.unwrap();
+    assert_eq!(after.version(), before_manifest);
+    assert_eq!(
+        after.entry("node:Thing").unwrap().table_version,
+        before_table
+    );
+    assert_eq!(
+        Dataset::open(&table_uri).await.unwrap().version().version,
+        before_head,
+        "one-over update must fail before a Lance table effect"
+    );
+    assert_eq!(count_rows(&over, "node:Thing").await, LIMIT + 1);
+    let recovery_dir = over_dir.path().join("__recovery");
+    assert!(
+        !recovery_dir.exists() || std::fs::read_dir(recovery_dir).unwrap().next().is_none(),
+        "one-over update must fail before writing a recovery sidecar"
+    );
+}
+
+/// Blob descriptors do not represent their payload allocation. An update must
+/// consult `BlobFile::size()` against its remaining byte budget before calling
+/// `BlobFile::read`; the scoped payload-read probe makes this a structural
+/// assertion rather than inferring it from the eventual error.
+#[tokio::test]
+async fn mutation_update_rejects_oversized_blob_before_payload_read_pre_effect() {
+    const LIMIT: u64 = 32 * 1024 * 1024;
+    const SCHEMA: &str = r#"
+node Document {
+    title: String @key
+    content: Blob?
+    note: String?
+}
+"#;
+    const UPDATE: &str = r#"
+query update_note($note: String) {
+    update Document set { note: $note } where title = "wide"
+}
+"#;
+
+    let dir = tempfile::tempdir().unwrap();
+    let external_path = dir.path().join("wide.blob");
+    let file = std::fs::File::create(&external_path).unwrap();
+    file.set_len(LIMIT + 1).unwrap();
+    drop(file);
+    let external_uri = format!("file://{}", external_path.display());
+    let external_policy = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(
+            url::Url::from_directory_path(dir.path()).expect("external blob base is absolute"),
+            ExternalBlobExecutionScope::EmbeddedOnly,
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+
+    let graph_path = dir.path().join("graph");
+    let db = Omnigraph::init(graph_path.to_str().unwrap(), SCHEMA)
+        .await
+        .unwrap()
+        .with_external_blob_policy(external_policy)
+        .unwrap();
+    let row = serde_json::json!({
+        "type": "Document",
+        "data": {
+            "title": "wide",
+            "content": external_uri,
+        }
+    })
+    .to_string();
+    load_jsonl(&db, &row, LoadMode::Overwrite).await.unwrap();
+    let before = snapshot_main(&db).await.unwrap();
+    let before_manifest = before.version();
+    let entry = before.entry("node:Document").unwrap();
+    let before_table = entry.table_version;
+    let table_uri = format!(
+        "{}/{}",
+        db.uri().trim_end_matches('/'),
+        entry.table_path.trim_start_matches('/')
+    );
+    let before_head = Dataset::open(&table_uri).await.unwrap().version().version;
+
+    let probes = omnigraph::instrumentation::MergeWriteProbes::default();
+    let error = omnigraph::instrumentation::with_merge_write_probes(
+        probes.clone(),
+        db.mutate(
+            "main",
+            UPDATE,
+            "update_note",
+            &params(&[("$note", "bounded")]),
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            OmniError::ResourceLimitExceeded {
+                ref resource,
+                limit: LIMIT,
+                actual,
+            } if resource == "keyed bytes for node:Document" && actual > LIMIT
+        ),
+        "oversized update blob must be rejected before payload read, got {error:?}"
+    );
+    assert_eq!(
+        probes.blob_payload_read_calls(),
+        0,
+        "BlobFile::size must reject the update before BlobFile::read"
+    );
+    let after = snapshot_main(&db).await.unwrap();
+    assert_eq!(after.version(), before_manifest);
+    assert_eq!(
+        after.entry("node:Document").unwrap().table_version,
+        before_table
+    );
+    assert_eq!(
+        Dataset::open(&table_uri).await.unwrap().version().version,
+        before_head,
+        "oversized update must fail before a Lance table effect"
+    );
+    let recovery_dir = graph_path.join("__recovery");
+    assert!(
+        !recovery_dir.exists() || std::fs::read_dir(recovery_dir).unwrap().next().is_none(),
+        "oversized update must fail before writing a recovery sidecar"
+    );
+}
+
 /// D₂: a query mixing inserts/updates with deletes is rejected at parse
 /// time, BEFORE any I/O. The error shape directs the user to split the
 /// query into two mutations.
 #[tokio::test]
 async fn mutation_rejects_mixed_insert_and_delete_at_parse_time() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     // Capture pre-mutation state on touched tables to confirm no I/O.
     let persons_before = count_rows(&db, "node:Person").await;
@@ -576,7 +865,7 @@ async fn mutation_rejects_mixed_insert_and_delete_at_parse_time() {
 #[tokio::test]
 async fn overlapping_delete_predicates_do_not_double_count_affected() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     let r = db
         .mutate(
@@ -598,8 +887,16 @@ async fn overlapping_delete_predicates_do_not_double_count_affected() {
     );
 
     // The data is correct regardless of the count: Bob + Diana remain.
-    assert_eq!(count_rows(&db, "node:Person").await, 2, "Bob and Diana remain");
-    assert_eq!(count_rows(&db, "edge:Knows").await, 1, "only Bob→Diana remains");
+    assert_eq!(
+        count_rows(&db, "node:Person").await,
+        2,
+        "Bob and Diana remain"
+    );
+    assert_eq!(
+        count_rows(&db, "edge:Knows").await,
+        1,
+        "only Bob→Diana remains"
+    );
     assert_eq!(
         count_rows(&db, "edge:WorksAt").await,
         1,
@@ -632,8 +929,8 @@ edge Knows: Person -> Person
     let data = r#"{"type":"Person","data":{"name":"Charlie","age":35}}
 {"type":"Person","data":{"name":"Zoe"}}
 {"edge":"Knows","from":"Zoe","to":"Charlie"}"#;
-    let mut db = Omnigraph::init(uri, schema).await.unwrap();
-    load_jsonl(&mut db, data, LoadMode::Overwrite).await.unwrap();
+    let db = Omnigraph::init(uri, schema).await.unwrap();
+    load_jsonl(&db, data, LoadMode::Overwrite).await.unwrap();
 
     let q = r#"
 query del_age_then_name($threshold: I32, $name: String) {
@@ -668,12 +965,12 @@ query del_age_then_name($threshold: I32, $name: String) {
 /// `insert Person 'X'; update Person where name='X' set age=...` — both
 /// ops produce content on `node:Person` and coalesce into one
 /// `stage_merge_insert` at end-of-query. The accumulator's last-write-wins
-/// dedupe (in `MutationStaging::finalize`) ensures the update's value
+/// dedupe (during `MutationStaging::stage_all`) ensures the update's value
 /// wins. Single Lance commit per table per query.
 #[tokio::test]
 async fn mixed_insert_and_update_on_same_person_coalesces_to_one_merge() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     let pre_version = version_main(&db).await.unwrap();
 
@@ -692,7 +989,7 @@ async fn mixed_insert_and_update_on_same_person_coalesces_to_one_merge() {
     assert_eq!(result.affected_nodes, 2, "1 insert + 1 update reported");
 
     // The end-state row carries the update value (last-write-wins via
-    // dedupe in finalize), proving the staged merge_insert ran with the
+    // end-of-query dedupe), proving the staged merge_insert ran with the
     // correct source dedupe. Read the underlying Person table directly
     // and assert age=99 for the row we just inserted+updated.
     let batches = read_table(&db, "node:Person").await;
@@ -737,13 +1034,13 @@ async fn mixed_insert_and_update_on_same_person_coalesces_to_one_merge() {
 }
 
 /// `insert Knows from='Alice' to='Bob'; insert Knows from='Alice' to='Eve'`
-/// — both append to `edge:Knows`. The accumulator coalesces them into one
-/// `stage_append` at end-of-query. Edge IDs are ULID-generated so no
-/// dedupe is needed (Append mode).
+/// — both add rows to `edge:Knows`. The accumulator coalesces them into one
+/// strict exact-id fenced write at end-of-query. Edge IDs are ULID-generated,
+/// but the write still carries the same conflict filter as every graph table.
 #[tokio::test]
-async fn multiple_appends_to_same_edge_coalesce_to_one_append() {
+async fn multiple_edge_inserts_coalesce_to_one_fenced_write() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     // Add Eve so the second edge has a valid endpoint.
     db.mutate(
@@ -790,7 +1087,7 @@ async fn multiple_appends_to_same_edge_coalesce_to_one_append() {
 #[tokio::test]
 async fn multi_statement_inserts_publish_exactly_once() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     let pre_version = version_main(&db).await.unwrap();
 
@@ -846,10 +1143,10 @@ async fn multi_statement_inserts_publish_exactly_once() {
 async fn load_with_bad_edge_reference_unblocks_next_load() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
     // Seed with the standard fixture so we're working from a non-empty
     // baseline.
-    load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite)
+    load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
 
@@ -862,7 +1159,7 @@ async fn load_with_bad_edge_reference_unblocks_next_load() {
     let bad = r#"{"type": "Person", "data": {"name": "Mallory", "age": 5}}
 {"edge": "Knows", "from": "Mallory", "to": "Ghost"}
 "#;
-    let err = load_jsonl(&mut db, bad, LoadMode::Append)
+    let err = load_jsonl(&db, bad, LoadMode::Append)
         .await
         .expect_err("RI violation must fail the load");
     let OmniError::Manifest(manifest_err) = err else {
@@ -888,7 +1185,7 @@ async fn load_with_bad_edge_reference_unblocks_next_load() {
 
     // Second load against the same tables — succeeds (no HEAD drift).
     let good = r#"{"type": "Person", "data": {"name": "Pat", "age": 55}}"#;
-    load_jsonl(&mut db, good, LoadMode::Append).await.unwrap();
+    load_jsonl(&db, good, LoadMode::Append).await.unwrap();
     assert_eq!(
         count_rows(&db, "node:Person").await,
         pre_persons + 1,
@@ -900,8 +1197,8 @@ async fn load_with_bad_edge_reference_unblocks_next_load() {
 async fn load_overwrite_with_bad_edge_reference_unblocks_next_load() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-    load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite)
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
 
@@ -911,7 +1208,7 @@ async fn load_overwrite_with_bad_edge_reference_unblocks_next_load() {
     let bad = r#"{"type": "Person", "data": {"name": "Mallory", "age": 5}}
 {"edge": "Knows", "from": "Mallory", "to": "Ghost"}
 "#;
-    let err = load_jsonl(&mut db, bad, LoadMode::Overwrite)
+    let err = load_jsonl(&db, bad, LoadMode::Overwrite)
         .await
         .expect_err("RI violation must fail overwrite before commit_staged");
     let OmniError::Manifest(manifest_err) = err else {
@@ -935,9 +1232,7 @@ async fn load_overwrite_with_bad_edge_reference_unblocks_next_load() {
 {"edge": "Knows", "from": "Pat", "to": "Quinn"}
 {"edge": "WorksAt", "from": "Pat", "to": "Acme"}
 "#;
-    load_jsonl(&mut db, good, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    load_jsonl(&db, good, LoadMode::Overwrite).await.unwrap();
     assert_eq!(count_rows(&db, "node:Person").await, 2);
     assert_eq!(count_rows(&db, "edge:Knows").await, 1);
 }
@@ -965,15 +1260,13 @@ edge WorksAt: Person -> Company @card(0..1)
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, CARD_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, CARD_SCHEMA).await.unwrap();
 
     let seed = r#"{"type": "Person", "data": {"name": "Alice", "age": 30}}
 {"type": "Company", "data": {"name": "Acme"}}
 {"type": "Company", "data": {"name": "Bigco"}}
 "#;
-    load_jsonl(&mut db, seed, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    load_jsonl(&db, seed, LoadMode::Overwrite).await.unwrap();
 
     let pre_works = count_rows(&db, "edge:WorksAt").await;
 
@@ -981,7 +1274,7 @@ edge WorksAt: Person -> Company @card(0..1)
     let bad = r#"{"edge": "WorksAt", "from": "Alice", "to": "Acme"}
 {"edge": "WorksAt", "from": "Alice", "to": "Bigco"}
 "#;
-    let err = load_jsonl(&mut db, bad, LoadMode::Append)
+    let err = load_jsonl(&db, bad, LoadMode::Append)
         .await
         .expect_err("cardinality violation must fail the load");
     let OmniError::Manifest(manifest_err) = err else {
@@ -998,7 +1291,7 @@ edge WorksAt: Person -> Company @card(0..1)
     assert_eq!(mid_works, pre_works);
 
     let good = r#"{"edge": "WorksAt", "from": "Alice", "to": "Acme"}"#;
-    load_jsonl(&mut db, good, LoadMode::Append).await.unwrap();
+    load_jsonl(&db, good, LoadMode::Append).await.unwrap();
     assert_eq!(
         count_rows(&db, "edge:WorksAt").await,
         pre_works + 1,
@@ -1021,22 +1314,20 @@ edge WorksAt: Person -> Company @card(0..1)
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, CARD_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, CARD_SCHEMA).await.unwrap();
 
     let seed = r#"{"type": "Person", "data": {"name": "Alice", "age": 30}}
 {"type": "Company", "data": {"name": "Acme"}}
 {"type": "Company", "data": {"name": "Bigco"}}
 "#;
-    load_jsonl(&mut db, seed, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    load_jsonl(&db, seed, LoadMode::Overwrite).await.unwrap();
 
     let pre_works = count_rows(&db, "edge:WorksAt").await;
 
     let bad = r#"{"edge": "WorksAt", "from": "Alice", "to": "Acme"}
 {"edge": "WorksAt", "from": "Alice", "to": "Bigco"}
 "#;
-    let err = load_jsonl(&mut db, bad, LoadMode::Overwrite)
+    let err = load_jsonl(&db, bad, LoadMode::Overwrite)
         .await
         .expect_err("cardinality violation must fail overwrite before commit_staged");
     let OmniError::Manifest(manifest_err) = err else {
@@ -1050,9 +1341,7 @@ edge WorksAt: Person -> Company @card(0..1)
     assert_eq!(count_rows(&db, "edge:WorksAt").await, pre_works);
 
     let good = r#"{"edge": "WorksAt", "from": "Alice", "to": "Acme"}"#;
-    load_jsonl(&mut db, good, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    load_jsonl(&db, good, LoadMode::Overwrite).await.unwrap();
     assert_eq!(count_rows(&db, "edge:WorksAt").await, 1);
 }
 
@@ -1063,7 +1352,7 @@ edge WorksAt: Person -> Company @card(0..1)
 /// `scan_with_pending`, the second update sees the stale committed value
 /// (the first update's row still appears in the Lance scan because the
 /// pending side hasn't committed), the predicate matches it, and the
-/// dedupe-last-wins step at finalize ends up applying the second update
+/// end-of-query dedupe-last-wins step ends up applying the second update
 /// to a row whose pending value should have shielded it.
 ///
 /// Concretely: Alice starts at age=30 in TEST_DATA. Op-1 sets Alice to
@@ -1079,7 +1368,7 @@ edge WorksAt: Person -> Company @card(0..1)
 #[tokio::test]
 async fn chained_updates_with_overlapping_predicate_respects_intermediate_value() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     let pre_version = version_main(&db).await.unwrap();
 
@@ -1149,7 +1438,7 @@ async fn chained_updates_with_overlapping_predicate_respects_intermediate_value(
 #[tokio::test]
 async fn multi_statement_delete_on_same_node_table() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     let pre_persons = count_rows(&db, "node:Person").await;
     let pre_version = version_main(&db).await.unwrap();
@@ -1208,7 +1497,7 @@ query cascade_then_explicit($name: String, $other: String) {
 "#;
 
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     // TEST_DATA seeds three Knows edges:
     //   Alice → Bob, Alice → Charlie (cascade target — should be deleted by op-1)
@@ -1268,14 +1557,12 @@ query add_friend($from: String, $to: String) {
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, MIN_CARD_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, MIN_CARD_SCHEMA).await.unwrap();
 
     let seed = r#"{"type": "Person", "data": {"name": "Alice"}}
 {"type": "Person", "data": {"name": "Bob"}}
 "#;
-    load_jsonl(&mut db, seed, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    load_jsonl(&db, seed, LoadMode::Overwrite).await.unwrap();
 
     // Single insert: count=1 < min=2 → reject with clear message.
     let err = db
@@ -1319,7 +1606,7 @@ edge WorksAt: Person -> Company @card(0..1)
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, CARD_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, CARD_SCHEMA).await.unwrap();
 
     // Seed: Alice + Acme + Bigco + WorksAt(id=w1, Alice→Acme). Note the
     // loader reads edge ids from the `data.id` field (not top-level), so
@@ -1329,16 +1616,14 @@ edge WorksAt: Person -> Company @card(0..1)
 {"type": "Company", "data": {"name": "Bigco"}}
 {"edge": "WorksAt", "from": "Alice", "to": "Acme", "data": {"id": "w1"}}
 "#;
-    load_jsonl(&mut db, seed, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    load_jsonl(&db, seed, LoadMode::Overwrite).await.unwrap();
 
     // Merge-update the same edge id w1 to point at Bigco. Counted naively
     // as union, Alice has 2 WorksAt (committed Acme + pending Bigco) which
     // would trip @card(0..1). With merge dedupe, Alice has 1 WorksAt.
     let merge_data = r#"{"edge": "WorksAt", "from": "Alice", "to": "Bigco", "data": {"id": "w1"}}
 "#;
-    load_jsonl(&mut db, merge_data, LoadMode::Merge)
+    load_jsonl(&db, merge_data, LoadMode::Merge)
         .await
         .expect("Merge update must dedupe the committed edge by id");
 
@@ -1347,7 +1632,7 @@ edge WorksAt: Person -> Company @card(0..1)
 }
 
 /// A Merge load whose input has TWO rows with the same edge id must be
-/// deduped at cardinality-count time, not just at finalize. Without
+/// deduped at cardinality-count time, not just during end-of-query staging. Without
 /// dedup, two pending rows count twice → spurious `@card` violation.
 /// With dedup (last-occurrence-wins, mirroring
 /// `dedupe_merge_batches_by_id`), the pending side counts once.
@@ -1371,24 +1656,22 @@ edge WorksAt: Person -> Company @card(0..1)
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, CARD_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, CARD_SCHEMA).await.unwrap();
 
     let seed = r#"{"type": "Person", "data": {"name": "Alice"}}
 {"type": "Company", "data": {"name": "Acme"}}
 {"type": "Company", "data": {"name": "Bigco"}}
 "#;
-    load_jsonl(&mut db, seed, LoadMode::Overwrite)
-        .await
-        .unwrap();
+    load_jsonl(&db, seed, LoadMode::Overwrite).await.unwrap();
 
     // Merge load with the SAME edge id twice — the second row supersedes
-    // the first in the finalize-time dedupe. If pending-counting doesn't
+    // the first in the end-of-query dedupe. If pending-counting doesn't
     // dedupe, Alice has 2 pending edges → @card(0..1) trips → load
     // fails. With dedupe, Alice has 1 → load succeeds.
     let dup_data = r#"{"edge": "WorksAt", "from": "Alice", "to": "Acme", "data": {"id": "w1"}}
 {"edge": "WorksAt", "from": "Alice", "to": "Bigco", "data": {"id": "w1"}}
 "#;
-    load_jsonl(&mut db, dup_data, LoadMode::Merge)
+    load_jsonl(&db, dup_data, LoadMode::Merge)
         .await
         .expect("Merge load with within-input dup ids must dedupe pending count");
 
@@ -1397,114 +1680,13 @@ edge WorksAt: Person -> Company @card(0..1)
     assert_eq!(count_rows(&db, "edge:WorksAt").await, 1);
 }
 
-/// `scan_with_pending` must reject a call where `key_column` is
-/// requested but the projection omits that column. Without the
-/// up-front check, the helper silently degraded to union semantics —
-/// letting a chained-update bug slip through unnoticed. This test
-/// verifies the contract is enforced at the API boundary.
+/// A blob-table insert followed by a non-blob update must remain one
+/// full-schema merge stream. The update reads the just-inserted pending row,
+/// copies its logical blob column through, and replaces the pending row under
+/// the existing last-write-wins shadow semantics. This used to produce a
+/// partial update batch and fail schema validation at the second op.
 #[tokio::test]
-async fn scan_with_pending_rejects_key_column_missing_from_projection() {
-    use arrow_array::{RecordBatch, StringArray};
-    use arrow_schema::{DataType, Field, Schema};
-    use omnigraph::table_store::TableStore;
-    use std::sync::Arc;
-
-    let dir = tempfile::tempdir().unwrap();
-    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
-    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
-
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Utf8, false),
-        Field::new("note", DataType::Utf8, true),
-    ]));
-    let seed = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(StringArray::from(vec!["a", "b"])) as _,
-            Arc::new(StringArray::from(vec![Some("seed-a"), Some("seed-b")])) as _,
-        ],
-    )
-    .unwrap();
-    let ds = TableStore::write_dataset(&uri, seed).await.unwrap();
-
-    let pending = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(StringArray::from(vec!["a"])) as _,
-            Arc::new(StringArray::from(vec![Some("pending-a")])) as _,
-        ],
-    )
-    .unwrap();
-
-    // Bad call: key_column = "id" but projection doesn't include "id".
-    // Pre-fix this silently disabled merge-shadowing and returned both
-    // committed "a" and pending "a" rows. Now it must error.
-    let err = store
-        .scan_with_pending(
-            &ds,
-            std::slice::from_ref(&pending),
-            None,
-            Some(&["note"]),
-            None,
-            Some("id"),
-        )
-        .await
-        .expect_err("scan_with_pending must reject merge-shadow with missing key in projection");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("key_column 'id'") && msg.contains("must appear in projection"),
-        "unexpected error: {msg}"
-    );
-
-    // Good call: projection includes the key column. Shadow works:
-    // pending row 'a' shadows committed 'a', so the result has only
-    // committed 'b' + pending 'a'.
-    let batches = store
-        .scan_with_pending(
-            &ds,
-            std::slice::from_ref(&pending),
-            None,
-            Some(&["id", "note"]),
-            None,
-            Some("id"),
-        )
-        .await
-        .expect("projection containing key_column must succeed");
-    let mut ids: Vec<String> = Vec::new();
-    for b in &batches {
-        let arr = b
-            .column_by_name("id")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<arrow_array::StringArray>()
-            .unwrap();
-        for i in 0..arr.len() {
-            ids.push(arr.value(i).to_string());
-        }
-    }
-    ids.sort();
-    assert_eq!(
-        ids,
-        vec!["a", "b"],
-        "merge-shadow should drop committed 'a' and surface pending 'a' + committed 'b'"
-    );
-}
-
-/// `PendingTable.schema` is captured from the first `append_batch` call
-/// and never updated. On a blob-bearing table, an `insert` produces a
-/// full-schema batch (blob columns included) and an `update` that
-/// doesn't assign every blob produces a subset-schema batch. Mixed in
-/// one query, the second `append_batch` would silently push an
-/// incompatible batch — the mismatch surfaced eventually at
-/// `concat_batches`/MemTable construction inside finalize, but the
-/// failure point was distant from the offending op.
-///
-/// `append_batch` validates the new batch's schema against the existing
-/// accumulator's schema and returns a typed error directing the caller
-/// to split the mutation. The error fires at the second op (the
-/// update), not at end-of-query.
-#[tokio::test]
-async fn append_batch_rejects_mismatched_schema_in_blob_table_at_offending_op() {
+async fn blob_table_insert_then_non_blob_update_preserves_full_schema() {
     use omnigraph::loader::{LoadMode, load_jsonl};
 
     const BLOB_SCHEMA: &str = r#"
@@ -1521,25 +1703,48 @@ query insert_then_update_note(
     insert Document { title: $title, content: $blob }
     update Document set { note: $note } where title = $title
 }
+
+query insert_then_replace_blob(
+    $title: String, $first: String, $second: String
+) {
+    insert Document { title: $title, content: $first }
+    update Document set { content: $second } where title = $title
+}
 "#;
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
+    let allowed_path = dir.path().join("allowed-source.bin");
+    std::fs::write(&allowed_path, b"last write wins").unwrap();
+    let allowed_uri = url::Url::from_file_path(&allowed_path)
+        .expect("allowed external source is absolute")
+        .to_string();
+    let policy = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(
+            url::Url::from_directory_path(dir.path()).expect("external Blob base is absolute"),
+            ExternalBlobExecutionScope::EmbeddedOnly,
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    let db = Omnigraph::init(uri, BLOB_SCHEMA)
+        .await
+        .unwrap()
+        .with_external_blob_policy(policy)
+        .unwrap();
 
-    // Seed with a Document so the update has something to match (the
-    // mid-query case is the chained-update scenario where the update's
-    // predicate matches the just-inserted row, exercising the in-memory
-    // pending union).
+    // Keep one committed blob row as well as the just-inserted pending row so
+    // the table has the real blob-v2 physical representation while this query
+    // exercises the pending union.
     load_jsonl(
-        &mut db,
+        &db,
         r#"{"type":"Document","data":{"title":"seed","content":"base64:AQID"}}"#,
         LoadMode::Overwrite,
     )
     .await
     .unwrap();
 
-    let err = db
+    let result = db
         .mutate(
             "main",
             BLOB_QUERIES,
@@ -1551,36 +1756,72 @@ query insert_then_update_note(
             ]),
         )
         .await
-        .expect_err("blob-table mixed insert+update with non-fully-assigned blob must error early");
-    let OmniError::Manifest(manifest_err) = err else {
-        panic!("expected Manifest error, got {err:?}");
-    };
-    assert!(
-        manifest_err.message.contains("mismatched schemas")
-            && manifest_err.message.contains("Split the mutation"),
-        "error must direct user to split: {}",
-        manifest_err.message,
+        .expect("blob-table insert + non-blob update must share a full-schema merge batch");
+    assert_eq!(
+        result.affected_nodes, 2,
+        "one insert plus one pending-row update"
     );
 
-    // Confirm the manifest didn't advance — early error must be
-    // before any commit.
+    let blob = read_managed_blob_bytes(
+        &db,
+        ReadTarget::branch("main"),
+        node_blob_cell("Document", "letter", "content"),
+    )
+    .await;
+    assert_eq!(&blob[..], &[4, 5, 6]);
+
     let qr = db
         .query(
             ReadTarget::branch("main"),
             r#"query get_doc($title: String) {
                 match { $d: Document { title: $title } }
-                return { $d.title }
+                return { $d.title, $d.note }
             }"#,
             "get_doc",
             &params(&[("$title", "letter")]),
         )
         .await
         .unwrap();
-    assert_eq!(
-        qr.num_rows(),
-        0,
-        "letter must not be visible after early error"
-    );
+    assert_eq!(qr.num_rows(), 1);
+    let json = qr.to_sdk_json();
+    let row = json.as_array().unwrap().first().unwrap();
+    assert_eq!(row["d.title"], "letter");
+    assert_eq!(row["d.note"], "draft 1");
+
+    // Mutation coalescing is last-write-wins before URI admission. The first
+    // pending value is deliberately outside the allow base; because the
+    // update replaces it in the same query, it must cause no policy check,
+    // HEAD, or payload read. Only the surviving URI is copied.
+    let probes = omnigraph::instrumentation::MergeWriteProbes::default();
+    let result = omnigraph::instrumentation::with_merge_write_probes(
+        probes.clone(),
+        db.mutate(
+            "main",
+            BLOB_QUERIES,
+            "insert_then_replace_blob",
+            &params(&[
+                ("$title", "last-wins"),
+                (
+                    "$first",
+                    "file:///definitely-outside-the-allowed-base/ignored",
+                ),
+                ("$second", &allowed_uri),
+            ]),
+        ),
+    )
+    .await
+    .expect("superseded external URI must not participate in admission");
+    assert_eq!(result.affected_nodes, 2);
+    assert_eq!(probes.external_blob_probe_inputs(), 1);
+    assert_eq!(probes.external_blob_probe_calls(), 1);
+    assert_eq!(probes.blob_payload_read_calls(), 1);
+    let blob = read_managed_blob_bytes(
+        &db,
+        ReadTarget::branch("main"),
+        node_blob_cell("Document", "last-wins", "content"),
+    )
+    .await;
+    assert_eq!(&blob[..], b"last write wins");
 }
 
 /// MR-920 regression: two sequential `update T set {f:v} where x=y`
@@ -1601,7 +1842,7 @@ query insert_then_update_note(
 #[tokio::test]
 async fn second_sequential_update_on_same_row_succeeds() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     db.mutate(
         "main",
@@ -1685,12 +1926,17 @@ async fn second_sequential_update_on_same_row_succeeds() {
 #[tokio::test]
 async fn first_write_self_heals_manifest_unreferenced_fork_on_live_branch() {
     let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap().to_string();
     let mut db = init_and_load(&dir).await;
     db.branch_create("feature").await.unwrap();
 
     // Forge the manifest-unreferenced fork directly at the Lance layer.
-    let person_uri = node_table_uri(&uri, "Person");
+    let main = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let person_path = &main.entry("node:Person").unwrap().table_path;
+    let person_uri = format!(
+        "{}/{}",
+        db.uri().trim_end_matches('/'),
+        person_path.trim_start_matches('/')
+    );
     {
         let mut ds = lance::Dataset::open(&person_uri).await.unwrap();
         let base = ds.version().version;
@@ -1793,8 +2039,8 @@ const CC_DATA: &str = r#"{"type":"Doc","data":{"slug":"d1","repoName":"acme","st
 async fn camelcase_mutation_predicate_updates_and_deletes() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, CC_SCHEMA).await.unwrap();
-    load_jsonl(&mut db, CC_DATA, LoadMode::Overwrite).await.unwrap();
+    let db = Omnigraph::init(uri, CC_SCHEMA).await.unwrap();
+    load_jsonl(&db, CC_DATA, LoadMode::Overwrite).await.unwrap();
 
     let m = r#"
 query set_status($repo: String, $st: String) { update Doc set { status: $st } where repoName = $repo }
@@ -1802,7 +2048,12 @@ query del($repo: String) { delete Doc where repoName = $repo }
 "#;
 
     let upd = db
-        .mutate("main", m, "set_status", &params(&[("$repo", "acme"), ("$st", "closed")]))
+        .mutate(
+            "main",
+            m,
+            "set_status",
+            &params(&[("$repo", "acme"), ("$st", "closed")]),
+        )
         .await
         .expect("update with a camelCase predicate must execute");
     assert_eq!(upd.affected_nodes, 1, "exactly the acme Doc should update");
@@ -1811,9 +2062,16 @@ query del($repo: String) { delete Doc where repoName = $repo }
         .mutate("main", m, "del", &params(&[("$repo", "globex")]))
         .await
         .expect("delete with a camelCase predicate must execute");
-    assert_eq!(del.affected_nodes, 1, "exactly the globex Doc should delete");
+    assert_eq!(
+        del.affected_nodes, 1,
+        "exactly the globex Doc should delete"
+    );
 
-    assert_eq!(count_rows(&db, "node:Doc").await, 1, "one Doc (acme) should remain");
+    assert_eq!(
+        count_rows(&db, "node:Doc").await,
+        1,
+        "one Doc (acme) should remain"
+    );
 }
 
 // #283 (pending side): a chained mutation whose 2nd op filters a camelCase
@@ -1824,8 +2082,8 @@ query del($repo: String) { delete Doc where repoName = $repo }
 async fn camelcase_chained_mutation_reads_pending_by_camelcase() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, CC_SCHEMA).await.unwrap();
-    load_jsonl(&mut db, CC_DATA, LoadMode::Overwrite).await.unwrap();
+    let db = Omnigraph::init(uri, CC_SCHEMA).await.unwrap();
+    load_jsonl(&db, CC_DATA, LoadMode::Overwrite).await.unwrap();
 
     // op-1 stages a status change to the acme Doc; op-2 re-filters the same
     // camelCase column, so it must match op-1's pending row.
@@ -1838,8 +2096,13 @@ query chain($repo: String) {
     let r = db
         .mutate("main", m, "chain", &params(&[("$repo", "acme")]))
         .await
-        .expect("chained camelCase mutation must read the pending row, not fail at the MemTable SELECT");
-    assert_eq!(r.affected_nodes, 2, "both ops should touch the acme Doc (read-your-writes)");
+        .expect(
+            "chained camelCase mutation must read the pending row, not fail at the MemTable SELECT",
+        );
+    assert_eq!(
+        r.affected_nodes, 2,
+        "both ops should touch the acme Doc (read-your-writes)"
+    );
 }
 
 /// A zero-row cascade delete must not advance an edge table's Lance HEAD past
@@ -1913,7 +2176,7 @@ async fn node_delete_with_no_incident_edges_leaves_no_edge_table_drift() {
 async fn post_publish_fold_matches_fresh_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     db.mutate(
         "main",
@@ -1970,7 +2233,7 @@ query find_person($name: String) {
 /// Lance 7.0.0 `RowIdIndex::new` then fails any filtered scan that needs
 /// the id→address map ("all columns in a record batch must have the same
 /// length" in release, a "Wrong range" debug assert). Fixed upstream by
-/// lance#7480; consumed here via the vendored `lance-table` patch.
+/// lance#7480 and shipped in the pinned crates.io Lance release.
 #[tokio::test]
 async fn filtered_read_after_merge_update_and_delete_keeps_row_ids_consistent() {
     let dir = tempfile::tempdir().unwrap();
@@ -1980,7 +2243,7 @@ async fn filtered_read_after_merge_update_and_delete_keeps_row_ids_consistent() 
     let seed: String = (1..=40)
         .map(|i| format!("{{\"type\":\"Person\",\"data\":{{\"name\":\"p{i}\",\"age\":{i}}}}}\n"))
         .collect();
-    load_jsonl(&mut db, &seed, LoadMode::Merge).await.unwrap();
+    load_jsonl(&db, &seed, LoadMode::Merge).await.unwrap();
 
     // Same-key updates: Lance Operation::Update rewrites these 15 rows into
     // new fragments that keep their original stable row ids (the overlap).
@@ -1992,7 +2255,7 @@ async fn filtered_read_after_merge_update_and_delete_keeps_row_ids_consistent() 
             )
         })
         .collect();
-    load_jsonl(&mut db, &updates, LoadMode::Merge).await.unwrap();
+    load_jsonl(&db, &updates, LoadMode::Merge).await.unwrap();
 
     // The delete adds a deletion vector, so the overlapping region no longer
     // densely tiles its id range — the shape lance#7444 choked on.
@@ -2023,7 +2286,8 @@ async fn filtered_read_after_merge_update_and_delete_keeps_row_ids_consistent() 
 
 /// Isolation control for the regression above: the same load/delete/filtered
 /// read walk WITHOUT same-key updates (append-only merges, disjoint keys)
-/// never produces overlapping row-id ranges and passes on unpatched Lance.
+/// never produces overlapping row-id ranges and passed on the historical
+/// unpatched substrate as well.
 /// If this one fails alongside the merge-update case, the defect is not the
 /// lance#7444 overlap shape.
 #[tokio::test]
@@ -2035,13 +2299,13 @@ async fn filtered_read_after_append_and_delete_is_consistent() {
     let seed: String = (1..=40)
         .map(|i| format!("{{\"type\":\"Person\",\"data\":{{\"name\":\"p{i}\",\"age\":{i}}}}}\n"))
         .collect();
-    load_jsonl(&mut db, &seed, LoadMode::Merge).await.unwrap();
+    load_jsonl(&db, &seed, LoadMode::Merge).await.unwrap();
 
     // Disjoint keys: plain inserts, no fragment rewrite, no id reuse.
     let more: String = (41..=55)
         .map(|i| format!("{{\"type\":\"Person\",\"data\":{{\"name\":\"p{i}\",\"age\":{i}}}}}\n"))
         .collect();
-    load_jsonl(&mut db, &more, LoadMode::Merge).await.unwrap();
+    load_jsonl(&db, &more, LoadMode::Merge).await.unwrap();
 
     mutate_main(
         &mut db,
@@ -2064,4 +2328,266 @@ async fn filtered_read_after_append_and_delete_is_consistent() {
         let got = first_column_sorted(&result);
         assert_eq!(got, expected, "filtered read for {name}");
     }
+}
+
+async fn head_commit_id(uri: &str) -> String {
+    CommitGraph::open(uri)
+        .await
+        .unwrap()
+        .head_commit()
+        .await
+        .unwrap()
+        .expect("loaded graph has at least one commit")
+        .graph_commit_id
+}
+
+/// GitHub #365: `mutate_as_with_expected_head` is a caller-facing
+/// compare-and-swap on the branch head. A stale expectation is rejected with
+/// `PreconditionFailed` carrying the exact expected/actual commit ids and
+/// produces no commit; an expectation naming the current head passes.
+#[tokio::test]
+async fn mutate_expected_head_precondition_issue_365() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = init_and_load(&dir).await;
+    let stale_head = head_commit_id(&uri).await;
+
+    // Writer A advances the head past the commit both writers read.
+    db.mutate(
+        "main",
+        MUTATION_QUERIES,
+        "set_age",
+        &mixed_params(&[("$name", "Alice")], &[("$age", 31)]),
+    )
+    .await
+    .unwrap();
+    let current_head = head_commit_id(&uri).await;
+    assert_ne!(stale_head, current_head);
+
+    // Writer B lost the race: its stale expectation must be rejected before
+    // any effect, with the ids the caller needs to re-read and decide again.
+    let err = db
+        .mutate_as_with_expected_head(
+            "main",
+            MUTATION_QUERIES,
+            "set_age",
+            &mixed_params(&[("$name", "Alice")], &[("$age", 52)]),
+            None,
+            Some(&stale_head),
+        )
+        .await
+        .unwrap_err();
+    match err {
+        OmniError::PreconditionFailed {
+            branch,
+            expected,
+            actual,
+        } => {
+            assert_eq!(branch, "main");
+            assert_eq!(expected, stale_head);
+            assert_eq!(actual.as_deref(), Some(current_head.as_str()));
+        }
+        other => panic!("expected PreconditionFailed, got: {other}"),
+    }
+    assert_eq!(
+        head_commit_id(&uri).await,
+        current_head,
+        "rejected precondition must not produce a commit"
+    );
+
+    // An expectation naming the current head passes and returns the exact
+    // commit produced by that same manifest publication.
+    let receipt = db
+        .mutate_as_with_expected_head_receipt(
+            "main",
+            MUTATION_QUERIES,
+            "set_age",
+            &mixed_params(&[("$name", "Alice")], &[("$age", 33)]),
+            None,
+            Some(&current_head),
+        )
+        .await
+        .unwrap();
+    let commit = receipt
+        .commit
+        .expect("an effectful conditional mutation publishes once");
+    assert_eq!(
+        commit.parent_commit_id.as_deref(),
+        Some(current_head.as_str())
+    );
+    assert_eq!(head_commit_id(&uri).await, commit.graph_commit_id);
+
+    // A successful conditional no-op has a fresh linearization check but no
+    // table or manifest publication, so its receipt carries no commit.
+    let current_head = commit.graph_commit_id;
+    let no_op = db
+        .mutate_as_with_expected_head_receipt(
+            "main",
+            MUTATION_QUERIES,
+            "set_age",
+            &mixed_params(&[("$name", "Missing")], &[("$age", 99)]),
+            None,
+            Some(&current_head),
+        )
+        .await
+        .unwrap();
+    assert_eq!(no_op.result.affected_nodes, 0);
+    assert!(no_op.commit.is_none());
+    assert_eq!(head_commit_id(&uri).await, current_head);
+
+    // A fresh named branch has no materialized `graph_head:feature` row, but
+    // it inherits main's exact lineage head. The read token must expose that
+    // effective head because this is the value the mutation gate compares.
+    let inherited_head = head_commit_id(&uri).await;
+    db.branch_create("feature").await.unwrap();
+    let (_, read_head) = db
+        .query_with_head(
+            ReadTarget::branch("feature"),
+            TEST_QUERIES,
+            "get_person",
+            &params(&[("$name", "Alice")]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(read_head.as_deref(), Some(inherited_head.as_str()));
+
+    // The token returned by the fresh-branch read is immediately usable for a
+    // conditional first write on that branch.
+    db.mutate_as_with_expected_head(
+        "feature",
+        MUTATION_QUERIES,
+        "set_age",
+        &mixed_params(&[("$name", "Alice")], &[("$age", 34)]),
+        None,
+        read_head.as_deref(),
+    )
+    .await
+    .unwrap();
+    let feature_head = CommitGraph::open_at_branch(&uri, "feature")
+        .await
+        .unwrap()
+        .head_commit()
+        .await
+        .unwrap()
+        .expect("feature first write creates a branch-owned head")
+        .graph_commit_id;
+    assert_ne!(feature_head, inherited_head);
+}
+
+/// A warm handle may refresh its manifest after another handle publishes.
+/// The read token and the following write capture must both prefer the exact
+/// graph-head row from that refreshed manifest over the handle's older derived
+/// lineage cache, or a token returned by the read falsely rejects immediately.
+#[tokio::test]
+async fn refreshed_warm_read_token_is_accepted_by_next_conditional_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let reader = init_and_load(&dir).await;
+    let writer = Omnigraph::open(&uri).await.unwrap();
+
+    let (_, before) = reader
+        .query_with_head(
+            ReadTarget::branch("main"),
+            TEST_QUERIES,
+            "get_person",
+            &params(&[("$name", "Alice")]),
+        )
+        .await
+        .unwrap();
+    writer
+        .mutate(
+            "main",
+            MUTATION_QUERIES,
+            "set_age",
+            &mixed_params(&[("$name", "Alice")], &[("$age", 31)]),
+        )
+        .await
+        .unwrap();
+
+    let (_, refreshed) = reader
+        .query_with_head(
+            ReadTarget::branch("main"),
+            TEST_QUERIES,
+            "get_person",
+            &params(&[("$name", "Alice")]),
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        refreshed, before,
+        "the warm read must observe writer's commit"
+    );
+    let durable_head = head_commit_id(&uri).await;
+    assert_eq!(
+        refreshed.as_deref(),
+        Some(durable_head.as_str()),
+        "the token must come from the exact refreshed manifest snapshot"
+    );
+
+    reader
+        .mutate_as_with_expected_head(
+            "main",
+            MUTATION_QUERIES,
+            "set_age",
+            &mixed_params(&[("$name", "Alice")], &[("$age", 32)]),
+            None,
+            refreshed.as_deref(),
+        )
+        .await
+        .expect("a just-returned warm read token must be usable immediately");
+}
+
+/// Tripwire for the precondition/reprepare interaction (GitHub #365): the
+/// pre-effect retry loop replays insert-only mutations after an internal
+/// `ReadSetChanged`, and a caller precondition must never ride that replay —
+/// a retry against the fresh head would silently discard the compare-and-swap
+/// the caller asked for. `PreconditionFailed` is a distinct variant so the
+/// loop cannot classify it as retryable.
+#[tokio::test]
+async fn insert_only_mutation_stale_expected_head_is_terminal_issue_365() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let mut db = init_and_load(&dir).await;
+    let stale_head = head_commit_id(&uri).await;
+
+    db.mutate(
+        "main",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "WriterA")], &[("$age", 41)]),
+    )
+    .await
+    .unwrap();
+    let current_head = head_commit_id(&uri).await;
+
+    let err = db
+        .mutate_as_with_expected_head(
+            "main",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "WriterB")], &[("$age", 42)]),
+            None,
+            Some(&stale_head),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, OmniError::PreconditionFailed { .. }),
+        "insert-only mutation with a stale expectation must surface \
+         PreconditionFailed, got: {err}"
+    );
+    assert_eq!(
+        head_commit_id(&uri).await,
+        current_head,
+        "rejected insert must not produce a commit"
+    );
+    let absent = query_main(
+        &mut db,
+        TEST_QUERIES,
+        "get_person",
+        &params(&[("$name", "WriterB")]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(absent.num_rows(), 0, "rejected insert must leave no row");
 }

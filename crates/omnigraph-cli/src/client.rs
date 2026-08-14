@@ -26,36 +26,40 @@ use std::io::Write;
 use color_eyre::Result;
 use color_eyre::eyre::bail;
 use omnigraph::db::{Omnigraph, ReadTarget};
+use omnigraph::{BLOB_READ_RANGE_MAX_BYTES, BlobContent};
 use omnigraph_api_types::{
-    BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
-    BranchMergeOutput, BranchMergeRequest, ChangeOutput, CommitListOutput, CommitOutput,
-    ErrorOutput, ExportRequest, GraphListResponse, IngestOutput, IngestRequest,
-    InvokeStoredQueryRequest, ReadOutput,
-    ReadRequest, SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotOutput, commit_output,
-    ingest_output, read_output, schema_apply_output, snapshot_payload,
+    BlobReadQuery, BlobStatOutput, BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput,
+    BranchListOutput, BranchMergeOutput, BranchMergeRequest, ChangeOutput, ChangeRequest,
+    CommitChangesOutput, CommitListOutput, CommitOutput, ErrorOutput, ExportRequest,
+    GraphBatchLoadOutput, GraphListResponse, IngestOutput, IngestRequest, InvokeStoredQueryRequest,
+    QueryRequest, ReadOutput, SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotOutput,
+    commit_changes_output, commit_output, ingest_receipt_output, read_output, schema_apply_output,
+    snapshot_payload,
 };
 use omnigraph_compiler::catalog::Catalog;
-use reqwest::Method;
+use reqwest::header::{CONTENT_RANGE, RANGE};
+use reqwest::{Method, StatusCode};
 use serde_json::Value;
 
+use crate::blob_cli::{
+    BlobRangeRequest, blob_cell, blob_read_target, blob_url, external_response_headers,
+    managed_response_headers, map_embedded_blob_error, remote_blob_error, whole_external_uri,
+};
 use crate::cli::CliLoadMode;
 use crate::helpers::{
-    apply_bearer_token, apply_server_flag, build_http_client, is_remote_uri,
-    legacy_change_request_body, query_params_from_json,
-    remote_json, remote_url, resolve_cli_actor, resolve_cli_graph, resolve_remote_bearer_token,
-    resolve_server_flag, select_named_query,
+    apply_bearer_token, apply_server_flag, build_blob_http_client, build_http_client,
+    is_remote_uri, legacy_change_request_body, precondition_failed_cli, query_params_from_json,
+    remote_json, remote_json_with_graph_commit_precondition, remote_url, resolve_cli_actor,
+    resolve_cli_graph, resolve_remote_bearer_token, resolve_server_flag, select_named_query,
 };
-use crate::output::{LoadOutput, load_output_from_result, load_output_from_tables};
+use crate::output::{LoadOutput, load_output_from_graph_batch, load_output_from_receipt};
 
 pub(crate) enum GraphClient {
     /// Local engine at `uri`. Reads (`resolve()`) leave `actor` empty;
     /// writes (`resolve_with_policy()`) attribute the resolved actor.
     /// Direct-store access carries no Cedar policy (RFC-011: policy lives
     /// in the cluster/server, not in per-operator addressing).
-    Embedded {
-        uri: String,
-        actor: Option<String>,
-    },
+    Embedded { uri: String, actor: Option<String> },
     /// Remote HTTP server. The actor is resolved server-side from the
     /// token; the client never sets identity.
     Remote {
@@ -72,21 +76,11 @@ pub(crate) enum GraphClient {
 /// a policy-gated `/graphs`, or an unreachable server all proceed — the bare URL
 /// is then correct, or the real request surfaces the failure. Only fires on the
 /// no-graph path, so a `--graph`/`default_graph` happy path does no extra I/O.
-async fn require_graph_for_multi_graph_server(
-    scope: &crate::scope::ResolvedScope,
-) -> Result<()> {
+async fn require_graph_for_multi_graph_server(scope: &crate::scope::ResolvedScope) -> Result<()> {
     let (Some(server), None) = (scope.server.as_deref(), scope.graph.as_deref()) else {
         return Ok(());
     };
-    let Some(base) = resolve_server_flag(Some(server), None)? else {
-        return Ok(());
-    };
-    let token = resolve_remote_bearer_token(Some(&base))?;
-    let probe = GraphClient::Remote {
-        http: build_http_client()?,
-        base_url: base,
-        token,
-    };
+    let probe = GraphClient::registry_client(server)?;
     if let Ok(resp) = probe.list_graphs().await {
         if !resp.graphs.is_empty() {
             let ids: Vec<&str> = resp.graphs.iter().map(|g| g.graph_id.as_str()).collect();
@@ -116,6 +110,60 @@ fn reject_positional_remote(via_server: bool, uri: &str) -> Result<()> {
 }
 
 impl GraphClient {
+    /// The single owner of registry (`GET /graphs`) addressing: the bare base
+    /// URL of `server` (a config name or literal URL) — never `/graphs/<id>`
+    /// — with the keyed bearer-token chain. Synchronous: pure config
+    /// resolution, no I/O. Used by the RFC-011 D7 multi-graph probe and the
+    /// `graphs list` registry factory.
+    fn registry_client(server: &str) -> Result<Self> {
+        let base = resolve_server_flag(Some(server), None)?.expect("server name is present");
+        let token = resolve_remote_bearer_token(Some(&base))?;
+        Ok(GraphClient::Remote {
+            http: build_http_client()?,
+            base_url: base,
+            token,
+        })
+    }
+
+    /// Served-REGISTRY factory (RFC-011): resolve a server scope (`--server`
+    /// / `--profile` / `defaults.server`) to the bare server base URL for
+    /// `graphs list`. Synchronous by design: the RFC-011 D7 multi-graph probe
+    /// (`require_graph_for_multi_graph_server`) is async, so it structurally
+    /// cannot run on this path — `graphs list` IS the enumeration the probe
+    /// performs. There is no graph selection and no `/graphs/<id>` append; a
+    /// scope's `default_graph` is deliberately ignored (rejecting a config
+    /// default would make `graphs list` unusable in any profile that sets
+    /// one, and the registry is server-scoped either way). An explicit
+    /// `--graph` never reaches here — the addressing guard rejects it.
+    pub(crate) fn resolve_registry(server: Option<&str>, profile: Option<&str>) -> Result<Self> {
+        let scope = crate::scope::resolve_scope(
+            &crate::operator::load_operator_config()?,
+            crate::planes::Capability::Served,
+            crate::scope::ScopeFlags {
+                profile,
+                store: None,
+                server,
+                cluster: None,
+                graph: None,
+                uri: None,
+            },
+        )?;
+        let Some(server) = scope.server.as_deref() else {
+            bail!(
+                "`graphs list` needs a server scope — pass --server <name|url> or \
+                 --profile <name>, or set `defaults.server` in ~/.omnigraph/config.yaml"
+            );
+        };
+        let client = Self::registry_client(server)?;
+        if !is_remote_uri(client.uri()) {
+            bail!(
+                "a server scope resolves to an http(s):// URL; `{}` is not one",
+                client.uri()
+            );
+        }
+        Ok(client)
+    }
+
     /// Resolve the addressing (positional URI / `--target` / `--server`)
     /// and credential once, then pick the variant by URI scheme — the
     /// single branch point that replaces every per-command `is_remote`
@@ -123,6 +171,7 @@ impl GraphClient {
     /// path, not the policy-bearing `resolve_cli_graph`). Used by reads
     /// and `query` (which opens without policy, like the reads).
     pub(crate) async fn resolve(
+        capability: crate::planes::Capability,
         server: Option<&str>,
         graph: Option<&str>,
         uri: Option<String>,
@@ -131,18 +180,25 @@ impl GraphClient {
     ) -> Result<Self> {
         // RFC-011: a scope (profile / --store / operator defaults) may stand in
         // for omitted addressing. The explicit branch passes server/graph/uri
-        // straight through, so existing invocations are unchanged.
+        // straight through, so existing invocations are unchanged. The caller
+        // threads its verb's declared capability (planes::command_capability)
+        // so scope resolution and the addressing guard share one
+        // classification; every current caller is a data-plane (`Any`) verb —
+        // registry-scoped `graphs list` uses `resolve_registry` instead.
         let scope = crate::scope::resolve_scope(
             &crate::operator::load_operator_config()?,
-            crate::planes::Capability::Any,
-            crate::scope::ScopeFlags { profile, store, server, cluster: None, graph, uri },
+            capability,
+            crate::scope::ScopeFlags {
+                profile,
+                store,
+                server,
+                cluster: None,
+                graph,
+                uri,
+            },
         )?;
         require_graph_for_multi_graph_server(&scope).await?;
-        let (server, graph, uri) = (
-            scope.server.as_deref(),
-            scope.graph.as_deref(),
-            scope.uri,
-        );
+        let (server, graph, uri) = (scope.server.as_deref(), scope.graph.as_deref(), scope.uri);
         let via_server = server.is_some();
         let uri = apply_server_flag(server, graph, uri)?;
         let token = resolve_remote_bearer_token(uri.as_deref())?;
@@ -166,6 +222,7 @@ impl GraphClient {
     /// resolution order matches the write arms exactly: server flag →
     /// bearer token → graph.
     pub(crate) async fn resolve_with_policy(
+        capability: crate::planes::Capability,
         server: Option<&str>,
         graph: Option<&str>,
         uri: Option<String>,
@@ -174,18 +231,29 @@ impl GraphClient {
         store: Option<&str>,
     ) -> Result<Self> {
         // RFC-011 scope translation (see `resolve`); explicit addressing passes
-        // through unchanged.
+        // through unchanged, and the caller threads its verb's declared
+        // capability.
         let scope = crate::scope::resolve_scope(
             &crate::operator::load_operator_config()?,
-            crate::planes::Capability::Any,
-            crate::scope::ScopeFlags { profile, store, server, cluster: None, graph, uri },
+            capability,
+            crate::scope::ScopeFlags {
+                profile,
+                store,
+                server,
+                cluster: None,
+                graph,
+                uri,
+            },
         )?;
+        Self::resolve_with_policy_scope(scope, cli_as).await
+    }
+
+    async fn resolve_with_policy_scope(
+        scope: crate::scope::ResolvedScope,
+        cli_as: Option<&str>,
+    ) -> Result<Self> {
         require_graph_for_multi_graph_server(&scope).await?;
-        let (server, graph, uri) = (
-            scope.server.as_deref(),
-            scope.graph.as_deref(),
-            scope.uri,
-        );
+        let (server, graph, uri) = (scope.server.as_deref(), scope.graph.as_deref(), scope.uri);
         let via_server = server.is_some();
         let uri = apply_server_flag(server, graph, uri)?;
         let token = resolve_remote_bearer_token(uri.as_deref())?;
@@ -360,10 +428,49 @@ impl GraphClient {
         }
     }
 
+    pub(crate) async fn commit_changes(
+        &self,
+        commit_id: &str,
+        cursor: Option<&str>,
+        limit: usize,
+        max_bytes: u64,
+    ) -> Result<CommitChangesOutput> {
+        match self {
+            GraphClient::Remote {
+                http,
+                base_url,
+                token,
+            } => {
+                let limit = limit.to_string();
+                let max_bytes = max_bytes.to_string();
+                let mut query = vec![("limit", limit.as_str()), ("max_bytes", max_bytes.as_str())];
+                if let Some(cursor) = cursor {
+                    query.push(("cursor", cursor));
+                }
+                remote_json(
+                    http,
+                    Method::GET,
+                    remote_url(base_url, &["commits", commit_id, "changes"], &query)?,
+                    None,
+                    token.as_deref(),
+                )
+                .await
+            }
+            GraphClient::Embedded { uri, .. } => {
+                let db = Omnigraph::open(uri).await?;
+                let commit = db.get_commit(commit_id).await?;
+                let page = db
+                    .commit_changes_page(commit_id, cursor, limit, max_bytes)
+                    .await?;
+                Ok(commit_changes_output(&commit, &page))
+            }
+        }
+    }
+
     /// `load` — bulk-load `data` (a file path) onto `branch`, forking from
     /// `from` if missing. Returns the CLI `LoadOutput`; each arm keeps its
-    /// own mapping (remote sums the wire `IngestOutput.tables`, embedded
-    /// reads the richer `LoadResult` directly) — preserved exactly.
+    /// own mapping (remote uses the logical graph-batch result, embedded reads
+    /// the engine `LoadResult` directly).
     pub(crate) async fn load(
         &self,
         branch: &str,
@@ -378,39 +485,62 @@ impl GraphClient {
                 token,
             } => {
                 let data = std::fs::read_to_string(data)?;
-                // RFC-009 Phase 5: the canonical `load` verb targets the
-                // canonical `/load` route (the deprecated `ingest` verb below
-                // still rides `/ingest`).
-                let output = remote_json::<IngestOutput>(
-                    http,
-                    Method::POST,
-                    remote_url(base_url, &["load"], &[])?,
-                    Some(serde_json::to_value(IngestRequest {
-                        branch: Some(branch.to_string()),
-                        from: from.map(ToOwned::to_owned),
-                        mode: Some(mode.into()),
-                        data,
-                    })?),
+                let mut query = vec![("branch", branch), ("mode", mode.as_str())];
+                if let Some(from) = from {
+                    query.push(("from", from));
+                }
+                let request = apply_bearer_token(
+                    http.request(
+                        Method::POST,
+                        remote_url(base_url, &["load", "ndjson"], &query)?,
+                    ),
                     token.as_deref(),
                 )
-                .await?;
-                Ok(load_output_from_tables(base_url, branch, mode.as_str(), &output))
+                .header(reqwest::header::CONTENT_TYPE, "application/x-ndjson")
+                .body(data);
+                let response = request.send().await?;
+                let status = response.status();
+                let text = response.text().await?;
+                if !status.is_success() {
+                    if let Ok(error) = serde_json::from_str::<ErrorOutput>(&text) {
+                        bail!(error.error);
+                    }
+                    bail!("server returned {}: {}", status, text);
+                }
+                let output: GraphBatchLoadOutput = serde_json::from_str(&text)?;
+                Ok(load_output_from_graph_batch(
+                    base_url,
+                    mode.as_str(),
+                    &output,
+                ))
             }
             GraphClient::Embedded { uri, actor } => {
                 let db = Self::open_embedded(uri).await?;
-                let result = db
-                    .load_file_as(branch, from, data, mode.into(), actor.as_deref())
+                let data = std::fs::read_to_string(data)?;
+                let receipt = db
+                    .load_graph_batch_as_with_receipt(
+                        branch,
+                        from,
+                        &data,
+                        mode.into(),
+                        actor.as_deref(),
+                    )
                     .await?;
-                Ok(load_output_from_result(uri, branch, mode.as_str(), &result))
+                Ok(load_output_from_receipt(
+                    uri,
+                    branch,
+                    mode.as_str(),
+                    &receipt,
+                ))
             }
         }
     }
 
-    /// `ingest` — the deprecated alias of `load`. Same operation, but the
-    /// surfaced shape is the wire `IngestOutput` (printed by
-    /// `print_ingest_human`), so it is its own method. The embedded arm
-    /// echoes `actor_id: None` in the output exactly as the legacy arm did
-    /// (the actor is still attributed on the commit via `load_file_as`).
+    /// `ingest` — the deprecated loader-compatible path. Unlike canonical
+    /// `load`, it retains the historical permissive parser and JSON `/ingest`
+    /// wire shape. The embedded arm echoes `actor_id: None` in the output
+    /// exactly as the legacy arm did (the actor is still attributed on the
+    /// commit via `load_file_as_with_receipt`).
     pub(crate) async fn ingest(
         &self,
         branch: &str,
@@ -441,22 +571,34 @@ impl GraphClient {
             }
             GraphClient::Embedded { uri, actor } => {
                 let db = Self::open_embedded(uri).await?;
-                let result = db
-                    .load_file_as(branch, Some(from), data, mode.into(), actor.as_deref())
+                let receipt = db
+                    .load_file_as_with_receipt(
+                        branch,
+                        Some(from),
+                        data,
+                        mode.into(),
+                        actor.as_deref(),
+                    )
                     .await?;
-                Ok(ingest_output(uri, &result, mode.into(), None))
+                Ok(ingest_receipt_output(uri, &receipt, mode.into(), None))
             }
         }
     }
 
     /// `mutate` — run a change query against `branch`. Folds
     /// `execute_change` / `execute_change_remote` + the legacy request body.
+    ///
+    /// `expected_head` is the `--if-commit` compare-and-swap precondition:
+    /// the write runs only if the branch head commit still equals it. A
+    /// mismatch surfaces as the typed [`PreconditionFailedCli`] on both
+    /// transports so the verb can exit with `EXIT_PRECONDITION_FAILED` (4).
     pub(crate) async fn mutate(
         &self,
         branch: &str,
         query_source: &str,
         query_name: Option<&str>,
         params_json: Option<&Value>,
+        expected_head: Option<&str>,
     ) -> Result<ChangeOutput> {
         match self {
             GraphClient::Remote {
@@ -464,17 +606,29 @@ impl GraphClient {
                 base_url,
                 token,
             } => {
-                remote_json(
+                let (url, body) = if expected_head.is_some() {
+                    (
+                        remote_url(base_url, &["mutate", "if-graph-commit"], &[])?,
+                        serde_json::to_value(ChangeRequest {
+                            query: query_source.to_string(),
+                            name: query_name.map(ToOwned::to_owned),
+                            params: params_json.cloned(),
+                            branch: Some(branch.to_string()),
+                        })?,
+                    )
+                } else {
+                    (
+                        remote_url(base_url, &["change"], &[])?,
+                        legacy_change_request_body(query_source, query_name, branch, params_json),
+                    )
+                };
+                remote_json_with_graph_commit_precondition(
                     http,
                     Method::POST,
-                    remote_url(base_url, &["change"], &[])?,
-                    Some(legacy_change_request_body(
-                        query_source,
-                        query_name,
-                        branch,
-                        params_json,
-                    )),
+                    url,
+                    Some(body),
                     token.as_deref(),
+                    expected_head,
                 )
                 .await
             }
@@ -483,15 +637,34 @@ impl GraphClient {
                 let params = query_params_from_json(&query_params, params_json)?;
                 let db = Self::open_embedded(uri).await?;
                 let actor = actor.as_deref();
-                let result = db
-                    .mutate_as(branch, query_source, &selected_name, &params, actor)
-                    .await?;
+                let receipt = db
+                    .mutate_as_with_expected_head_receipt(
+                        branch,
+                        query_source,
+                        &selected_name,
+                        &params,
+                        actor,
+                        expected_head,
+                    )
+                    .await
+                    .map_err(|err| {
+                        let message = err.to_string();
+                        match err {
+                            omnigraph::error::OmniError::PreconditionFailed {
+                                branch: _,
+                                expected,
+                                actual,
+                            } => precondition_failed_cli(message, expected, actual).into(),
+                            other => color_eyre::eyre::Report::from(other),
+                        }
+                    })?;
                 Ok(ChangeOutput {
                     branch: branch.to_string(),
                     query_name: selected_name,
-                    affected_nodes: result.affected_nodes,
-                    affected_edges: result.affected_edges,
+                    affected_nodes: receipt.result.affected_nodes,
+                    affected_edges: receipt.result.affected_edges,
                     actor_id: actor.map(String::from),
+                    commit: receipt.commit.as_ref().map(commit_output),
                 })
             }
         }
@@ -520,10 +693,10 @@ impl GraphClient {
                 remote_json(
                     http,
                     Method::POST,
-                    remote_url(base_url, &["read"], &[])?,
-                    Some(serde_json::to_value(ReadRequest {
-                        query_source: query_source.to_string(),
-                        query_name: query_name.map(ToOwned::to_owned),
+                    remote_url(base_url, &["query"], &[])?,
+                    Some(serde_json::to_value(QueryRequest {
+                        query: query_source.to_string(),
+                        name: query_name.map(ToOwned::to_owned),
                         params: params_json.cloned(),
                         branch,
                         snapshot,
@@ -536,10 +709,10 @@ impl GraphClient {
                 let (selected_name, query_params) = select_named_query(query_source, query_name)?;
                 let params = query_params_from_json(&query_params, params_json)?;
                 let db = Self::open_embedded(uri).await?;
-                let result = db
-                    .query(target.clone(), query_source, &selected_name, &params)
+                let (result, graph_commit_id) = db
+                    .query_with_head(target.clone(), query_source, &selected_name, &params)
                     .await?;
-                Ok(read_output(selected_name, &target, result))
+                Ok(read_output(selected_name, &target, result, graph_commit_id))
             }
         }
     }
@@ -558,6 +731,7 @@ impl GraphClient {
         params_json: Option<&Value>,
         branch: Option<String>,
         snapshot: Option<String>,
+        expected_head: Option<&str>,
     ) -> Result<T> {
         match self {
             GraphClient::Remote {
@@ -571,12 +745,17 @@ impl GraphClient {
                     snapshot,
                     expect_mutation: Some(expect_mutation),
                 };
-                remote_json(
+                remote_json_with_graph_commit_precondition(
                     http,
                     Method::POST,
-                    remote_url(base_url, &["queries", name], &[])?,
+                    if expected_head.is_some() {
+                        remote_url(base_url, &["queries", name, "if-graph-commit"], &[])?
+                    } else {
+                        remote_url(base_url, &["queries", name], &[])?
+                    },
                     Some(serde_json::to_value(body)?),
                     token.as_deref(),
+                    expected_head,
                 )
                 .await
             }
@@ -655,7 +834,12 @@ impl GraphClient {
         }
     }
 
-    pub(crate) async fn branch_merge(&self, source: &str, into: &str) -> Result<BranchMergeOutput> {
+    pub(crate) async fn branch_merge(
+        &self,
+        source: &str,
+        into: &str,
+        delete_branch: bool,
+    ) -> Result<BranchMergeOutput> {
         match self {
             GraphClient::Remote {
                 http,
@@ -669,6 +853,7 @@ impl GraphClient {
                     Some(serde_json::to_value(BranchMergeRequest {
                         source: source.to_string(),
                         target: Some(into.to_string()),
+                        delete_branch,
                     })?),
                     token.as_deref(),
                 )
@@ -678,11 +863,25 @@ impl GraphClient {
                 let db = Self::open_embedded(uri).await?;
                 let actor = actor.as_deref();
                 let outcome = db.branch_merge_as(source, into, actor).await?;
+                // Composed exactly like the server handler: the merge is
+                // durable, so a deletion refusal/failure is reported in the
+                // payload, never as an error (parity_matrix pins the two
+                // composition sites against drift).
+                let (branch_deleted, branch_delete_error) = if delete_branch {
+                    match db.branch_delete_as(source, actor).await {
+                        Ok(()) => (Some(true), None),
+                        Err(err) => (Some(false), Some(err.to_string())),
+                    }
+                } else {
+                    (None, None)
+                };
                 Ok(BranchMergeOutput {
                     source: source.to_string(),
                     target: into.to_string(),
                     outcome: outcome.into(),
                     actor_id: actor.map(String::from),
+                    branch_deleted,
+                    branch_delete_error,
                 })
             }
         }
@@ -793,11 +992,175 @@ impl GraphClient {
         }
     }
 
-    /// `graphs list` — enumerate the graphs a remote multi-graph server
-    /// serves (`GET /graphs`). Remote-only by design: there is no local
-    /// enumeration endpoint, so the Embedded arm fails loudly. Routing it
-    /// through the enum still buys the shared `resolve()` addressing/token
-    /// preamble.
+    /// Stream one managed Blob without buffering the whole value. External
+    /// descriptors are reported but never followed or dereferenced.
+    pub(crate) async fn blob_get<W: Write + ?Sized>(
+        &self,
+        query: &BlobReadQuery,
+        range: Option<BlobRangeRequest>,
+        writer: &mut W,
+    ) -> Result<()> {
+        match self {
+            GraphClient::Embedded { uri, .. } => {
+                let db = Self::open_embedded(uri).await?;
+                let read = db
+                    .read_blob_at(blob_read_target(query), blob_cell(query))
+                    .await
+                    .map_err(map_embedded_blob_error)?;
+                match read.content {
+                    BlobContent::Managed { length, reader, .. } => {
+                        let selected = match range {
+                            Some(range) => range.resolve(length)?,
+                            None => 0..length,
+                        };
+                        let mut cursor = selected.start;
+                        while cursor < selected.end {
+                            let end = selected
+                                .end
+                                .min(cursor.saturating_add(BLOB_READ_RANGE_MAX_BYTES));
+                            let bytes = reader
+                                .read_range(cursor..end)
+                                .await
+                                .map_err(map_embedded_blob_error)?;
+                            let expected = usize::try_from(end - cursor)
+                                .map_err(|_| color_eyre::eyre::eyre!("Blob delivery failed"))?;
+                            if bytes.len() != expected {
+                                bail!("Blob delivery failed: managed range length mismatch");
+                            }
+                            writer.write_all(&bytes)?;
+                            cursor = end;
+                        }
+                        writer.flush()?;
+                        Ok(())
+                    }
+                    BlobContent::External(reference) => {
+                        let uri = whole_external_uri(&reference)?;
+                        bail!(
+                            "external Blob is not downloaded; URI: {uri}; use `blob stat --json` \
+                             to inspect the descriptor"
+                        )
+                    }
+                }
+            }
+            GraphClient::Remote {
+                base_url, token, ..
+            } => {
+                let http = build_blob_http_client()?;
+                let mut request = apply_bearer_token(
+                    http.request(Method::GET, blob_url(base_url, query)?),
+                    token.as_deref(),
+                );
+                if let Some(range) = range {
+                    request = request.header(RANGE, range.header_value());
+                }
+                let mut response = request
+                    .send()
+                    .await
+                    .map_err(|_| color_eyre::eyre::eyre!("Blob server request failed"))?;
+                let status = response.status();
+                if status == StatusCode::FOUND {
+                    let (uri, _snapshot_id) = external_response_headers(response.headers())?;
+                    bail!(
+                        "external Blob is not downloaded; URI: {uri}; use `blob stat --json` \
+                         to inspect the descriptor"
+                    );
+                }
+                let expected_status = if range.is_some() {
+                    StatusCode::PARTIAL_CONTENT
+                } else {
+                    StatusCode::OK
+                };
+                if status != expected_status {
+                    return Err(remote_blob_error(status));
+                }
+                let headers = managed_response_headers(response.headers())?;
+                if let Some(range) = range {
+                    validate_content_range(response.headers(), range, headers.length)?;
+                }
+                let mut written = 0_u64;
+                while let Some(chunk) = response
+                    .chunk()
+                    .await
+                    .map_err(|_| color_eyre::eyre::eyre!("Blob delivery stream failed"))?
+                {
+                    writer.write_all(&chunk)?;
+                    written = written
+                        .checked_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX))
+                        .ok_or_else(|| color_eyre::eyre::eyre!("Blob delivery failed"))?;
+                }
+                if written != headers.length {
+                    bail!(
+                        "Blob delivery stream ended after {written} bytes; expected {}",
+                        headers.length
+                    );
+                }
+                writer.flush()?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Inspect one Blob descriptor. Neither arm reads managed payload bytes;
+    /// external references are classified without probing their target.
+    pub(crate) async fn blob_stat(&self, query: &BlobReadQuery) -> Result<BlobStatOutput> {
+        match self {
+            GraphClient::Embedded { uri, .. } => {
+                let db = Self::open_embedded(uri).await?;
+                let read = db
+                    .read_blob_at(blob_read_target(query), blob_cell(query))
+                    .await
+                    .map_err(map_embedded_blob_error)?;
+                let resolved_snapshot = read.resolved_target.snapshot_id.to_string();
+                match read.content {
+                    BlobContent::Managed { length, etag, .. } => Ok(BlobStatOutput::managed(
+                        query,
+                        resolved_snapshot,
+                        length,
+                        etag.into_string(),
+                    )),
+                    BlobContent::External(reference) => Ok(BlobStatOutput::external(
+                        query,
+                        resolved_snapshot,
+                        whole_external_uri(&reference)?.to_string(),
+                    )),
+                }
+            }
+            GraphClient::Remote {
+                base_url, token, ..
+            } => {
+                let http = build_blob_http_client()?;
+                let response = apply_bearer_token(
+                    http.request(Method::HEAD, blob_url(base_url, query)?),
+                    token.as_deref(),
+                )
+                .send()
+                .await
+                .map_err(|_| color_eyre::eyre::eyre!("Blob server request failed"))?;
+                match response.status() {
+                    StatusCode::OK => {
+                        let headers = managed_response_headers(response.headers())?;
+                        Ok(BlobStatOutput::managed(
+                            query,
+                            headers.snapshot_id,
+                            headers.length,
+                            headers.etag,
+                        ))
+                    }
+                    StatusCode::FOUND => {
+                        let (uri, snapshot_id) = external_response_headers(response.headers())?;
+                        Ok(BlobStatOutput::external(query, snapshot_id, uri))
+                    }
+                    status => Err(remote_blob_error(status)),
+                }
+            }
+        }
+    }
+
+    /// `graphs list` — enumerate the graphs a multi-graph server serves
+    /// (`GET /graphs`). Reached only through registry-addressed clients
+    /// (`resolve_registry` / the D7 probe's `registry_client`), which always
+    /// build the Remote variant — the Embedded arm is unreachable by
+    /// construction and kept as a defensive internal-invariant bail.
     pub(crate) async fn list_graphs(&self) -> Result<GraphListResponse> {
         match self {
             GraphClient::Remote {
@@ -815,10 +1178,94 @@ impl GraphClient {
                 .await
             }
             GraphClient::Embedded { .. } => bail!(
-                "`omnigraph graphs list` requires a remote multi-graph server \
-                 (--server <url>). To enumerate the graphs in a cluster, run \
-                 `omnigraph cluster status --config <dir>`."
+                "internal error: `graphs list` reached an embedded client — registry \
+                 addressing always resolves a server"
             ),
         }
+    }
+}
+
+fn validate_content_range(
+    headers: &reqwest::header::HeaderMap,
+    requested: BlobRangeRequest,
+    served_length: u64,
+) -> Result<()> {
+    let raw = headers
+        .get(CONTENT_RANGE)
+        .ok_or_else(|| color_eyre::eyre::eyre!("Blob server response omitted Content-Range"))?
+        .to_str()
+        .map_err(|_| color_eyre::eyre::eyre!("Blob server returned an invalid Content-Range"))?;
+    let Some(spec) = raw.strip_prefix("bytes ") else {
+        bail!("Blob server returned an invalid Content-Range");
+    };
+    let Some((bounds, total)) = spec.split_once('/') else {
+        bail!("Blob server returned an invalid Content-Range");
+    };
+    let Some((start, end)) = bounds.split_once('-') else {
+        bail!("Blob server returned an invalid Content-Range");
+    };
+    let start = start
+        .parse::<u64>()
+        .map_err(|_| color_eyre::eyre::eyre!("Blob server returned an invalid Content-Range"))?;
+    let end = end
+        .parse::<u64>()
+        .map_err(|_| color_eyre::eyre::eyre!("Blob server returned an invalid Content-Range"))?;
+    let total = total
+        .parse::<u64>()
+        .map_err(|_| color_eyre::eyre::eyre!("Blob server returned an invalid Content-Range"))?;
+    let actual = end
+        .checked_sub(start)
+        .and_then(|length| length.checked_add(1))
+        .ok_or_else(|| color_eyre::eyre::eyre!("Blob server returned an invalid Content-Range"))?;
+    let available = total.checked_sub(requested.start()).ok_or_else(|| {
+        color_eyre::eyre::eyre!("Blob server returned an inconsistent Content-Range")
+    })?;
+    let expected = requested
+        .requested_length()
+        .map_or(available, |length| length.min(available));
+    if start != requested.start() || actual != served_length || actual != expected || end >= total {
+        bail!("Blob server returned an inconsistent Content-Range");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn content_range_headers(value: &'static str) -> reqwest::header::HeaderMap {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(CONTENT_RANGE, value.parse().unwrap());
+        headers
+    }
+
+    #[test]
+    fn resolve_registry_is_sync_and_yields_the_bare_base_url() {
+        // Structural proof the RFC-011 D7 multi-graph probe cannot fire on the
+        // graphs-list path: resolve_registry is synchronous (called here with
+        // no tokio runtime), while the probe is async and performs GET
+        // /graphs. Also pins the URL-corruption fix: the bare base URL with
+        // the trailing slash trimmed and no `/graphs/<id>` segment. A literal
+        // `://` --server value bypasses the operator server registry, so a
+        // developer's real config cannot change the outcome.
+        let client = GraphClient::resolve_registry(Some("http://server.invalid:9/"), None).unwrap();
+        assert_eq!(client.uri(), "http://server.invalid:9");
+        assert!(client.is_remote());
+    }
+
+    #[test]
+    fn content_range_must_cover_the_exact_requested_or_eof_clamped_length() {
+        let exact = BlobRangeRequest::new(Some(0), Some(6)).unwrap().unwrap();
+        validate_content_range(&content_range_headers("bytes 0-5/100"), exact, 6).unwrap();
+        assert!(
+            validate_content_range(&content_range_headers("bytes 0-2/100"), exact, 3).is_err(),
+            "a self-consistent but truncated 206 must not be accepted as the requested range"
+        );
+
+        let clamped = BlobRangeRequest::new(Some(98), Some(6)).unwrap().unwrap();
+        validate_content_range(&content_range_headers("bytes 98-99/100"), clamped, 2).unwrap();
+
+        let open = BlobRangeRequest::new(Some(97), None).unwrap().unwrap();
+        validate_content_range(&content_range_headers("bytes 97-99/100"), open, 3).unwrap();
     }
 }

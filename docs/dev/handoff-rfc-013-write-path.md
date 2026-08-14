@@ -7,9 +7,12 @@
 > internal tables, and the per-write `_graph_commits` scan term is gone. See
 > [versioning.md](versioning.md) and [invariants.md](invariants.md).
 
-**Status:** living handoff. **Source of truth is [`rfc-013-write-path-latency.md`](rfc-013-write-path-latency.md)** —
-this doc is the *current-state map + the decisions/validation from the latest work cycle
-+ the concrete next actions*. When they disagree, the RFC wins (and fix this doc).
+**Status:** historical handoff. **Source of truth is
+[`rfc-013-write-path-latency.md`](rfc-013-write-path-latency.md)**; current write
+and identity behavior lives in [writes.md](writes.md), [canon.md](canon.md), and
+[RFC-028](../rfcs/0028-stable-schema-identity.md). The cycle-specific branch,
+line-number, and “next action” notes below are retained as implementation history,
+not a current work queue.
 
 **Audience:** the engineer/agent who picks up RFC-013 next.
 
@@ -61,11 +64,14 @@ amplification = PR2's target.)
 
 ### A.2 What is LANDED on `main`
 
-- **Step 2a** — `optimize` compacts the internal tables too (`__manifest` / `_graph_commits` /
-  `_graph_commit_actors`), so a *periodically-compacted* graph keeps Term-1 flat. (Cleanup/version-GC
-  of them is the still-open PR1.)
+- **Step 2a** — #291 originally added compaction for all three then-current
+  internal tables (`__manifest`, `_graph_commits`, and `_graph_commit_actors`).
+  After strand-and-retire removed the two lineage datasets, the live behavior is
+  `__manifest`-only internal compaction. A periodically-compacted graph therefore
+  keeps the remaining Term-1 flat. (`__manifest` cleanup/version-GC is still open.)
 - **Phase 7 / #299** (`1c5cb874`) — graph lineage lives in `__manifest` (`graph_commit` +
-  `graph_head:<branch>` rows in the same publish merge-insert; `_graph_commits` is now a projection;
+  `graph_head:<branch>` rows in the same publish merge-insert; `CommitGraph` is
+  now a projection and the former lineage datasets are gone;
   v3→v4 internal-schema migration; schema-version floor). This removed the per-write commit-graph
   scan and closed the manifest→commit-graph atomicity + commit-graph-parent-under-concurrency gaps.
   **This is the base everything below builds on.**
@@ -90,7 +96,9 @@ correctness fix, and PR2.1's ground-truth cost harness.
    row UPDATEd in place at the same Lance version with a new `table_branch` (merge-insert `UpdateAll`
    on the deterministic `version_object_id`) was appended after `existing_versions`, and
    `assemble_manifest_state` kept the stale first entry, so the warm coordinator held the wrong fork
-   until refresh. Fix: key the fold's version entries by `(table_key, table_version)` so a pending row
+   until refresh. The original fix keyed by `(table_key, table_version)`; RFC-028
+   later replaced that mutable-name coordinate with `(stable_table_id,
+   table_incarnation_id, table_version)` so a pending row
    **replaces** the existing one (mirroring `UpdateAll`). Test-first repro in
    `db/manifest/tests.rs::test_post_publish_fold_reflects_owner_branch_handoff` (red→green).
 3. **PR2.1 — ground-truth cost harness** (`fd73f01b`, `59d9ff39`, `3cd2b2c1`, `383022e8`, `9f1e5b6e`).
@@ -177,9 +185,11 @@ a 0-IO cache hit). So, apples-to-apples (both ground truth), per-write `__manife
 - **`cost_harness` must wrap the WHOLE test body** (the graph must open inside it), and the body future
   must be **`Box::pin`-ed** — wrapping a whole test body in another async layer overflows the test
   thread's stack (these cost tests already raise `recursion_limit`).
-- **The fold must mirror merge-insert identity.** `version_object_id(table_key, version)` is
-  deterministic, so a same-version handoff is an in-place `UpdateAll`; the in-memory fold must key by
-  `(table_key, version)` and replace, or the warm coordinator desyncs from a fresh re-scan. The
+- **The fold must mirror merge-insert identity.** The historical implementation
+  used `version_object_id(table_key, version)`; RFC-028 now derives the object ID
+  and fold key from `(stable_table_id, table_incarnation_id, version)`. A
+  same-version handoff is still an in-place `UpdateAll`, so the in-memory fold
+  must replace by that immutable key or the warm coordinator desyncs from a fresh re-scan. The
   byte-identity guard is `writes.rs::post_publish_fold_matches_fresh_reopen`.
 - **`lance-io` `test-util`** is enabled in dev-deps (gives `IoStats.requests` + `assert_io_eq!`,
   diagnostics only); production builds exclude dev-deps so they never see it.
@@ -202,12 +212,14 @@ for the canonical list. Current reality:
 - **Step 3a** — opener bypass: write opens go direct (`Dataset::open` by URI + version)
   instead of the Lance-namespace builder (#288). **This already banked the dominant
   depth win** — see §2 below; it reframes everything.
-- **Step 2a** — internal-table compaction: `optimize` now compacts `__manifest` /
-  `_graph_commits` / `_graph_commit_actors` (#291). Plus the RFC latency-model
-  correction (#292).
+- **Step 2a** — internal-table compaction: #291 originally covered
+  `__manifest` plus the two then-live lineage datasets. The current
+  post-retirement implementation compacts only `__manifest`. Plus the RFC
+  latency-model correction (#292).
 - **Step 4 / Phase 7** — graph lineage moved into `__manifest` (#299 `1c5cb874`):
   `graph_commit` + mutable `graph_head:<branch>` in the publish merge-insert,
-  `_graph_commits` now a projection. **The base for the live branch (§A).**
+  with `CommitGraph` projected directly from those rows and no separate lineage
+  dataset. **The base for the live branch (§A).**
 - **Optimize-vs-write race** — optimize survives a cross-process write race on the
   same table (#297, **LANDED** — origin/main `6d4606a8`; see §6 for why it's not
   redundant with Design A). Step 3b stacks on top of this.
@@ -280,7 +292,7 @@ retires the window entirely.** See §5.
 
 ### 1d. The second facet: the write base is a stale pin (no probe)
 The READ path resolves its base behind a freshness probe (`resolve_target_inner`
-omnigraph.rs:~1072 → `probe_latest_incarnation` → `refresh_manifest_only`); the WRITE path
+omnigraph.rs → `probe_latest_incarnation` → `refresh_for_live_read`); the WRITE path
 does NOT (`resolved_branch_target` omnigraph.rs:~778 returns the warm `coord.snapshot()` for
 the bound branch, no probe). So a long-lived server's write base lags the live manifest. That
 single staleness feeds **two distinct failure modes**, both surfaced this cycle:
@@ -312,7 +324,7 @@ single staleness feeds **two distinct failure modes**, both surfaced this cycle:
    `writes.rs::served_strict_delete_after_external_optimize_advance_auto_refreshes`
    (`#[ignore]` on branch `fix/write-path-stale-view-probe`). **The naive "just probe" fix is
    proven wrong** — a blanket probe silently refreshes past *logical* advances too, breaking
-   `consistency::stale_handle_public_mutation_must_refresh_then_retry` (the deliberate
+   `consistency::stale_handle_strict_mutation_returns_read_set_changed_then_refresh_retry` (the deliberate
    cross-process lost-update OCC primitive). The fix must **discriminate by op class**.
 
 **Both fold into Design A (step 5), same as §1c.** `open_txn`'s one warm probe makes the base
@@ -425,13 +437,14 @@ reopen/replan **semantics** are permanent. (Noted in RFC §6.6.)
 ## 4. DONE: Step 3b — capture-once `WriteTxn` (shipped on `rfc-013-step-3b-writetxn-v2`)
 
 **Delivered:** on the **table-touch hot path**, a single `mutate`/`load` validates the schema
-contract **once** and opens each touched data table **at most once** — a constant-factor/RTT
-win (not a depth-slope win; 1a). Two cost gates in `write_cost.rs` lock it (both on a node
-insert): `write_validates_schema_contract_once` (3 `read_text` / 2 `exists`, was 12/9) and
+contract once at capture and once at the RFC-022 pre-effect gate, with one cheap trailing
+identity-marker read fencing capture (never per table), and opens each touched data table
+**at most once** — a constant-factor/RTT win (not a depth-slope win;
+1a). Two cost gates in `write_cost.rs` lock it (both on a node insert):
+`write_schema_io_is_bounded_to_capture_fence_and_effect_gate` (7 `read_text` / 4 `exists`) and
 `keyed_insert_opens_table_at_most_once` (`data_open_count <= 1`, was 4). The carrier is the
-minimal `WriteTxn { branch, base }`, threaded as `Option<&WriteTxn>` (`Some` on the hot
-mutate/load path, `None` byte-identical everywhere else); it **converges into** step 5's
-`PublishPlan`.
+operation-local `WriteTxn { branch, base, authority, catalog }`; the catalog is built from the
+exact accepted IR named by the authority token. It **converges into** step 5's `PublishPlan`.
 
 **Not "once" everywhere (scope, not regression):** edge endpoint / cardinality RI validation
 (`ensure_node_id_exists`, the loader's RI + cardinality) still resolves through
@@ -444,8 +457,9 @@ gate yet (only the node gates above).
 
 Commits (off merged-#297 main):
 - **Stage 0** — scope `open_count` → `data_open_count`/`internal_open_count` by URI class
-  (the review fix: `open_dataset_tracked` also opens `__manifest`/`_graph_commits`, so the
-  raw counter conflated them and the gate was unreachable). Re-baselined RED 4.
+  (historically, before lineage-table retirement, `open_dataset_tracked` also opened
+  `__manifest`/`_graph_commits`, so the raw counter conflated them and the gate was
+  unreachable). Re-baselined RED 4.
 - **Commit A (schema-once)** — capture `txn` once at entry (the single validation); the 4
   validation sites collapse: S1 (entry `ensure_schema_state_valid`) removed; S3a
   (`open_for_mutation_on_branch`) + S3b (`prepare_updates_for_commit`) source `txn.base`;
@@ -521,9 +535,10 @@ substrate-shaped scaffolding (custom WAL / job queue / second coordination table
 over the window — strictly higher liability than either Design A or waiting for MTT.
 
 **Deeper-than-A (post-MTT or as Lance exposes uncommitted variants):** all-uncommitted-fragments
-+ one manifest commit would shrink the A-before-B window itself, blocked today by Lance not
-exposing uncommitted variants for `compact_files` / `optimize_indices` / vector index (#6666
-open; delete #6658 shipped). Track, don't build yet.
++ one manifest commit would shrink the A-before-B window itself. Lance still exposes no
+uncommitted `compact_files` / `optimize_indices`; beta.21 does expose the full-table vector
+stage OmniGraph needs, while #6666 remains about generic multi-segment publication (delete
+#6658 shipped). Track the maintenance primitives; migrate vector through the reconciler.
 
 ### 5.1 Step-5 design constraints inherited from the #295 spec review
 3b shipped a **minimal** `WriteTxn { branch, base }` (schema-once + open-collapse via
@@ -587,7 +602,8 @@ for #298** (which built none of those constructs) but are **load-bearing constra
   residual concurrent TOCTOU is the §7.1 gap (step 4) — un-widen here, don't over-reach.
 - **Step 4 / Phase 7** (`iss-991`): **LANDED on `main` as #299 (`1c5cb874`).** Lineage now lives
   in `__manifest` (`graph_commit` + mutable `graph_head:<branch>` in the same merge-insert;
-  `_graph_commits` is a projection). Removed the per-write `commit_graph.refresh`; closed the
+  `CommitGraph` is projected from those rows and the old lineage dataset is
+  gone). Removed the per-write `commit_graph.refresh`; closed the
   manifest→commit-graph atomicity + commit-graph-parent-under-concurrency gaps. *(Historical note,
   kept for the §7.1 framing it carried:)* it
   carries the §7.1 *concurrent* write-skew fix (needs the `graph_head` contention row) —
@@ -600,7 +616,7 @@ for #298** (which built none of those constructs) but are **load-bearing constra
   false-fail** (§1d.2) — the op-class-aware precondition + `open_txn` probe. The contract is
   two tests passing *together*: un-ignore
   `writes.rs::served_strict_delete_after_external_optimize_advance_auto_refreshes` (goes green)
-  *while* `consistency::stale_handle_public_mutation_must_refresh_then_retry` stays green
+  *while* `consistency::stale_handle_strict_mutation_returns_read_set_changed_then_refresh_retry` stays green
   (maintenance fast-forwards; logical fails loudly). Self-contained enough to ship standalone
   like #297 if prod pain is acute; otherwise fold into the single PublishPlan delta-interpreter.
 - **Step 2b** — internal-table cleanup + the Q8 monotonic watermark (a Lance boundary tag).

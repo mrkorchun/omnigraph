@@ -6,8 +6,9 @@
 //!
 //! 1. Each writer that performs a multi-table commit writes a small JSON
 //!    sidecar at `__recovery/{ulid}.json` BEFORE its per-table
-//!    `commit_staged` loop, listing every `(table_key, table_path,
-//!    expected_version, post_commit_pin)` it intends to publish.
+//!    `commit_staged` loop, listing every `(stable_table_id,
+//!    table_incarnation_id, table_key, table_path, expected_version,
+//!    post_commit_pin)` it intends to publish.
 //! 2. After the manifest publish (Phase C) succeeds, the writer deletes
 //!    the sidecar.
 //! 3. If the writer crashes between Phase B begin and Phase C success,
@@ -23,73 +24,205 @@
 //!   `self.manifest.version` (currently checked-out version). From HEAD =
 //!   `h`, produces a new commit at `h + 1` with content == checked-out
 //!   version. Pinned by
-//!   `tests/staged_writes.rs::lance_restore_appends_one_commit_with_checked_out_content`.
+//!   `src/table_store/staged_tests.rs::lance_restore_appends_one_commit_with_checked_out_content`.
 //! - `Dataset::restore` "wins" against concurrent Append/Update/Delete/
 //!   CreateIndex/Merge — see `check_restore_txn` at lance-6.0.1
 //!   `src/io/commit/conflict_resolver.rs:986`. The hazard is documented
-//!   by `tests/staged_writes.rs::lance_restore_loses_to_concurrent_append_via_orphaning`.
-//!   The open-time sweep sidesteps the hazard by running before any
-//!   other writers can race; the in-process heal
-//!   ([`heal_pending_sidecars_roll_forward`]) never restores (roll-
-//!   forward only) and guards via per-(table_key, branch) queue
-//!   acquisition.
+//!   by `src/table_store/staged_tests.rs::lance_restore_loses_to_concurrent_append_via_orphaning`.
+//!   The open-time sweep and live healer both join the root-scoped ordered
+//!   gates. The in-process healer ([`heal_pending_sidecars_roll_forward`])
+//!   additionally never restores (roll-forward only); foreign processes remain
+//!   outside this serialization boundary.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use crate::db::graph_coordinator::GraphCoordinator;
 use crate::db::recovery_audit::{RecoveryAudit, RecoveryAuditRecord, RecoveryKind, TableOutcome};
-use crate::db::schema_state::SchemaStateRecovery;
+use crate::db::schema_state::{
+    SchemaStateRecovery, read_schema_state_identity, schema_ir_staging_uri,
+    schema_source_staging_uri, schema_state_staging_uri,
+};
 use crate::error::{OmniError, Result};
 use crate::storage::StorageAdapter;
+use crate::table_store::StagedTransactionIdentity;
 
 use super::Snapshot;
-use super::publisher::{GraphNamespacePublisher, LineageIntent, ManifestBatchPublisher};
-use super::{ManifestChange, SubTableUpdate, TableRegistration, TableTombstone};
+use super::publisher::{
+    GraphHeadExpectation, GraphNamespacePublisher, LineageIntent, ManifestBatchPublisher,
+    PublishPrecondition,
+};
+use super::{
+    ExpectedTableVersions, ManifestChange, ManifestCoordinator, SubTableUpdate, TableIdentity,
+    TableRegistration, TableRename, TableTombstone, TableVersionExpectation,
+};
 
-/// System actor identifier recorded on every recovery commit. Operators
-/// distinguish recovery commits from user commits in `omnigraph commit list`
-/// by filtering on this actor; the original sidecar's actor (if any) flows
-/// into the audit row's `recovery_for_actor` field.
+/// System actor identifier for recovery-owned lineage: legacy recovery,
+/// exact-protocol rollback, schema-v6 EnsureIndices rollback, and orphan
+/// discard. A v3/v4 roll-forward
+/// deliberately publishes the original writer's fixed lineage and actor
+/// instead. The recovery audit row is the authoritative attribution surface in
+/// both cases; the original sidecar actor flows into its `recovery_for_actor`
+/// field.
 pub(crate) const RECOVERY_ACTOR: &str = "omnigraph:recovery";
 
-/// Publish a recovery action's manifest `updates` AND its recovery commit in one
-/// CAS (RFC-013 Phase 7). The recovery commit's lineage (`graph_commit` +
-/// `graph_head`) rides the same merge-insert as the table-version re-pin — there
-/// is no separate `_graph_commits.lance` write and no manifest→commit-graph gap.
+/// Publish a recovery action's manifest `updates` AND its lineage in one CAS
+/// (RFC-013 Phase 7). Legacy recovery and rollback publish a recovery commit;
+/// v3/v4 and v6 rollback reuse a pre-minted id, while v3/v4 roll-forward
+/// publishes the original writer's fixed lineage intent. The lineage
+/// (`graph_commit` + `graph_head`) rides the same
+/// merge-insert as the table-version re-pin — there is no separate
+/// `_graph_commits.lance` write and no manifest→commit-graph gap.
 /// `updates` is empty for the no-table-change recovery paths (all-NoMovement
 /// roll-back, stale-sidecar cleanup, orphaned-branch discard); the lineage rows
 /// still publish, so the recovery commit is always durable.
 ///
-/// The commit's first parent is resolved by the publisher (the live head of the
-/// recovery's branch); its merged-in parent is the sidecar's recorded source
-/// head for a rolled-forward branch merge, matching the pre-Phase-7 merge-commit
-/// shape. Returns the new manifest version and the minted recovery commit id
-/// (which the audit row references).
+/// Legacy commits resolve their parent from the live branch head. An exact
+/// roll-forward instead carries an exact graph-head precondition, so it cannot
+/// be silently re-parented after authority changes. Returns the new manifest
+/// version and the stable commit id the audit row references.
 async fn publish_recovery_commit(
     root_uri: &str,
     sidecar: &RecoverySidecar,
     kind: RecoveryKind,
     updates: &[ManifestChange],
-    expected: &HashMap<String, u64>,
+    expected: &ExpectedTableVersions,
 ) -> Result<(u64, String)> {
-    let merged_parent_commit_id = match (sidecar.writer_kind, kind) {
-        (SidecarKind::BranchMerge, RecoveryKind::RolledForward) => {
-            sidecar.merge_source_commit_id.clone()
+    let exact_lineage = sidecar
+        .protocol_v3
+        .as_ref()
+        .map(|protocol| &protocol.lineage)
+        .or_else(|| {
+            sidecar
+                .protocol_v4
+                .as_ref()
+                .map(|protocol| &protocol.lineage)
+        })
+        .or_else(|| {
+            sidecar
+                .protocol_v7
+                .as_ref()
+                .map(|protocol| &protocol.lineage)
+        })
+        .or_else(|| {
+            sidecar
+                .protocol_v8
+                .as_ref()
+                .map(|protocol| &protocol.lineage)
+        });
+    let exact_rollback_id = sidecar
+        .protocol_v3
+        .as_ref()
+        .map(|protocol| protocol.rollback_graph_commit_id.as_str())
+        .or_else(|| {
+            sidecar
+                .protocol_v4
+                .as_ref()
+                .map(|protocol| protocol.rollback_graph_commit_id.as_str())
+        })
+        .or_else(|| {
+            sidecar
+                .protocol_v7
+                .as_ref()
+                .map(|protocol| protocol.rollback_graph_commit_id.as_str())
+        })
+        .or_else(|| {
+            sidecar
+                .protocol_v8
+                .as_ref()
+                .map(|protocol| protocol.rollback_graph_commit_id.as_str())
+        })
+        .or_else(|| {
+            matches!(kind, RecoveryKind::RolledBack)
+                .then(|| {
+                    sidecar
+                        .ensure_indices_rollback_v6
+                        .as_ref()
+                        .map(|protocol| protocol.rollback_graph_commit_id.as_str())
+                })
+                .flatten()
+        });
+    let intent = match (exact_lineage, exact_rollback_id, kind) {
+        (Some(lineage), _, RecoveryKind::RolledForward) => LineageIntent::from(lineage),
+        (_, Some(rollback_graph_commit_id), RecoveryKind::RolledBack) => LineageIntent {
+            graph_commit_id: rollback_graph_commit_id.to_string(),
+            branch: sidecar.branch.clone(),
+            actor_id: Some(RECOVERY_ACTOR.to_string()),
+            merged_parent_commit_id: None,
+            created_at: sidecar
+                .started_at
+                .parse::<i64>()
+                .unwrap_or(crate::db::now_micros()?),
+        },
+        (Some(_), _, RecoveryKind::OrphanedBranchDiscarded)
+        | (_, Some(_), RecoveryKind::OrphanedBranchDiscarded) => {
+            return Err(OmniError::manifest_internal(
+                "orphaned-branch discard cannot publish through an exact recovery protocol",
+            ));
         }
-        _ => None,
+        (None, None, _) => {
+            let merged_parent_commit_id = match (sidecar.writer_kind, kind) {
+                (SidecarKind::BranchMerge, RecoveryKind::RolledForward) => {
+                    sidecar.merge_source_commit_id.clone()
+                }
+                _ => None,
+            };
+            LineageIntent {
+                graph_commit_id: ulid::Ulid::new().to_string(),
+                branch: sidecar.branch.clone(),
+                actor_id: Some(RECOVERY_ACTOR.to_string()),
+                merged_parent_commit_id,
+                created_at: crate::db::now_micros()?,
+            }
+        }
+        _ => {
+            return Err(OmniError::manifest_internal(
+                "exact recovery sidecar is missing either lineage or rollback identity",
+            ));
+        }
     };
-    let intent = LineageIntent {
-        graph_commit_id: ulid::Ulid::new().to_string(),
-        branch: sidecar.branch.clone(),
-        actor_id: Some(RECOVERY_ACTOR.to_string()),
-        merged_parent_commit_id,
-        created_at: crate::db::now_micros()?,
+    let publisher = GraphNamespacePublisher::new_with_session(
+        root_uri,
+        sidecar.branch.as_deref(),
+        crate::lance_access::control_session(),
+    );
+    let exact_authority = sidecar
+        .protocol_v3
+        .as_ref()
+        .map(|protocol| &protocol.authority)
+        .or_else(|| {
+            sidecar
+                .protocol_v4
+                .as_ref()
+                .map(|protocol| &protocol.authority)
+        })
+        .or_else(|| {
+            sidecar
+                .protocol_v7
+                .as_ref()
+                .map(|protocol| &protocol.authority)
+        })
+        .or_else(|| {
+            sidecar
+                .protocol_v8
+                .as_ref()
+                .map(|protocol| &protocol.authority)
+        });
+    let precondition = match (exact_authority, kind) {
+        (Some(authority), RecoveryKind::RolledForward) => {
+            PublishPrecondition::ExactGraphHead(GraphHeadExpectation::new(
+                sidecar.branch.as_deref(),
+                authority.branch_identifier.clone(),
+                authority.graph_head.clone(),
+            ))
+        }
+        _ => PublishPrecondition::Any,
     };
-    let publisher = GraphNamespacePublisher::new(root_uri, sidecar.branch.as_deref());
-    let outcome = publisher.publish(updates, expected, Some(&intent)).await?;
+    let outcome = publisher
+        .publish_with_precondition(updates, expected, Some(&intent), &precondition)
+        .await?;
     Ok((outcome.dataset.version().version, intent.graph_commit_id))
 }
 
@@ -109,13 +242,110 @@ pub(crate) const RECOVERY_DIR_NAME: &str = "__recovery";
 /// back); at v1 it predates confirmation and keeps the loose roll-forward. The
 /// reader must distinguish the two, so this is a real version bump, not an
 /// additive field.
-pub(crate) const SIDECAR_SCHEMA_VERSION: u32 = 2;
+///
+/// v2 → v3: RFC-022 exact mutation/load effects. An enrolled sidecar carries
+/// the captured authority, stable lineage/rollback ids, planned Lance
+/// transaction identities, a canonical manifest delta, and an explicit
+/// Armed → EffectsConfirmed transition. Schema v2 remains the bounded
+/// Optimize maintenance protocol; exact adapters use their assigned later
+/// schema rather than reinterpreting a v2 file.
+///
+/// v3 → v4: RFC-022 branch-merge authority and exact confirmed output. A v4
+/// sidecar carries the captured target authority, fixed merge lineage and
+/// rollback ids, the complete intended manifest delta (including pointer-only
+/// updates), and an ordered exact transaction chain for each multi-commit HEAD
+/// effect or an explicit ref-only first-touch fork. Mutation/Load remain fixed
+/// at v3: raising the reader maximum must not silently enroll an existing writer
+/// in new semantics.
+///
+/// v4 → v5: SchemaApply Phase-C confirmation. A v5 SchemaApply sidecar carries
+/// the target schema identity and a durable manifest-published marker so an
+/// empty table-pin set can distinguish pre-staging rollback from Phase-D delete
+/// residue. This bridge is retained for compatibility; current SchemaApply uses
+/// the exact v7 protocol.
+///
+/// v5 → v6: EnsureIndices fixed rollback identity. This compatibility protocol
+/// uses the loose classifier, but a pre-minted rollback commit id and a durably
+/// prepared audit payload make rollback re-entry outcome-exact. Current
+/// EnsureIndices uses the exact v8 protocol.
+///
+/// v6 → v7: exact SchemaApply authority and physical ownership. A v7
+/// sidecar carries the initiating actor/fixed lineage, exact existing-table
+/// overwrite and first-touch dataset transaction identities, the complete
+/// registrations/updates/tombstones delta, and an Armed → EffectsConfirmed
+/// transition that includes durable schema staging.
+///
+/// v7 → v8: exact EnsureIndices authority and physical ownership. A v8
+/// sidecar replaces v6's loose classifier with one exact CreateIndex
+/// transaction per table, a complete fixed manifest delta, and target-ref
+/// identity for first-touch named-branch tables.
+///
+/// v8 → v9: RFC-028 table-lifetime identity. Every table pin, effect,
+/// registration, rename, tombstone, and manifest output slot carries an
+/// explicit non-zero `(stable_table_id, table_incarnation_id)`. Active writers
+/// all emit v9; the writer-specific payload field names remain `protocol_v3`,
+/// `protocol_v4`, `protocol_v7`, and `protocol_v8` only to avoid duplicating
+/// their established exact-effect shapes. Pre-v9 files are never upgraded by
+/// alias inference or a serde default.
+pub(crate) const SIDECAR_SCHEMA_VERSION: u32 = 9;
+
+/// The only recovery generation emitted by the identity-aware manifest-v5/v6
+/// write paths.
+pub(crate) const IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION: u32 = 9;
+
+/// Oldest loose-classification generation retained for test fixtures. No
+/// active constructor emits it.
+#[cfg(test)]
+pub(crate) const LEGACY_SIDECAR_SCHEMA_VERSION: u32 = 2;
 
 /// The version at which Phase-B confirmation shipped. A `BranchMerge` sidecar is
 /// confirmation-aware (strict classification) iff `schema_version >=` this.
 /// FIXED at 2 — NOT derived from [`SIDECAR_SCHEMA_VERSION`] — so a future bump to
 /// v3+ still treats v2 sidecars as confirmation-aware.
 pub(crate) const CONFIRMATION_SCHEMA_VERSION: u32 = 2;
+
+/// Mutation/load exact-effect semantics shipped at v3. Fixed rather than tied
+/// to the current maximum so future sidecar versions retain this floor.
+pub(crate) const EXACT_EFFECT_IDENTITY_SCHEMA_VERSION: u32 = 3;
+
+/// Historical Mutation/Load protocol floor. Active writers emit v9 while
+/// retaining the `protocol_v3` payload field name.
+#[cfg(test)]
+pub(crate) const MUTATION_LOAD_SIDECAR_SCHEMA_VERSION: u32 = 3;
+
+/// Historical BranchMerge protocol floor.
+pub(crate) const BRANCH_MERGE_SIDECAR_SCHEMA_VERSION: u32 = 4;
+
+/// SchemaApply recovery generation with target identity + durable Phase-C
+/// confirmation. Its table classification remains legacy loose-match.
+pub(crate) const SCHEMA_APPLY_CONFIRMATION_SCHEMA_VERSION: u32 = 5;
+
+/// EnsureIndices generation with a fixed rollback outcome. This is narrower
+/// than an exact effect adapter: it makes compensation idempotent without
+/// claiming transaction-level ownership of the derived index commits.
+pub(crate) const ENSURE_INDICES_ROLLBACK_SCHEMA_VERSION: u32 = 6;
+
+/// Exact SchemaApply generation. Kept distinct from the v3 Mutation/Load
+/// payload because first-touch dataset rollback deletes an owned dataset rather
+/// than restoring a prior version, and because schema staging is itself part of
+/// the confirmed effect set.
+pub(crate) const SCHEMA_APPLY_EXACT_SCHEMA_VERSION: u32 = 7;
+
+/// Exact EnsureIndices generation. Schema-v6 remains readable under its
+/// original loose-classifier/fixed-rollback semantics.
+pub(crate) const ENSURE_INDICES_EXACT_SCHEMA_VERSION: u32 = 8;
+
+/// Maximum logical data transactions one table may arm in a BranchMerge chain.
+/// The writer rejects a larger plan before the sidecar exists.
+pub(crate) const MAX_BRANCH_MERGE_DATA_TRANSACTIONS: u64 = 1024;
+
+/// Bound the cold-path transaction-history probes used by exact recovery.
+/// BranchMerge reserves two versions beyond its logical chain: one allowed
+/// derived `CreateIndex` tail and one compensating `Restore`. Recovery may
+/// crash after that Restore but before its manifest publish, so both versions
+/// must remain classifiable on the next sweep. Exceeding this bound fails
+/// closed rather than turning open into an unbounded history walk.
+pub(crate) const MAX_EFFECT_IDENTITY_SCAN_VERSIONS: u64 = MAX_BRANCH_MERGE_DATA_TRANSACTIONS + 2;
 
 /// Selects which recovery actions are allowed in a sweep.
 ///
@@ -126,7 +356,7 @@ pub(crate) const CONFIRMATION_SCHEMA_VERSION: u32 = 2;
 /// `Dataset::restore`: it "wins" against concurrent Append/Update/
 /// Delete/CreateIndex/Merge per `check_restore_txn`, silently orphaning
 /// the concurrent writer's commit (pinned by
-/// `tests/staged_writes.rs::lance_restore_loses_to_concurrent_append_via_orphaning`).
+/// `src/table_store/staged_tests.rs::lance_restore_loses_to_concurrent_append_via_orphaning`).
 /// Roll-forward is safe under concurrency because
 /// `ManifestBatchPublisher::publish` uses row-level CAS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,6 +414,10 @@ pub(crate) enum ClassificationMode {
     /// CONFIRMATION_SCHEMA_VERSION`): roll forward ONLY to the confirmed
     /// version; an unconfirmed moved HEAD is a partial publish and rolls back.
     Confirmed,
+    /// RFC-022 mutation/load effect: the sidecar must be durably confirmed and
+    /// the observed Lance HEAD transaction `(read_version, uuid)` must exactly
+    /// equal the planned and confirmed transaction identity.
+    ExactEffect,
 }
 
 impl SidecarKind {
@@ -192,7 +426,13 @@ impl SidecarKind {
     /// compile error here until its recovery semantics are declared.
     pub(crate) fn classification_mode(self, schema_version: u32) -> ClassificationMode {
         match self {
-            SidecarKind::Mutation | SidecarKind::Load => ClassificationMode::Strict,
+            SidecarKind::Mutation | SidecarKind::Load => {
+                if schema_version >= EXACT_EFFECT_IDENTITY_SCHEMA_VERSION {
+                    ClassificationMode::ExactEffect
+                } else {
+                    ClassificationMode::Strict
+                }
+            }
             // BranchMerge gained two-phase confirmation at
             // `CONFIRMATION_SCHEMA_VERSION`. A sidecar written before that
             // carries no `confirmed_version` and must keep the prior loose
@@ -206,9 +446,21 @@ impl SidecarKind {
                     ClassificationMode::Loose
                 }
             }
-            SidecarKind::SchemaApply | SidecarKind::EnsureIndices | SidecarKind::Optimize => {
-                ClassificationMode::Loose
+            SidecarKind::SchemaApply => {
+                if schema_version >= SCHEMA_APPLY_EXACT_SCHEMA_VERSION {
+                    ClassificationMode::ExactEffect
+                } else {
+                    ClassificationMode::Loose
+                }
             }
+            SidecarKind::EnsureIndices => {
+                if schema_version >= ENSURE_INDICES_EXACT_SCHEMA_VERSION {
+                    ClassificationMode::ExactEffect
+                } else {
+                    ClassificationMode::Loose
+                }
+            }
+            SidecarKind::Optimize => ClassificationMode::Loose,
         }
     }
 }
@@ -217,7 +469,10 @@ impl SidecarKind {
 /// uses these to decide per-table state at recovery time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SidecarTablePin {
-    /// Stable identifier (`node:Person`, `edge:Knows`, etc.).
+    /// Immutable logical table lifetime. Recovery ownership is never inferred
+    /// from the mutable diagnostic alias below.
+    pub identity: super::TableIdentity,
+    /// Current diagnostic alias (`node:Person`, `edge:Knows`, etc.).
     pub table_key: String,
     /// Full URI to the Lance dataset for this table.
     pub table_path: String,
@@ -259,16 +514,30 @@ pub(crate) struct SidecarTablePin {
 /// returns None when the engine tries to read them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SidecarTableRegistration {
-    /// Stable identifier (`node:Tag`, `edge:WorksAt`, etc.).
+    /// Immutable logical table lifetime being registered.
+    pub identity: super::TableIdentity,
+    /// Current diagnostic alias (`node:Tag`, `edge:WorksAt`, etc.).
     pub table_key: String,
-    /// Graph-relative path the manifest will register
-    /// (e.g. `nodes/{fnv1a64-hex}`); recovery joins this with `root_uri`
+    /// Graph-relative identity-derived path the manifest will register
+    /// (e.g. `nodes/{stable-id}-{incarnation-id}`); recovery joins this with `root_uri`
     /// to open the dataset Lance HEAD when constructing the
     /// accompanying `Update`.
     pub table_path: String,
     /// Lance branch ref the dataset lives on (None for main / default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub table_branch: Option<String>,
+}
+
+/// Metadata-only alias rebinding captured by SchemaApply. The identity and
+/// physical path are fixed attempt data; recovery may change only the public
+/// alias, never rematerialize or adopt a name-derived dataset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SidecarTableRename {
+    pub identity: super::TableIdentity,
+    pub expected_table_key: String,
+    pub expected_version: u64,
+    pub table_key: String,
+    pub table_path: String,
 }
 
 /// Tombstone metadata captured by SchemaApply sidecars so recovery can
@@ -278,10 +547,348 @@ pub(crate) struct SidecarTableRegistration {
 /// schema no longer declares them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SidecarTombstone {
+    pub identity: super::TableIdentity,
     pub table_key: String,
     /// Manifest version at which this table was active before the
     /// tombstone — required by the publisher's CAS pre-check.
     pub tombstone_version: u64,
+}
+
+/// Authority captured before an RFC-022 mutation/load attempt was prepared.
+/// Recovery compares this complete token before it may roll confirmed effects
+/// forward. The native Lance branch identifier closes delete/recreate ABA;
+/// `graph_head: None` deliberately preserves absence on a fresh branch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RecoveryAuthorityToken {
+    pub branch_identifier: lance::dataset::refs::BranchIdentifier,
+    pub graph_head: Option<String>,
+    pub schema_identity_domain: String,
+    pub schema_ir_hash: String,
+    pub schema_identity_version: u32,
+}
+
+/// Serializable copy of the original graph lineage intent. It is minted once
+/// before recovery is armed and never re-parented or replaced during recovery.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RecoveryLineageIntent {
+    pub graph_commit_id: String,
+    pub branch: Option<String>,
+    pub actor_id: Option<String>,
+    pub merged_parent_commit_id: Option<String>,
+    pub created_at: i64,
+}
+
+impl From<&RecoveryLineageIntent> for LineageIntent {
+    fn from(intent: &RecoveryLineageIntent) -> Self {
+        Self {
+            graph_commit_id: intent.graph_commit_id.clone(),
+            branch: intent.branch.clone(),
+            actor_id: intent.actor_id.clone(),
+            merged_parent_commit_id: intent.merged_parent_commit_id.clone(),
+            created_at: intent.created_at,
+        }
+    }
+}
+
+/// Durable phase of an RFC-022 effect set. `Armed` is written before the first
+/// HEAD advance. `EffectsConfirmed` is written only after every planned table
+/// effect landed with its exact transaction identity and full manifest update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub(crate) enum RecoveryEffectPhase {
+    Armed,
+    EffectsConfirmed,
+}
+
+/// One exact physical effect enrolled in an RFC-022 sidecar.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RecoveryTableEffect {
+    pub identity: TableIdentity,
+    pub table_key: String,
+    pub planned_transaction: StagedTransactionIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmed_transaction: Option<StagedTransactionIdentity>,
+}
+
+/// The confirmed value for one table-version output slot in the intended
+/// manifest delta. Metadata is copied from `SubTableUpdate` so recovery can
+/// publish exactly what the original writer prepared rather than re-deriving a
+/// wider delta from an arbitrary live HEAD.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RecoveryConfirmedTableUpdate {
+    pub table_version: u64,
+    pub table_branch: Option<String>,
+    pub row_count: u64,
+    pub version_metadata: super::TableVersionMetadata,
+}
+
+/// Canonical manifest-delta output slot for one touched table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RecoveryTableUpdateSlot {
+    pub identity: super::TableIdentity,
+    pub table_key: String,
+    pub expected_version: u64,
+    pub table_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmed: Option<RecoveryConfirmedTableUpdate>,
+}
+
+/// Complete manifest delta carried by an RFC-022 mutation/load sidecar. The
+/// table keys and expectations are immutable at arm time; physical output
+/// slots are bound exactly once by Phase-B confirmation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RecoveryManifestDelta {
+    pub table_updates: Vec<RecoveryTableUpdateSlot>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub registrations: Vec<SidecarTableRegistration>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub renames: Vec<SidecarTableRename>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tombstones: Vec<SidecarTombstone>,
+}
+
+/// v3 payload. Kept optional on [`RecoverySidecar`] so v1/v2 continue to parse
+/// with their original semantics; [`parse_sidecar`] requires it for v3.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RecoveryProtocolV3 {
+    pub authority: RecoveryAuthorityToken,
+    pub lineage: RecoveryLineageIntent,
+    /// Stable id for the rollback lineage outcome. A recovery retry reuses it
+    /// instead of manufacturing an unbounded series of indistinguishable ids.
+    pub rollback_graph_commit_id: String,
+    /// Exact operator-facing outcomes for the fixed rollback commit. Recovery
+    /// persists this plan before the first restore or rollback publish and
+    /// reuses it verbatim after a crash. `None` means no rollback has been
+    /// prepared; `Some([])` is a prepared lineage-only rollback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback_audit_outcomes: Option<Vec<TableOutcome>>,
+    pub effect_phase: RecoveryEffectPhase,
+    pub effects: Vec<RecoveryTableEffect>,
+    pub intended_delta: RecoveryManifestDelta,
+}
+
+/// One branch-merge physical effect. A merge can make several staged commits
+/// to one table, or it can create only a native target ref and publish that
+/// source state by pointer. The latter is independently durable even though no
+/// table HEAD moves, so it must be represented explicitly rather than inferred
+/// from a numeric version comparison.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RecoveryBranchMergeEffect {
+    pub identity: TableIdentity,
+    pub table_key: String,
+    pub kind: RecoveryBranchMergeEffectKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "PascalCase")]
+pub(crate) enum RecoveryBranchMergeEffectKind {
+    /// One or more logical data commits on the target table. The exact final
+    /// version is unknown while Armed and is bound atomically with the complete
+    /// manifest delta at EffectsConfirmed. `source_fork_version` is present
+    /// when the target table ref itself is first-touch and therefore must be
+    /// recovered before any HEAD movement is considered.
+    MultiCommitHead {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_fork_version: Option<u64>,
+        /// Exact Lance transactions the writer pre-minted for the logical
+        /// data effect, in commit order. Recovery proves ownership by reading
+        /// these identities back at their expected versions; a numeric HEAD
+        /// advance alone is never sufficient evidence.
+        planned_transactions: Vec<StagedTransactionIdentity>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        confirmed_version: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        confirmed_branch_identifier: Option<lance::dataset::refs::BranchIdentifier>,
+    },
+    /// A first-touch target ref whose HEAD remains exactly the captured source
+    /// fork version. Lance mints the target BranchIdentifier during create, so
+    /// it is necessarily an EffectsConfirmed output rather than an arm-time
+    /// input.
+    RefOnlyFork {
+        source_version: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        confirmed_branch_identifier: Option<lance::dataset::refs::BranchIdentifier>,
+    },
+}
+
+impl RecoveryBranchMergeEffectKind {
+    fn source_fork_version(&self) -> Option<u64> {
+        match self {
+            Self::MultiCommitHead {
+                source_fork_version,
+                ..
+            } => *source_fork_version,
+            Self::RefOnlyFork { source_version, .. } => Some(*source_version),
+        }
+    }
+
+    fn confirmed_branch_identifier(&self) -> Option<&lance::dataset::refs::BranchIdentifier> {
+        match self {
+            Self::MultiCommitHead {
+                confirmed_branch_identifier,
+                ..
+            }
+            | Self::RefOnlyFork {
+                confirmed_branch_identifier,
+                ..
+            } => confirmed_branch_identifier.as_ref(),
+        }
+    }
+}
+
+/// v4 BranchMerge payload. Kept separate from v3 so old Mutation/Load files
+/// retain their one-transaction-per-table interpretation forever.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RecoveryProtocolV4 {
+    pub authority: RecoveryAuthorityToken,
+    pub lineage: RecoveryLineageIntent,
+    pub rollback_graph_commit_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback_audit_outcomes: Option<Vec<TableOutcome>>,
+    pub effect_phase: RecoveryEffectPhase,
+    pub effects: Vec<RecoveryBranchMergeEffect>,
+    pub intended_delta: RecoveryManifestDelta,
+}
+
+/// One exact physical effect in a schema-v7 SchemaApply intent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RecoverySchemaApplyEffect {
+    pub identity: TableIdentity,
+    pub table_key: String,
+    pub kind: RecoverySchemaApplyEffectKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "PascalCase")]
+pub(crate) enum RecoverySchemaApplyEffectKind {
+    /// A replacement of an already manifest-owned table. Compensation restores
+    /// the current manifest-selected version and publishes the resulting HEAD.
+    ExistingOverwrite {
+        planned_transaction: StagedTransactionIdentity,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        confirmed_transaction: Option<StagedTransactionIdentity>,
+    },
+    /// The first commit at an AddType/RenameType target path. Compensation may
+    /// delete the whole path only while the exact version-one transaction is
+    /// still HEAD and no manifest entry or competing recovery claim owns it.
+    FirstTouchDataset {
+        planned_transaction: StagedTransactionIdentity,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        confirmed_transaction: Option<StagedTransactionIdentity>,
+    },
+}
+
+impl RecoverySchemaApplyEffectKind {
+    fn planned_transaction(&self) -> &StagedTransactionIdentity {
+        match self {
+            Self::ExistingOverwrite {
+                planned_transaction,
+                ..
+            }
+            | Self::FirstTouchDataset {
+                planned_transaction,
+                ..
+            } => planned_transaction,
+        }
+    }
+
+    fn confirmed_transaction(&self) -> Option<&StagedTransactionIdentity> {
+        match self {
+            Self::ExistingOverwrite {
+                confirmed_transaction,
+                ..
+            }
+            | Self::FirstTouchDataset {
+                confirmed_transaction,
+                ..
+            } => confirmed_transaction.as_ref(),
+        }
+    }
+
+    fn set_confirmed_transaction(&mut self, transaction: StagedTransactionIdentity) {
+        match self {
+            Self::ExistingOverwrite {
+                confirmed_transaction,
+                ..
+            }
+            | Self::FirstTouchDataset {
+                confirmed_transaction,
+                ..
+            } => *confirmed_transaction = Some(transaction),
+        }
+    }
+
+    fn is_first_touch(&self) -> bool {
+        matches!(self, Self::FirstTouchDataset { .. })
+    }
+}
+
+/// Schema-v7 exact recovery payload. The accepted/old schema identity lives in
+/// `authority`; `target_schema_ir_hash` identifies the staged contract that may
+/// be promoted only after the fixed original manifest outcome is visible.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RecoveryProtocolV7 {
+    pub authority: RecoveryAuthorityToken,
+    pub lineage: RecoveryLineageIntent,
+    pub rollback_graph_commit_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback_audit_outcomes: Option<Vec<TableOutcome>>,
+    pub target_schema_ir_hash: String,
+    pub effect_phase: RecoveryEffectPhase,
+    pub effects: Vec<RecoverySchemaApplyEffect>,
+    pub intended_delta: RecoveryManifestDelta,
+}
+
+/// One exact per-table index reconciliation effect. `source_fork_version` is
+/// present only when a named graph branch did not yet own its native Lance ref
+/// at arm time. Lance mints that ref's identifier during create, so the writer
+/// binds it together with the exact transaction and manifest output only after
+/// every table effect has completed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RecoveryEnsureIndicesEffect {
+    pub identity: TableIdentity,
+    pub table_key: String,
+    pub planned_transaction: StagedTransactionIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_fork_version: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmed_transaction: Option<StagedTransactionIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmed_branch_identifier: Option<lance::dataset::refs::BranchIdentifier>,
+}
+
+impl RecoveryEnsureIndicesEffect {
+    fn is_first_touch(&self) -> bool {
+        self.source_fork_version.is_some()
+    }
+}
+
+/// Schema-v8 exact EnsureIndices recovery payload. Kept separate from v3 so
+/// mutation/load's existing one-transaction interpretation is never widened by
+/// the first-touch native-ref fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RecoveryProtocolV8 {
+    pub authority: RecoveryAuthorityToken,
+    pub lineage: RecoveryLineageIntent,
+    pub rollback_graph_commit_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback_audit_outcomes: Option<Vec<TableOutcome>>,
+    pub effect_phase: RecoveryEffectPhase,
+    pub effects: Vec<RecoveryEnsureIndicesEffect>,
+    pub intended_delta: RecoveryManifestDelta,
+}
+
+/// Schema-v6 EnsureIndices rollback identity retained for compatibility.
+/// Recovery must still be able to prove that a previously published
+/// compensation was a rollback rather than infer the outcome from aligned
+/// numeric table pins; current writers emit the exact v8 protocol.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RecoveryEnsureIndicesRollbackV6 {
+    pub rollback_graph_commit_id: String,
+    /// Bound before the first restore or rollback publish so a retry can replay
+    /// the original pre-compensation observations exactly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback_audit_outcomes: Option<Vec<TableOutcome>>,
 }
 
 /// In-memory representation of the on-disk JSON sidecar.
@@ -318,6 +925,38 @@ pub(crate) struct RecoverySidecar {
     /// non-SchemaApply writers.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tombstones: Vec<SidecarTombstone>,
+    /// SchemaApply-only Phase-C confirmation. A metadata/table-set-only apply
+    /// may have zero table pins, so table classification alone cannot
+    /// distinguish a pre-staging crash from a completed apply whose Phase-D
+    /// sidecar delete failed. The writer flips this marker durably immediately
+    /// after its manifest commit and before final schema-file promotion.
+    ///
+    /// Optional/default-false for backward compatibility. The full exact
+    /// SchemaApply adapter will replace this narrow confirmation with its
+    /// complete authority and intended-delta protocol.
+    #[serde(default)]
+    pub schema_apply_manifest_published: bool,
+    /// Hash of the schema contract this SchemaApply intends to promote. Paired
+    /// with `schema_apply_manifest_published` so recovery can distinguish a
+    /// completed final rename from missing/corrupt staging after Phase C.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_apply_target_schema_ir_hash: Option<String>,
+    /// RFC-022 exact-effect protocol. Absent for every v1/v2 sidecar.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_v3: Option<RecoveryProtocolV3>,
+    /// RFC-022 BranchMerge payload (introduced at v4; retained by v9).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_v4: Option<RecoveryProtocolV4>,
+    /// Exact SchemaApply payload (introduced at v7; retained by v9).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_v7: Option<RecoveryProtocolV7>,
+    /// Exact EnsureIndices payload (introduced at v8; retained by v9).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_v8: Option<RecoveryProtocolV8>,
+    /// EnsureIndices-only fixed rollback identity. It does not make the
+    /// physical index effects exact; it only makes compensation retry-safe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ensure_indices_rollback_v6: Option<RecoveryEnsureIndicesRollbackV6>,
 }
 
 /// Opaque handle returned by [`write_sidecar`] so the caller can delete
@@ -384,6 +1023,11 @@ pub(crate) enum TableClassification {
     /// previous restore attempt or an external mutation. Roll back to
     /// the manifest pin.
     UnexpectedMultistep,
+    /// The observed HEAD version may have the expected number, but the Lance
+    /// transaction identity does not equal the exact planned+confirmed effect.
+    /// A foreign writer or transparent rebase produced it; never roll it
+    /// forward as this sidecar's result.
+    UnexpectedEffectIdentity,
     /// A confirmation-using writer (`BranchMerge`) advanced this table's HEAD
     /// (`lance_head > manifest_pinned`) but the sidecar carries no
     /// `confirmed_version` — its multi-commit publish crashed mid-flight, so
@@ -407,7 +1051,8 @@ pub(crate) enum TableClassification {
 /// based on the worst classification:
 ///
 /// - Any `InvariantViolation` → `Abort` (operator action required).
-/// - Any `UnexpectedAtP1` / `UnexpectedMultistep` / `NoMovement` →
+/// - Any `UnexpectedAtP1` / `UnexpectedMultistep` /
+///   `UnexpectedEffectIdentity` / `NoMovement` →
 ///   `RollBack` all drifted tables to the manifest pin.
 /// - All `RolledPastExpected` → `RollForward` every table in one
 ///   manifest publish.
@@ -450,8 +1095,10 @@ pub(crate) async fn write_sidecar(
     // Failpoint: models a storage put failure (S3 PutObject / fs write)
     // in Phase A — every writer must abort before any HEAD advance.
     crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_SIDECAR_WRITE)?;
-    debug_assert_eq!(sidecar.schema_version, SIDECAR_SCHEMA_VERSION);
+    debug_assert!(sidecar.schema_version <= SIDECAR_SCHEMA_VERSION);
     let uri = sidecar_uri(root_uri, &sidecar.operation_id);
+    validate_sidecar_shape(&uri, sidecar)?;
+    validate_identity_aware_pin_paths(root_uri, &uri, sidecar)?;
     let json = serde_json::to_string_pretty(sidecar).map_err(|err| {
         OmniError::manifest_internal(format!("failed to serialize recovery sidecar: {}", err))
     })?;
@@ -482,11 +1129,12 @@ pub(crate) async fn write_sidecar(
 /// commit, so the `BranchMerge` arm of `classify_table` could fold back into the
 /// strict single-commit path and `IncompletePhaseB` retire. Do NOT delete this
 /// with the row path — keep the sidecar; only simplify the classifier.
-pub(crate) async fn confirm_sidecar_phase_b(
+#[cfg(test)]
+pub(crate) async fn confirm_sidecar_phase_b_v9(
     root_uri: &str,
     storage: &dyn StorageAdapter,
     sidecar: &mut RecoverySidecar,
-    confirmed_versions: &HashMap<String, u64>,
+    confirmed_versions: &HashMap<TableIdentity, u64>,
 ) -> Result<()> {
     // Failpoint: models a storage failure on the confirmation write — the
     // pre-confirm sidecar stays on disk, so recovery rolls the operation back.
@@ -498,7 +1146,7 @@ pub(crate) async fn confirm_sidecar_phase_b(
         // read as a partial Phase B and silently roll the whole (complete) merge
         // back. Today the two are kept in lockstep by construction; this guards
         // the invariant against a future edit to either filter.
-        let version = confirmed_versions.get(&pin.table_key).ok_or_else(|| {
+        let version = confirmed_versions.get(&pin.identity).ok_or_else(|| {
             OmniError::manifest_internal(format!(
                 "confirm_sidecar_phase_b: no achieved version for pinned table '{}' \
                  (pins and publish updates diverged)",
@@ -551,17 +1199,136 @@ pub(crate) async fn list_sidecars(
     // ordering-sensitive bugs.
     uris.sort();
     let mut out = Vec::with_capacity(uris.len());
+    let mut before_first_json_read = true;
     for uri in uris {
         // Skip non-JSON files defensively; the directory is ours but a
         // future feature might leave other artifacts here.
         if !uri.ends_with(".json") {
             continue;
         }
-        let body = storage.read_text(&uri).await?;
+        if before_first_json_read {
+            crate::failpoints::maybe_fail(
+                crate::failpoints::names::RECOVERY_POST_SIDECAR_LIST_PRE_READ,
+            )?;
+            before_first_json_read = false;
+        }
+        let Some(body) = storage.read_text_if_exists(&uri).await? else {
+            continue;
+        };
         let sidecar = parse_sidecar(&uri, &body)?;
+        validate_identity_aware_pin_paths(root_uri, &uri, &sidecar)?;
         out.push(sidecar);
     }
     Ok(out)
+}
+
+/// Best-effort discovery for the non-mutating read-only schema-coherence
+/// guard. ReadOnly historically skips recovery classification entirely, so a
+/// corrupt/future sidecar must not make an otherwise coherent read fail. Valid
+/// SchemaApply intents are still inspected; malformed files remain untouched
+/// for the next read-write open to reject and for operator inspection. Their
+/// URIs and parse errors are returned separately so the caller can fail closed
+/// if schema-staging artifacts make them relevant to catalog coherence.
+async fn list_parseable_sidecars_for_read_only(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+) -> Result<(Vec<RecoverySidecar>, Vec<(String, String)>)> {
+    let dir = recovery_dir_uri(root_uri);
+    let mut uris = storage.list_dir(&dir).await?;
+    uris.sort();
+    let mut out = Vec::with_capacity(uris.len());
+    let mut unparseable = Vec::new();
+    let mut before_first_json_read = true;
+    for uri in uris {
+        if !uri.ends_with(".json") {
+            continue;
+        }
+        if before_first_json_read {
+            crate::failpoints::maybe_fail(
+                crate::failpoints::names::RECOVERY_POST_SIDECAR_LIST_PRE_READ,
+            )?;
+            before_first_json_read = false;
+        }
+        let Some(body) = storage.read_text_if_exists(&uri).await? else {
+            continue;
+        };
+        match parse_sidecar(&uri, &body).and_then(|sidecar| {
+            validate_identity_aware_pin_paths(root_uri, &uri, &sidecar)?;
+            Ok(sidecar)
+        }) {
+            Ok(sidecar) => out.push(sidecar),
+            Err(error) => {
+                warn!(
+                    sidecar_uri = uri.as_str(),
+                    error = %error,
+                    "read-only open is leaving an unparseable recovery sidecar for read-write recovery"
+                );
+                unparseable.push((uri, error.to_string()));
+            }
+        }
+    }
+    Ok((out, unparseable))
+}
+
+/// Re-read one listed sidecar after its process-local recovery gates are held.
+///
+/// `list_sidecars` necessarily runs before gate acquisition so the caller knows
+/// which branch/table keys to take.  The sidecar body is mutable, however:
+/// BranchMerge stamps `confirmed_version`, and v3 writers move Armed ->
+/// EffectsConfirmed (or persist a rollback audit plan) while holding those same
+/// gates.  Existence alone therefore is not a sufficient post-wait recheck.  A
+/// recovery pass must classify the body that is durable *after* it wins the
+/// gates, not the stale body it used only for coordination discovery.
+async fn reread_sidecar_under_gates(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    listed: &RecoverySidecar,
+) -> Result<Option<RecoverySidecar>> {
+    let uri = sidecar_uri(root_uri, &listed.operation_id);
+    let Some(body) = storage.read_text_if_exists(&uri).await? else {
+        return Ok(None);
+    };
+    let current = parse_sidecar(&uri, &body)?;
+    validate_identity_aware_pin_paths(root_uri, &uri, &current)?;
+
+    // Confirmation/rollback-plan rewrites may change only recovery payload, not
+    // the keys whose gates protect the artifact.  Refuse a coordination-shape
+    // rewrite rather than processing it under the wrong locks.
+    let listed_keys = listed
+        .tables
+        .iter()
+        .map(|pin| {
+            (
+                pin.identity,
+                &pin.table_key,
+                &pin.table_path,
+                &pin.table_branch,
+            )
+        })
+        .collect::<Vec<_>>();
+    let current_keys = current
+        .tables
+        .iter()
+        .map(|pin| {
+            (
+                pin.identity,
+                &pin.table_key,
+                &pin.table_path,
+                &pin.table_branch,
+            )
+        })
+        .collect::<Vec<_>>();
+    if current.operation_id != listed.operation_id
+        || current.writer_kind != listed.writer_kind
+        || current.branch != listed.branch
+        || current_keys != listed_keys
+    {
+        return Err(OmniError::manifest_internal(format!(
+            "recovery sidecar '{}' changed its coordination keys while recovery waited for gates",
+            listed.operation_id
+        )));
+    }
+    Ok(Some(current))
 }
 
 /// Parse a sidecar body, enforcing the schema-version refusal policy.
@@ -593,12 +1360,1411 @@ pub(crate) fn parse_sidecar(sidecar_uri: &str, body: &str) -> Result<RecoverySid
         }
         .into());
     }
-    serde_json::from_str(body).map_err(|err| {
+    let sidecar: RecoverySidecar = serde_json::from_str(body).map_err(|err| {
         OmniError::manifest_internal(format!(
             "recovery sidecar at '{}' failed to deserialize: {}",
             sidecar_uri, err
         ))
-    })
+    })?;
+    validate_sidecar_shape(sidecar_uri, &sidecar)?;
+    Ok(sidecar)
+}
+
+fn validate_sidecar_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Result<()> {
+    let malformed = |reason: String| {
+        OmniError::manifest_internal(format!(
+            "recovery sidecar at '{}' has an invalid schema-v{} shape: {}",
+            sidecar_uri, sidecar.schema_version, reason
+        ))
+    };
+
+    let carries_schema_apply_confirmation = sidecar.schema_apply_manifest_published
+        || sidecar.schema_apply_target_schema_ir_hash.is_some();
+    if carries_schema_apply_confirmation
+        && sidecar.schema_version != SCHEMA_APPLY_CONFIRMATION_SCHEMA_VERSION
+    {
+        return Err(malformed(format!(
+            "SchemaApply confirmation fields require schema-v{}, found schema-v{}",
+            SCHEMA_APPLY_CONFIRMATION_SCHEMA_VERSION, sidecar.schema_version,
+        )));
+    }
+    if carries_schema_apply_confirmation && !matches!(sidecar.writer_kind, SidecarKind::SchemaApply)
+    {
+        return Err(malformed(
+            "SchemaApply confirmation fields are present on another writer kind".to_string(),
+        ));
+    }
+    if sidecar.schema_apply_manifest_published
+        && sidecar.schema_apply_target_schema_ir_hash.is_none()
+    {
+        return Err(malformed(
+            "SchemaApply manifest confirmation has no target schema identity".to_string(),
+        ));
+    }
+    if sidecar.ensure_indices_rollback_v6.is_some()
+        && sidecar.schema_version != ENSURE_INDICES_ROLLBACK_SCHEMA_VERSION
+    {
+        return Err(malformed(format!(
+            "EnsureIndices fixed rollback requires schema-v{}, found schema-v{}",
+            ENSURE_INDICES_ROLLBACK_SCHEMA_VERSION, sidecar.schema_version,
+        )));
+    }
+
+    if sidecar.schema_version < EXACT_EFFECT_IDENTITY_SCHEMA_VERSION {
+        if sidecar.protocol_v3.is_some()
+            || sidecar.protocol_v4.is_some()
+            || sidecar.protocol_v7.is_some()
+            || sidecar.protocol_v8.is_some()
+        {
+            return Err(malformed(
+                "an exact-effect protocol is present on a pre-v3 sidecar".to_string(),
+            ));
+        }
+        return Ok(());
+    }
+
+    if sidecar.schema_version == IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION {
+        return match sidecar.writer_kind {
+            SidecarKind::Mutation | SidecarKind::Load => {
+                validate_mutation_load_shape(sidecar_uri, sidecar)
+            }
+            SidecarKind::BranchMerge => validate_branch_merge_v4_shape(sidecar_uri, sidecar),
+            SidecarKind::SchemaApply => validate_schema_apply_v7_shape(sidecar_uri, sidecar),
+            SidecarKind::EnsureIndices => validate_ensure_indices_v8_shape(sidecar_uri, sidecar),
+            SidecarKind::Optimize => validate_optimize_v9_shape(sidecar_uri, sidecar),
+        };
+    }
+
+    if sidecar.schema_version == BRANCH_MERGE_SIDECAR_SCHEMA_VERSION {
+        return validate_branch_merge_v4_shape(sidecar_uri, sidecar);
+    }
+
+    if sidecar.schema_version == SCHEMA_APPLY_CONFIRMATION_SCHEMA_VERSION {
+        if !matches!(sidecar.writer_kind, SidecarKind::SchemaApply) {
+            return Err(malformed(format!(
+                "schema-v5 is reserved for SchemaApply, found {:?}",
+                sidecar.writer_kind,
+            )));
+        }
+        if sidecar.branch.is_some()
+            || sidecar.protocol_v3.is_some()
+            || sidecar.protocol_v4.is_some()
+            || sidecar.protocol_v7.is_some()
+            || sidecar.protocol_v8.is_some()
+        {
+            return Err(malformed(
+                "schema-v5 SchemaApply must target main and cannot carry v3/v4 protocols"
+                    .to_string(),
+            ));
+        }
+        if sidecar.schema_apply_target_schema_ir_hash.is_none() {
+            return Err(malformed(
+                "schema-v5 SchemaApply is missing its target schema identity".to_string(),
+            ));
+        }
+        return Ok(());
+    }
+
+    if sidecar.schema_version == ENSURE_INDICES_ROLLBACK_SCHEMA_VERSION {
+        return validate_ensure_indices_v6_shape(sidecar_uri, sidecar);
+    }
+
+    if sidecar.schema_version == SCHEMA_APPLY_EXACT_SCHEMA_VERSION {
+        return validate_schema_apply_v7_shape(sidecar_uri, sidecar);
+    }
+
+    if sidecar.schema_version == ENSURE_INDICES_EXACT_SCHEMA_VERSION {
+        return validate_ensure_indices_v8_shape(sidecar_uri, sidecar);
+    }
+
+    if sidecar.protocol_v4.is_some()
+        || sidecar.protocol_v7.is_some()
+        || sidecar.protocol_v8.is_some()
+    {
+        return Err(malformed(
+            "a writer-specific exact protocol is present on the wrong sidecar generation"
+                .to_string(),
+        ));
+    }
+
+    if !matches!(
+        sidecar.writer_kind,
+        SidecarKind::Mutation | SidecarKind::Load
+    ) {
+        return Err(malformed(format!(
+            "protocol_v3 exact effects are only defined for Mutation/Load, found {:?}",
+            sidecar.writer_kind
+        )));
+    }
+    validate_mutation_load_shape(sidecar_uri, sidecar)
+}
+
+/// Bind identity-aware recovery ownership to this graph root before any path
+/// can be opened, restored, or deleted. A canonical identity suffix alone is
+/// insufficient: an otherwise valid sidecar copied from another graph could
+/// point recovery at that foreign graph's dataset.
+///
+/// Older sidecars retain their historical path semantics. They predate stable
+/// table identity and cannot be tightened by inferring ownership during read.
+fn validate_identity_aware_pin_paths(
+    root_uri: &str,
+    sidecar_uri: &str,
+    sidecar: &RecoverySidecar,
+) -> Result<()> {
+    if sidecar.schema_version != IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION {
+        return Ok(());
+    }
+
+    let root = root_uri.trim_end_matches('/');
+    for pin in &sidecar.tables {
+        let relative = super::table_path_for_identity(&pin.table_key, pin.identity)?;
+        let expected = format!("{root}/{relative}");
+        if pin.table_path != expected {
+            return Err(OmniError::manifest_internal(format!(
+                "recovery sidecar at '{}' binds table identity {} alias '{}' to foreign or non-canonical URI '{}'; expected exact graph-owned URI '{}'",
+                sidecar_uri, pin.identity, pin.table_key, pin.table_path, expected
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_mutation_load_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Result<()> {
+    let malformed = |reason: String| {
+        OmniError::manifest_internal(format!(
+            "recovery sidecar at '{}' has an invalid schema-v{} shape: {}",
+            sidecar_uri, sidecar.schema_version, reason
+        ))
+    };
+    let protocol = sidecar
+        .protocol_v3
+        .as_ref()
+        .ok_or_else(|| malformed("missing required protocol_v3 payload".to_string()))?;
+    if sidecar.protocol_v4.is_some()
+        || sidecar.protocol_v7.is_some()
+        || sidecar.protocol_v8.is_some()
+        || sidecar.ensure_indices_rollback_v6.is_some()
+        || sidecar.merge_source_commit_id.is_some()
+        || sidecar.schema_apply_manifest_published
+        || sidecar.schema_apply_target_schema_ir_hash.is_some()
+    {
+        return Err(malformed(
+            "Mutation/Load sidecars must carry only the protocol_v3 writer payload".to_string(),
+        ));
+    }
+    validate_authority_identity(&malformed, &protocol.authority)?;
+    if !sidecar.additional_registrations.is_empty()
+        || !sidecar.tombstones.is_empty()
+        || !protocol.intended_delta.registrations.is_empty()
+        || !protocol.intended_delta.renames.is_empty()
+        || !protocol.intended_delta.tombstones.is_empty()
+    {
+        return Err(malformed(
+            "v3 Mutation/Load sidecars cannot register or tombstone tables".to_string(),
+        ));
+    }
+
+    let sidecar_branch = sidecar.branch.as_deref().filter(|branch| *branch != "main");
+    let lineage_branch = protocol
+        .lineage
+        .branch
+        .as_deref()
+        .filter(|branch| *branch != "main");
+    if sidecar_branch != lineage_branch {
+        return Err(malformed(
+            "sidecar branch does not match original lineage branch".to_string(),
+        ));
+    }
+    if sidecar.actor_id != protocol.lineage.actor_id {
+        return Err(malformed(
+            "sidecar actor does not match original lineage actor".to_string(),
+        ));
+    }
+    if protocol.lineage.merged_parent_commit_id.is_some() {
+        return Err(malformed(
+            "v3 Mutation/Load lineage cannot carry a merged parent".to_string(),
+        ));
+    }
+    if protocol.rollback_graph_commit_id == protocol.lineage.graph_commit_id {
+        return Err(malformed(
+            "original and rollback graph commit ids must differ".to_string(),
+        ));
+    }
+
+    validate_unique_pin_identities(&malformed, &sidecar.tables, false)?;
+    let pin_ids: HashSet<TableIdentity> = sidecar.tables.iter().map(|pin| pin.identity).collect();
+    let pin_aliases: HashSet<&str> = sidecar
+        .tables
+        .iter()
+        .map(|pin| pin.table_key.as_str())
+        .collect();
+    if let Some(outcomes) = protocol.rollback_audit_outcomes.as_ref() {
+        let outcome_keys: HashSet<&str> = outcomes
+            .iter()
+            .map(|outcome| outcome.table_key.as_str())
+            .collect();
+        if outcome_keys.len() != outcomes.len() || !outcome_keys.is_subset(&pin_aliases) {
+            return Err(malformed(
+                "rollback audit outcomes must name a unique subset of table pins".to_string(),
+            ));
+        }
+    }
+    let effect_ids: HashSet<TableIdentity> = protocol
+        .effects
+        .iter()
+        .map(|effect| effect.identity)
+        .collect();
+    let effect_uuids: HashSet<&str> = protocol
+        .effects
+        .iter()
+        .map(|effect| effect.planned_transaction.uuid.as_str())
+        .collect();
+    let delta_ids: HashSet<TableIdentity> = protocol
+        .intended_delta
+        .table_updates
+        .iter()
+        .map(|slot| slot.identity)
+        .collect();
+    if effect_ids.len() != protocol.effects.len()
+        || effect_uuids.len() != protocol.effects.len()
+        || delta_ids.len() != protocol.intended_delta.table_updates.len()
+        || effect_ids != pin_ids
+        || delta_ids != pin_ids
+    {
+        return Err(malformed(
+            "table pins, planned transaction identities, and intended-delta key sets are not one-to-one"
+                .to_string(),
+        ));
+    }
+
+    for pin in &sidecar.tables {
+        let effect = protocol
+            .effects
+            .iter()
+            .find(|effect| effect.identity == pin.identity)
+            .expect("key sets checked above");
+        let slot = protocol
+            .intended_delta
+            .table_updates
+            .iter()
+            .find(|slot| slot.identity == pin.identity)
+            .expect("key sets checked above");
+        if effect.table_key != pin.table_key || slot.table_key != pin.table_key {
+            return Err(malformed(format!(
+                "identity {} has inconsistent diagnostic aliases across pin/effect/delta",
+                pin.identity
+            )));
+        }
+        if effect.planned_transaction.read_version != pin.expected_version {
+            return Err(malformed(format!(
+                "planned transaction for '{}' reads version {}, pin expects {}",
+                pin.table_key, effect.planned_transaction.read_version, pin.expected_version
+            )));
+        }
+        if slot.expected_version != pin.expected_version || slot.table_branch != pin.table_branch {
+            return Err(malformed(format!(
+                "intended-delta pre-state for '{}' does not match its table pin",
+                pin.table_key
+            )));
+        }
+        match protocol.effect_phase {
+            RecoveryEffectPhase::Armed => {
+                if effect.confirmed_transaction.is_some()
+                    || slot.confirmed.is_some()
+                    || pin.confirmed_version.is_some()
+                {
+                    return Err(malformed(format!(
+                        "Armed effect '{}' already carries confirmation",
+                        pin.table_key
+                    )));
+                }
+            }
+            RecoveryEffectPhase::EffectsConfirmed => {
+                let confirmed_transaction =
+                    effect.confirmed_transaction.as_ref().ok_or_else(|| {
+                        malformed(format!(
+                            "EffectsConfirmed effect '{}' lacks a transaction identity",
+                            pin.table_key
+                        ))
+                    })?;
+                let confirmed_update = slot.confirmed.as_ref().ok_or_else(|| {
+                    malformed(format!(
+                        "EffectsConfirmed effect '{}' lacks a manifest update",
+                        pin.table_key
+                    ))
+                })?;
+                if confirmed_transaction != &effect.planned_transaction {
+                    return Err(malformed(format!(
+                        "confirmed transaction for '{}' differs from its planned identity",
+                        pin.table_key
+                    )));
+                }
+                if pin.confirmed_version != Some(confirmed_update.table_version)
+                    || confirmed_update.table_branch != pin.table_branch
+                {
+                    return Err(malformed(format!(
+                        "confirmed update for '{}' does not match its table pin",
+                        pin.table_key
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_unique_pin_identities<F>(
+    malformed: &F,
+    pins: &[SidecarTablePin],
+    require_non_empty: bool,
+) -> Result<()>
+where
+    F: Fn(String) -> OmniError,
+{
+    if require_non_empty && pins.is_empty() {
+        return Err(malformed("table pin set must not be empty".to_string()));
+    }
+    let mut identities = HashSet::with_capacity(pins.len());
+    let mut aliases = HashSet::with_capacity(pins.len());
+    for pin in pins {
+        pin.identity
+            .validate()
+            .map_err(|error| malformed(format!("invalid table identity: {error}")))?;
+        let canonical = super::table_path_for_identity(&pin.table_key, pin.identity)
+            .map_err(|error| malformed(format!("invalid table pin path: {error}")))?;
+        let normalized = pin.table_path.trim_end_matches('/');
+        if normalized != canonical && !normalized.ends_with(&format!("/{canonical}")) {
+            return Err(malformed(format!(
+                "table pin identity {} alias '{}' uses path '{}', expected canonical suffix '{}'",
+                pin.identity, pin.table_key, pin.table_path, canonical
+            )));
+        }
+        if !identities.insert(pin.identity) {
+            return Err(malformed(format!(
+                "duplicate table identity {} in pin set",
+                pin.identity
+            )));
+        }
+        if !aliases.insert(pin.table_key.as_str()) {
+            return Err(malformed(format!(
+                "duplicate diagnostic table alias '{}' in pin set",
+                pin.table_key
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_authority_identity<F>(malformed: &F, authority: &RecoveryAuthorityToken) -> Result<()>
+where
+    F: Fn(String) -> OmniError,
+{
+    if authority.schema_identity_domain.is_empty()
+        || authority.schema_ir_hash.is_empty()
+        || authority.schema_identity_version == 0
+    {
+        return Err(malformed(
+            "recovery authority must carry a non-empty schema identity domain/hash and non-zero identity version"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_optimize_v9_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Result<()> {
+    let malformed = |reason: String| {
+        OmniError::manifest_internal(format!(
+            "recovery sidecar at '{}' has an invalid schema-v{} shape: {}",
+            sidecar_uri, sidecar.schema_version, reason
+        ))
+    };
+    if sidecar.writer_kind != SidecarKind::Optimize
+        || sidecar.protocol_v3.is_some()
+        || sidecar.protocol_v4.is_some()
+        || sidecar.protocol_v7.is_some()
+        || sidecar.protocol_v8.is_some()
+        || sidecar.ensure_indices_rollback_v6.is_some()
+        || !sidecar.additional_registrations.is_empty()
+        || !sidecar.tombstones.is_empty()
+    {
+        return Err(malformed(
+            "schema-v9 Optimize must carry only identity-bearing table pins".to_string(),
+        ));
+    }
+    validate_unique_pin_identities(&malformed, &sidecar.tables, true)?;
+    Ok(())
+}
+
+fn validate_ensure_indices_v6_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Result<()> {
+    let malformed = |reason: String| {
+        OmniError::manifest_internal(format!(
+            "recovery sidecar at '{}' has an invalid schema-v{} shape: {}",
+            sidecar_uri, sidecar.schema_version, reason
+        ))
+    };
+    if !matches!(sidecar.writer_kind, SidecarKind::EnsureIndices) {
+        return Err(malformed(format!(
+            "schema-v6 is reserved for EnsureIndices, found {:?}",
+            sidecar.writer_kind,
+        )));
+    }
+    if sidecar.protocol_v3.is_some()
+        || sidecar.protocol_v4.is_some()
+        || sidecar.protocol_v7.is_some()
+        || sidecar.protocol_v8.is_some()
+        || sidecar.merge_source_commit_id.is_some()
+        || !sidecar.additional_registrations.is_empty()
+        || !sidecar.tombstones.is_empty()
+    {
+        return Err(malformed(
+            "schema-v6 EnsureIndices cannot carry exact, merge, registration, or tombstone fields"
+                .to_string(),
+        ));
+    }
+    let protocol = sidecar.ensure_indices_rollback_v6.as_ref().ok_or_else(|| {
+        malformed("schema-v6 EnsureIndices is missing its fixed rollback payload".to_string())
+    })?;
+    if protocol.rollback_graph_commit_id.is_empty() {
+        return Err(malformed(
+            "schema-v6 EnsureIndices has an empty rollback commit id".to_string(),
+        ));
+    }
+    let pin_keys: HashSet<&str> = sidecar
+        .tables
+        .iter()
+        .map(|pin| pin.table_key.as_str())
+        .collect();
+    if sidecar.tables.is_empty() || pin_keys.len() != sidecar.tables.len() {
+        return Err(malformed(
+            "schema-v6 EnsureIndices requires unique non-empty table pins".to_string(),
+        ));
+    }
+    if let Some(outcomes) = protocol.rollback_audit_outcomes.as_ref() {
+        let outcome_keys: HashSet<&str> = outcomes
+            .iter()
+            .map(|outcome| outcome.table_key.as_str())
+            .collect();
+        if outcome_keys.len() != outcomes.len() || !outcome_keys.is_subset(&pin_keys) {
+            return Err(malformed(
+                "rollback audit outcomes must name a unique subset of table pins".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_ensure_indices_v8_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Result<()> {
+    let malformed = |reason: String| {
+        OmniError::manifest_internal(format!(
+            "recovery sidecar at '{}' has an invalid schema-v{} shape: {}",
+            sidecar_uri, sidecar.schema_version, reason
+        ))
+    };
+    if sidecar.writer_kind != SidecarKind::EnsureIndices {
+        return Err(malformed(format!(
+            "schema-v8 is reserved for EnsureIndices, found {:?}",
+            sidecar.writer_kind
+        )));
+    }
+    if sidecar.protocol_v3.is_some()
+        || sidecar.protocol_v4.is_some()
+        || sidecar.protocol_v7.is_some()
+        || sidecar.ensure_indices_rollback_v6.is_some()
+        || sidecar.merge_source_commit_id.is_some()
+        || !sidecar.additional_registrations.is_empty()
+        || !sidecar.tombstones.is_empty()
+        || sidecar.schema_apply_manifest_published
+        || sidecar.schema_apply_target_schema_ir_hash.is_some()
+    {
+        return Err(malformed(
+            "schema-v8 EnsureIndices must carry authority/delta only in protocol_v8".to_string(),
+        ));
+    }
+    let protocol = sidecar
+        .protocol_v8
+        .as_ref()
+        .ok_or_else(|| malformed("missing required protocol_v8 payload".to_string()))?;
+    validate_authority_identity(&malformed, &protocol.authority)?;
+    if !protocol.intended_delta.registrations.is_empty()
+        || !protocol.intended_delta.renames.is_empty()
+        || !protocol.intended_delta.tombstones.is_empty()
+    {
+        return Err(malformed(
+            "schema-v8 EnsureIndices cannot register or tombstone tables".to_string(),
+        ));
+    }
+
+    let sidecar_branch = sidecar.branch.as_deref().filter(|branch| *branch != "main");
+    let lineage_branch = protocol
+        .lineage
+        .branch
+        .as_deref()
+        .filter(|branch| *branch != "main");
+    if sidecar_branch != lineage_branch
+        || sidecar.actor_id != protocol.lineage.actor_id
+        || protocol.lineage.merged_parent_commit_id.is_some()
+    {
+        return Err(malformed(
+            "schema-v8 sidecar branch/actor does not match its original lineage".to_string(),
+        ));
+    }
+    if protocol.lineage.graph_commit_id.is_empty()
+        || protocol.rollback_graph_commit_id.is_empty()
+        || protocol.lineage.graph_commit_id == protocol.rollback_graph_commit_id
+    {
+        return Err(malformed(
+            "schema-v8 original and rollback commit ids must be non-empty and distinct".to_string(),
+        ));
+    }
+
+    validate_unique_pin_identities(&malformed, &sidecar.tables, true)?;
+    let pin_ids: HashSet<TableIdentity> = sidecar.tables.iter().map(|pin| pin.identity).collect();
+    let pin_aliases: HashSet<&str> = sidecar
+        .tables
+        .iter()
+        .map(|pin| pin.table_key.as_str())
+        .collect();
+    let effect_ids: HashSet<TableIdentity> = protocol
+        .effects
+        .iter()
+        .map(|effect| effect.identity)
+        .collect();
+    let effect_uuids: HashSet<&str> = protocol
+        .effects
+        .iter()
+        .map(|effect| effect.planned_transaction.uuid.as_str())
+        .collect();
+    let delta_ids: HashSet<TableIdentity> = protocol
+        .intended_delta
+        .table_updates
+        .iter()
+        .map(|slot| slot.identity)
+        .collect();
+    if effect_ids.len() != protocol.effects.len()
+        || effect_uuids.len() != protocol.effects.len()
+        || effect_uuids.iter().any(|uuid| uuid.is_empty())
+        || delta_ids.len() != protocol.intended_delta.table_updates.len()
+        || effect_ids != pin_ids
+        || delta_ids != pin_ids
+    {
+        return Err(malformed(
+            "schema-v8 pins, effects, transaction UUIDs, and delta slots must be unique and one-to-one"
+                .to_string(),
+        ));
+    }
+    if let Some(outcomes) = protocol.rollback_audit_outcomes.as_ref() {
+        let outcome_keys: HashSet<&str> = outcomes
+            .iter()
+            .map(|outcome| outcome.table_key.as_str())
+            .collect();
+        if outcome_keys.len() != outcomes.len() || !outcome_keys.is_subset(&pin_aliases) {
+            return Err(malformed(
+                "schema-v8 rollback audit outcomes must name a unique subset of table pins"
+                    .to_string(),
+            ));
+        }
+    }
+
+    for pin in &sidecar.tables {
+        let effect = protocol
+            .effects
+            .iter()
+            .find(|effect| effect.identity == pin.identity)
+            .expect("schema-v8 key sets checked above");
+        let slot = protocol
+            .intended_delta
+            .table_updates
+            .iter()
+            .find(|slot| slot.identity == pin.identity)
+            .expect("schema-v8 key sets checked above");
+        if effect.table_key != pin.table_key || slot.table_key != pin.table_key {
+            return Err(malformed(format!(
+                "schema-v8 identity {} has inconsistent diagnostic aliases",
+                pin.identity
+            )));
+        }
+        let exact_output = pin.expected_version.checked_add(1).ok_or_else(|| {
+            malformed(format!(
+                "schema-v8 effect '{}' overflows its output version",
+                pin.table_key
+            ))
+        })?;
+        if effect.planned_transaction.read_version != pin.expected_version
+            || pin.post_commit_pin != exact_output
+            || slot.expected_version != pin.expected_version
+            || slot.table_branch != pin.table_branch
+        {
+            return Err(malformed(format!(
+                "schema-v8 effect '{}' does not match its pin/delta pre-state",
+                pin.table_key
+            )));
+        }
+        let is_first_touch = effect.source_fork_version.is_some();
+        if (is_first_touch
+            && !pin
+                .table_branch
+                .as_deref()
+                .is_some_and(|branch| branch != "main" && Some(branch) == sidecar_branch))
+            || effect
+                .source_fork_version
+                .is_some_and(|version| version != pin.expected_version)
+        {
+            return Err(malformed(format!(
+                "schema-v8 effect '{}' has inconsistent first-touch fork identity",
+                pin.table_key
+            )));
+        }
+        match protocol.effect_phase {
+            RecoveryEffectPhase::Armed => {
+                if effect.confirmed_transaction.is_some()
+                    || effect.confirmed_branch_identifier.is_some()
+                    || slot.confirmed.is_some()
+                    || pin.confirmed_version.is_some()
+                {
+                    return Err(malformed(format!(
+                        "Armed schema-v8 effect '{}' already carries confirmation",
+                        pin.table_key
+                    )));
+                }
+            }
+            RecoveryEffectPhase::EffectsConfirmed => {
+                let confirmed_transaction =
+                    effect.confirmed_transaction.as_ref().ok_or_else(|| {
+                        malformed(format!(
+                            "EffectsConfirmed schema-v8 effect '{}' lacks transaction confirmation",
+                            pin.table_key
+                        ))
+                    })?;
+                let confirmed_update = slot.confirmed.as_ref().ok_or_else(|| {
+                    malformed(format!(
+                        "EffectsConfirmed schema-v8 effect '{}' lacks a manifest output",
+                        pin.table_key
+                    ))
+                })?;
+                if confirmed_transaction != &effect.planned_transaction
+                    || confirmed_update.table_version != exact_output
+                    || confirmed_update.table_branch != pin.table_branch
+                    || pin.confirmed_version != Some(exact_output)
+                    || is_first_touch != effect.confirmed_branch_identifier.is_some()
+                {
+                    return Err(malformed(format!(
+                        "schema-v8 effect '{}' confirmation differs from its exact plan",
+                        pin.table_key
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_schema_apply_v7_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Result<()> {
+    let malformed = |reason: String| {
+        OmniError::manifest_internal(format!(
+            "recovery sidecar at '{}' has an invalid schema-v{} shape: {}",
+            sidecar_uri, sidecar.schema_version, reason
+        ))
+    };
+    if !matches!(sidecar.writer_kind, SidecarKind::SchemaApply) {
+        return Err(malformed(format!(
+            "schema-v7 is reserved for SchemaApply, found {:?}",
+            sidecar.writer_kind
+        )));
+    }
+    if sidecar.branch.is_some()
+        || sidecar.protocol_v3.is_some()
+        || sidecar.protocol_v4.is_some()
+        || sidecar.protocol_v8.is_some()
+        || sidecar.ensure_indices_rollback_v6.is_some()
+        || sidecar.merge_source_commit_id.is_some()
+        || !sidecar.additional_registrations.is_empty()
+        || !sidecar.tombstones.is_empty()
+        || sidecar.schema_apply_manifest_published
+        || sidecar.schema_apply_target_schema_ir_hash.is_some()
+    {
+        return Err(malformed(
+            "schema-v7 SchemaApply must target main and carry authority/delta only in protocol_v7"
+                .to_string(),
+        ));
+    }
+    let protocol = sidecar
+        .protocol_v7
+        .as_ref()
+        .ok_or_else(|| malformed("missing required protocol_v7 payload".to_string()))?;
+    validate_authority_identity(&malformed, &protocol.authority)?;
+    if protocol.target_schema_ir_hash.is_empty() {
+        return Err(malformed(
+            "schema-v7 SchemaApply has an empty target schema identity".to_string(),
+        ));
+    }
+    if sidecar.actor_id != protocol.lineage.actor_id
+        || protocol.lineage.branch.is_some()
+        || protocol.lineage.merged_parent_commit_id.is_some()
+    {
+        return Err(malformed(
+            "schema-v7 sidecar actor/main lineage fields do not match".to_string(),
+        ));
+    }
+    if protocol.lineage.graph_commit_id.is_empty()
+        || protocol.rollback_graph_commit_id.is_empty()
+        || protocol.rollback_graph_commit_id == protocol.lineage.graph_commit_id
+    {
+        return Err(malformed(
+            "schema-v7 original and rollback commit ids must be non-empty and distinct".to_string(),
+        ));
+    }
+
+    validate_unique_pin_identities(&malformed, &sidecar.tables, false)?;
+    let pin_ids: HashSet<TableIdentity> = sidecar.tables.iter().map(|pin| pin.identity).collect();
+    let rollback_aliases: HashSet<&str> = sidecar
+        .tables
+        .iter()
+        .map(|pin| schema_apply_rollback_table_key(protocol, pin))
+        .collect();
+    let effect_ids: HashSet<TableIdentity> = protocol
+        .effects
+        .iter()
+        .map(|effect| effect.identity)
+        .collect();
+    let delta_ids: HashSet<TableIdentity> = protocol
+        .intended_delta
+        .table_updates
+        .iter()
+        .map(|slot| slot.identity)
+        .collect();
+    let effect_uuids: HashSet<&str> = protocol
+        .effects
+        .iter()
+        .map(|effect| effect.kind.planned_transaction().uuid.as_str())
+        .collect();
+    if effect_ids.len() != protocol.effects.len()
+        || delta_ids.len() != protocol.intended_delta.table_updates.len()
+        || effect_uuids.len() != protocol.effects.len()
+        || effect_uuids.iter().any(|uuid| uuid.is_empty())
+        || pin_ids != effect_ids
+        || pin_ids != delta_ids
+    {
+        return Err(malformed(
+            "schema-v7 pins, effects, transaction UUIDs, and delta slots must be unique and one-to-one"
+                .to_string(),
+        ));
+    }
+
+    let registration_ids: HashSet<TableIdentity> = protocol
+        .intended_delta
+        .registrations
+        .iter()
+        .map(|registration| registration.identity)
+        .collect();
+    let tombstone_ids: HashSet<TableIdentity> = protocol
+        .intended_delta
+        .tombstones
+        .iter()
+        .map(|tombstone| tombstone.identity)
+        .collect();
+    let rename_ids: HashSet<TableIdentity> = protocol
+        .intended_delta
+        .renames
+        .iter()
+        .map(|rename| rename.identity)
+        .collect();
+    let first_touch_ids: HashSet<TableIdentity> = protocol
+        .effects
+        .iter()
+        .filter(|effect| effect.kind.is_first_touch())
+        .map(|effect| effect.identity)
+        .collect();
+    if registration_ids.len() != protocol.intended_delta.registrations.len()
+        || tombstone_ids.len() != protocol.intended_delta.tombstones.len()
+        || rename_ids.len() != protocol.intended_delta.renames.len()
+        || registration_ids != first_touch_ids
+        || !registration_ids.is_disjoint(&tombstone_ids)
+        || !registration_ids.is_disjoint(&rename_ids)
+        || !tombstone_ids.is_disjoint(&rename_ids)
+    {
+        return Err(malformed(
+            "SchemaApply first-touch effects must match unique registration identities, while registrations, renames, and tombstones remain identity-disjoint"
+                .to_string(),
+        ));
+    }
+    for registration in &protocol.intended_delta.registrations {
+        registration
+            .identity
+            .validate()
+            .map_err(|error| malformed(format!("invalid registration identity: {error}")))?;
+        let expected_path =
+            super::table_path_for_identity(&registration.table_key, registration.identity)?;
+        if registration.table_path != expected_path {
+            return Err(malformed(format!(
+                "registration identity {} alias '{}' has path '{}', expected '{}'",
+                registration.identity,
+                registration.table_key,
+                registration.table_path,
+                expected_path
+            )));
+        }
+        let effect = protocol
+            .effects
+            .iter()
+            .find(|effect| effect.identity == registration.identity)
+            .expect("registration identities match first-touch effects");
+        if effect.table_key != registration.table_key {
+            return Err(malformed(format!(
+                "first-touch identity {} has registration alias '{}' but effect alias '{}'",
+                registration.identity, registration.table_key, effect.table_key
+            )));
+        }
+    }
+    for rename in &protocol.intended_delta.renames {
+        rename
+            .identity
+            .validate()
+            .map_err(|error| malformed(format!("invalid rename identity: {error}")))?;
+        let old_path = super::table_path_for_identity(&rename.expected_table_key, rename.identity)?;
+        let new_path = super::table_path_for_identity(&rename.table_key, rename.identity)?;
+        if rename.expected_version == 0
+            || rename.expected_table_key == rename.table_key
+            || rename.table_path != old_path
+            || rename.table_path != new_path
+        {
+            return Err(malformed(format!(
+                "rename identity {} must carry a live expected version, change alias, and preserve canonical path '{}'",
+                rename.identity, rename.table_path
+            )));
+        }
+        if let Some(slot) = protocol
+            .intended_delta
+            .table_updates
+            .iter()
+            .find(|slot| slot.identity == rename.identity)
+            && (slot.table_key != rename.table_key
+                || slot.expected_version != rename.expected_version)
+        {
+            return Err(malformed(format!(
+                "rename identity {} does not match its physical output alias/version",
+                rename.identity
+            )));
+        }
+    }
+    let mut live_aliases = HashSet::new();
+    for (identity, alias) in protocol
+        .intended_delta
+        .registrations
+        .iter()
+        .map(|registration| (registration.identity, registration.table_key.as_str()))
+        .chain(
+            protocol
+                .intended_delta
+                .renames
+                .iter()
+                .map(|rename| (rename.identity, rename.table_key.as_str())),
+        )
+    {
+        if !live_aliases.insert(alias) {
+            return Err(malformed(format!(
+                "SchemaApply delta binds more than one live identity to alias '{alias}' (including {identity})"
+            )));
+        }
+    }
+    for tombstone in &protocol.intended_delta.tombstones {
+        tombstone
+            .identity
+            .validate()
+            .map_err(|error| malformed(format!("invalid tombstone identity: {error}")))?;
+    }
+    if protocol
+        .intended_delta
+        .registrations
+        .iter()
+        .any(|registration| registration.table_branch.is_some())
+    {
+        return Err(malformed(
+            "schema-v7 first-touch registrations must target main".to_string(),
+        ));
+    }
+    if let Some(outcomes) = protocol.rollback_audit_outcomes.as_ref() {
+        let outcome_keys: HashSet<&str> = outcomes
+            .iter()
+            .map(|outcome| outcome.table_key.as_str())
+            .collect();
+        if outcome_keys.len() != outcomes.len() || !outcome_keys.is_subset(&rollback_aliases) {
+            return Err(malformed(
+                "schema-v7 rollback audit outcomes must name a unique subset of restored table aliases"
+                    .to_string(),
+            ));
+        }
+    }
+
+    for pin in &sidecar.tables {
+        if pin.table_branch.is_some() {
+            return Err(malformed(format!(
+                "schema-v7 table '{}' must target main",
+                pin.table_key
+            )));
+        }
+        let effect = protocol
+            .effects
+            .iter()
+            .find(|effect| effect.identity == pin.identity)
+            .expect("key sets checked above");
+        let slot = protocol
+            .intended_delta
+            .table_updates
+            .iter()
+            .find(|slot| slot.identity == pin.identity)
+            .expect("key sets checked above");
+        if effect.table_key != pin.table_key || slot.table_key != pin.table_key {
+            return Err(malformed(format!(
+                "SchemaApply identity {} has inconsistent diagnostic aliases",
+                pin.identity
+            )));
+        }
+        let planned = effect.kind.planned_transaction();
+        if planned.read_version != pin.expected_version
+            || pin.post_commit_pin != pin.expected_version.saturating_add(1)
+            || slot.expected_version != pin.expected_version
+            || slot.table_branch.is_some()
+        {
+            return Err(malformed(format!(
+                "schema-v7 effect '{}' does not match its pin/delta pre-state",
+                pin.table_key
+            )));
+        }
+        if effect.kind.is_first_touch() != (pin.expected_version == 0) {
+            return Err(malformed(format!(
+                "schema-v7 effect '{}' has inconsistent first-touch identity",
+                pin.table_key
+            )));
+        }
+        match protocol.effect_phase {
+            RecoveryEffectPhase::Armed => {
+                if effect.kind.confirmed_transaction().is_some()
+                    || slot.confirmed.is_some()
+                    || pin.confirmed_version.is_some()
+                {
+                    return Err(malformed(format!(
+                        "Armed schema-v7 effect '{}' already carries confirmation",
+                        pin.table_key
+                    )));
+                }
+            }
+            RecoveryEffectPhase::EffectsConfirmed => {
+                let confirmed_transaction =
+                    effect.kind.confirmed_transaction().ok_or_else(|| {
+                        malformed(format!(
+                            "EffectsConfirmed schema-v7 effect '{}' lacks transaction confirmation",
+                            pin.table_key
+                        ))
+                    })?;
+                let confirmed_update = slot.confirmed.as_ref().ok_or_else(|| {
+                    malformed(format!(
+                        "EffectsConfirmed schema-v7 effect '{}' lacks a manifest output",
+                        pin.table_key
+                    ))
+                })?;
+                if confirmed_transaction != planned
+                    || confirmed_update.table_version != pin.post_commit_pin
+                    || confirmed_update.table_branch.is_some()
+                    || pin.confirmed_version != Some(confirmed_update.table_version)
+                {
+                    return Err(malformed(format!(
+                        "schema-v7 effect '{}' confirmation differs from its exact plan",
+                        pin.table_key
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_branch_merge_v4_shape(sidecar_uri: &str, sidecar: &RecoverySidecar) -> Result<()> {
+    let malformed = |reason: String| {
+        OmniError::manifest_internal(format!(
+            "recovery sidecar at '{}' has an invalid schema-v{} shape: {}",
+            sidecar_uri, sidecar.schema_version, reason
+        ))
+    };
+
+    if sidecar.writer_kind != SidecarKind::BranchMerge {
+        return Err(malformed(format!(
+            "protocol_v4 is only defined for BranchMerge, found {:?}",
+            sidecar.writer_kind
+        )));
+    }
+    if sidecar.protocol_v3.is_some()
+        || sidecar.protocol_v7.is_some()
+        || sidecar.protocol_v8.is_some()
+        || sidecar.ensure_indices_rollback_v6.is_some()
+    {
+        return Err(malformed(
+            "schema-v4 BranchMerge sidecar carries another writer protocol".to_string(),
+        ));
+    }
+    if sidecar.merge_source_commit_id.is_some()
+        || !sidecar.additional_registrations.is_empty()
+        || !sidecar.tombstones.is_empty()
+    {
+        return Err(malformed(
+            "schema-v4 BranchMerge must carry lineage/delta only in protocol_v4".to_string(),
+        ));
+    }
+    let protocol = sidecar
+        .protocol_v4
+        .as_ref()
+        .ok_or_else(|| malformed("missing required protocol_v4 payload".to_string()))?;
+    validate_authority_identity(&malformed, &protocol.authority)?;
+    if !protocol.intended_delta.registrations.is_empty()
+        || !protocol.intended_delta.renames.is_empty()
+        || !protocol.intended_delta.tombstones.is_empty()
+    {
+        return Err(malformed(
+            "BranchMerge cannot register or tombstone tables".to_string(),
+        ));
+    }
+
+    let sidecar_branch = sidecar.branch.as_deref().filter(|branch| *branch != "main");
+    let lineage_branch = protocol
+        .lineage
+        .branch
+        .as_deref()
+        .filter(|branch| *branch != "main");
+    if sidecar_branch != lineage_branch {
+        return Err(malformed(
+            "sidecar branch does not match original merge lineage branch".to_string(),
+        ));
+    }
+    if sidecar.actor_id != protocol.lineage.actor_id {
+        return Err(malformed(
+            "sidecar actor does not match original merge lineage actor".to_string(),
+        ));
+    }
+    if protocol.lineage.merged_parent_commit_id.is_none() {
+        return Err(malformed(
+            "BranchMerge lineage must carry the captured source commit".to_string(),
+        ));
+    }
+    if protocol.rollback_graph_commit_id == protocol.lineage.graph_commit_id {
+        return Err(malformed(
+            "original and rollback graph commit ids must differ".to_string(),
+        ));
+    }
+
+    validate_unique_pin_identities(&malformed, &sidecar.tables, true)?;
+    let pin_ids: HashSet<TableIdentity> = sidecar.tables.iter().map(|pin| pin.identity).collect();
+    let pin_aliases: HashSet<&str> = sidecar
+        .tables
+        .iter()
+        .map(|pin| pin.table_key.as_str())
+        .collect();
+    let effect_ids: HashSet<TableIdentity> = protocol
+        .effects
+        .iter()
+        .map(|effect| effect.identity)
+        .collect();
+    let delta_ids: HashSet<TableIdentity> = protocol
+        .intended_delta
+        .table_updates
+        .iter()
+        .map(|slot| slot.identity)
+        .collect();
+    let delta_aliases: HashSet<&str> = protocol
+        .intended_delta
+        .table_updates
+        .iter()
+        .map(|slot| slot.table_key.as_str())
+        .collect();
+    if effect_ids.len() != protocol.effects.len()
+        || delta_ids.len() != protocol.intended_delta.table_updates.len()
+        || delta_aliases.len() != protocol.intended_delta.table_updates.len()
+        || effect_ids != pin_ids
+        || !effect_ids.is_subset(&delta_ids)
+    {
+        return Err(malformed(
+            "physical table pins/effects must be one-to-one and a subset of unique intended-delta slots"
+                .to_string(),
+        ));
+    }
+    if let Some(outcomes) = protocol.rollback_audit_outcomes.as_ref() {
+        let outcome_keys: HashSet<&str> = outcomes
+            .iter()
+            .map(|outcome| outcome.table_key.as_str())
+            .collect();
+        if outcome_keys.len() != outcomes.len() || !outcome_keys.is_subset(&pin_aliases) {
+            return Err(malformed(
+                "rollback audit outcomes must name a unique subset of physical table pins"
+                    .to_string(),
+            ));
+        }
+    }
+
+    for slot in &protocol.intended_delta.table_updates {
+        slot.identity
+            .validate()
+            .map_err(|error| malformed(format!("invalid delta identity: {error}")))?;
+        match protocol.effect_phase {
+            RecoveryEffectPhase::Armed if slot.confirmed.is_some() => {
+                return Err(malformed(format!(
+                    "Armed manifest slot '{}' already carries confirmation",
+                    slot.table_key
+                )));
+            }
+            RecoveryEffectPhase::EffectsConfirmed if slot.confirmed.is_none() => {
+                return Err(malformed(format!(
+                    "EffectsConfirmed manifest slot '{}' lacks its exact output",
+                    slot.table_key
+                )));
+            }
+            _ => {}
+        }
+        if let Some(confirmed) = slot.confirmed.as_ref()
+            && confirmed.table_branch != slot.table_branch
+        {
+            return Err(malformed(format!(
+                "confirmed output branch for '{}' differs from its planned slot",
+                slot.table_key
+            )));
+        }
+    }
+
+    let mut planned_transaction_uuids = HashSet::new();
+    for pin in &sidecar.tables {
+        let effect = protocol
+            .effects
+            .iter()
+            .find(|effect| effect.identity == pin.identity)
+            .expect("effect/pin key sets checked above");
+        let slot = protocol
+            .intended_delta
+            .table_updates
+            .iter()
+            .find(|slot| slot.identity == pin.identity)
+            .expect("physical effects are a subset of delta slots");
+        if effect.table_key != pin.table_key || slot.table_key != pin.table_key {
+            return Err(malformed(format!(
+                "BranchMerge identity {} has inconsistent diagnostic aliases",
+                pin.identity
+            )));
+        }
+        if slot.expected_version != pin.expected_version || slot.table_branch != pin.table_branch {
+            return Err(malformed(format!(
+                "intended-delta pre-state for '{}' does not match its physical table pin",
+                pin.table_key
+            )));
+        }
+        if pin
+            .table_branch
+            .as_deref()
+            .is_none_or(|branch| branch == "main")
+            && effect.kind.source_fork_version().is_some()
+        {
+            return Err(malformed(format!(
+                "first-touch effect '{}' does not name a non-main target ref",
+                pin.table_key
+            )));
+        }
+        if let Some(source_fork_version) = effect.kind.source_fork_version()
+            && matches!(
+                &effect.kind,
+                RecoveryBranchMergeEffectKind::MultiCommitHead { .. }
+            )
+            && source_fork_version != pin.expected_version
+        {
+            return Err(malformed(format!(
+                "first-touch multi-commit effect '{}' forks from version {}, pin expects {}",
+                pin.table_key, source_fork_version, pin.expected_version
+            )));
+        }
+        match (&effect.kind, protocol.effect_phase) {
+            (
+                RecoveryBranchMergeEffectKind::MultiCommitHead {
+                    planned_transactions,
+                    confirmed_version,
+                    confirmed_branch_identifier,
+                    source_fork_version,
+                },
+                RecoveryEffectPhase::Armed,
+            ) => {
+                validate_branch_merge_transaction_chain(
+                    &malformed,
+                    pin,
+                    planned_transactions,
+                    &mut planned_transaction_uuids,
+                )?;
+                if confirmed_version.is_some()
+                    || confirmed_branch_identifier.is_some()
+                    || pin.confirmed_version.is_some()
+                {
+                    return Err(malformed(format!(
+                        "Armed multi-commit effect '{}' already carries confirmation",
+                        pin.table_key
+                    )));
+                }
+                if source_fork_version.is_none() && confirmed_branch_identifier.is_some() {
+                    return Err(malformed(format!(
+                        "owned-ref effect '{}' unexpectedly carries a branch identifier",
+                        pin.table_key
+                    )));
+                }
+            }
+            (
+                RecoveryBranchMergeEffectKind::MultiCommitHead {
+                    planned_transactions,
+                    confirmed_version,
+                    confirmed_branch_identifier,
+                    source_fork_version,
+                },
+                RecoveryEffectPhase::EffectsConfirmed,
+            ) => {
+                let planned_final_version = validate_branch_merge_transaction_chain(
+                    &malformed,
+                    pin,
+                    planned_transactions,
+                    &mut planned_transaction_uuids,
+                )?;
+                let version = confirmed_version.ok_or_else(|| {
+                    malformed(format!(
+                        "EffectsConfirmed multi-commit effect '{}' lacks final version",
+                        pin.table_key
+                    ))
+                })?;
+                let confirmed = slot.confirmed.as_ref().expect("phase checked above");
+                if pin.confirmed_version != Some(version)
+                    || confirmed.table_version != version
+                    || version < planned_final_version
+                {
+                    return Err(malformed(format!(
+                        "multi-commit effect '{}' confirmation does not match its pin/delta",
+                        pin.table_key
+                    )));
+                }
+                if source_fork_version.is_some() != confirmed_branch_identifier.is_some() {
+                    return Err(malformed(format!(
+                        "first-touch multi-commit effect '{}' must confirm its target ref identity",
+                        pin.table_key
+                    )));
+                }
+            }
+            (
+                RecoveryBranchMergeEffectKind::RefOnlyFork {
+                    source_version: _,
+                    confirmed_branch_identifier,
+                },
+                RecoveryEffectPhase::Armed,
+            ) => {
+                if confirmed_branch_identifier.is_some() || pin.confirmed_version.is_some() {
+                    return Err(malformed(format!(
+                        "Armed ref-only effect '{}' already carries confirmation",
+                        pin.table_key
+                    )));
+                }
+            }
+            (
+                RecoveryBranchMergeEffectKind::RefOnlyFork {
+                    source_version,
+                    confirmed_branch_identifier,
+                },
+                RecoveryEffectPhase::EffectsConfirmed,
+            ) => {
+                let confirmed = slot.confirmed.as_ref().expect("phase checked above");
+                if confirmed_branch_identifier.is_none()
+                    || pin.confirmed_version != Some(*source_version)
+                    || confirmed.table_version != *source_version
+                {
+                    return Err(malformed(format!(
+                        "ref-only effect '{}' confirmation does not match its exact fork version",
+                        pin.table_key
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_branch_merge_transaction_chain(
+    malformed: &impl Fn(String) -> OmniError,
+    pin: &SidecarTablePin,
+    planned_transactions: &[StagedTransactionIdentity],
+    planned_transaction_uuids: &mut HashSet<String>,
+) -> Result<u64> {
+    let transaction_count = u64::try_from(planned_transactions.len()).map_err(|_| {
+        malformed(format!(
+            "planned transaction chain for '{}' exceeds u64",
+            pin.table_key
+        ))
+    })?;
+    if transaction_count > MAX_BRANCH_MERGE_DATA_TRANSACTIONS {
+        return Err(malformed(format!(
+            "planned transaction chain for '{}' contains {} data transactions, exceeding the recovery-safe limit of {}",
+            pin.table_key, transaction_count, MAX_BRANCH_MERGE_DATA_TRANSACTIONS
+        )));
+    }
+    let first = planned_transactions.first().ok_or_else(|| {
+        malformed(format!(
+            "multi-commit effect '{}' has an empty planned transaction chain",
+            pin.table_key
+        ))
+    })?;
+    if first.read_version != pin.expected_version {
+        return Err(malformed(format!(
+            "planned transaction chain for '{}' begins at version {}, pin expects {}",
+            pin.table_key, first.read_version, pin.expected_version
+        )));
+    }
+    let first_output = first.read_version.checked_add(1).ok_or_else(|| {
+        malformed(format!(
+            "planned transaction chain for '{}' overflows its first output version",
+            pin.table_key
+        ))
+    })?;
+    if pin.post_commit_pin != first_output {
+        return Err(malformed(format!(
+            "post-commit pin for '{}' is {}, first planned output is {}",
+            pin.table_key, pin.post_commit_pin, first_output
+        )));
+    }
+
+    for (index, planned) in planned_transactions.iter().enumerate() {
+        if planned.uuid.is_empty() || !planned_transaction_uuids.insert(planned.uuid.clone()) {
+            return Err(malformed(format!(
+                "planned transaction chain for '{}' contains an empty or duplicate identity at offset {}",
+                pin.table_key, index
+            )));
+        }
+        let expected_read_version = pin
+            .expected_version
+            .checked_add(u64::try_from(index).map_err(|_| {
+                malformed(format!(
+                    "planned transaction chain for '{}' exceeds u64",
+                    pin.table_key
+                ))
+            })?)
+            .ok_or_else(|| {
+                malformed(format!(
+                    "planned transaction chain for '{}' overflows at offset {}",
+                    pin.table_key, index
+                ))
+            })?;
+        if planned.read_version != expected_read_version {
+            return Err(malformed(format!(
+                "planned transaction chain for '{}' reads version {} at offset {}, expected {}",
+                pin.table_key, planned.read_version, index, expected_read_version
+            )));
+        }
+    }
+
+    planned_transactions
+        .last()
+        .expect("non-empty chain checked above")
+        .read_version
+        .checked_add(1)
+        .ok_or_else(|| {
+            malformed(format!(
+                "planned transaction chain for '{}' overflows its final output version",
+                pin.table_key
+            ))
+        })
 }
 
 /// Classify one table's observed state vs. the sidecar's intent.
@@ -617,7 +2783,8 @@ pub(crate) fn parse_sidecar(sidecar_uri: &str, body: &str) -> Result<RecoverySid
 /// - **Strict** (`Mutation`, `Load`): exactly one `commit_staged` per
 ///   table, so `lance_head == manifest_pinned + 1` AND
 ///   `post_commit_pin == lance_head` is required.
-/// - **Loose** (`SchemaApply`, `EnsureIndices`, `Optimize`): the writer
+/// - **Loose** (schema-v5 SchemaApply, schema-v6 EnsureIndices, schema-v2
+///   Optimize): the writer
 ///   advances the Lance HEAD by N ≥ 1 commits per table (one per index
 ///   built + one for the overwrite, etc.; `Optimize` runs `compact_files`,
 ///   which commits reserve-fragments + rewrite) and the exact N is hard to
@@ -630,12 +2797,33 @@ pub(crate) fn parse_sidecar(sidecar_uri: &str, body: &str) -> Result<RecoverySid
 ///   no logical rows. The risk it admits — an external agent advancing HEAD
 ///   between sidecar write and recovery — is out of scope for the
 ///   single-coordinator model.
+#[cfg(test)]
 pub(crate) fn classify_table(
     pin: &SidecarTablePin,
     lance_head: u64,
     manifest_pinned: u64,
     kind: SidecarKind,
     schema_version: u32,
+) -> TableClassification {
+    classify_table_observation(
+        pin,
+        lance_head,
+        None,
+        manifest_pinned,
+        kind,
+        schema_version,
+        None,
+    )
+}
+
+fn classify_table_observation(
+    pin: &SidecarTablePin,
+    lance_head: u64,
+    observed_transaction: Option<&StagedTransactionIdentity>,
+    manifest_pinned: u64,
+    kind: SidecarKind,
+    schema_version: u32,
+    protocol_v3: Option<&RecoveryProtocolV3>,
 ) -> TableClassification {
     use TableClassification::*;
     if lance_head < manifest_pinned {
@@ -690,6 +2878,49 @@ pub(crate) fn classify_table(
                 UnexpectedMultistep
             }
         }
+        ClassificationMode::ExactEffect => {
+            let Some(protocol) = protocol_v3 else {
+                return IncompletePhaseB;
+            };
+            if protocol.effect_phase != RecoveryEffectPhase::EffectsConfirmed {
+                return IncompletePhaseB;
+            }
+            let Some(effect) = protocol
+                .effects
+                .iter()
+                .find(|effect| effect.identity == pin.identity)
+            else {
+                return IncompletePhaseB;
+            };
+            let Some(slot) = protocol
+                .intended_delta
+                .table_updates
+                .iter()
+                .find(|slot| slot.identity == pin.identity)
+            else {
+                return IncompletePhaseB;
+            };
+            let (Some(confirmed_transaction), Some(confirmed_update)) = (
+                effect.confirmed_transaction.as_ref(),
+                slot.confirmed.as_ref(),
+            ) else {
+                return IncompletePhaseB;
+            };
+            if pin.expected_version != manifest_pinned {
+                return UnexpectedAtP1;
+            }
+            if lance_head != confirmed_update.table_version
+                || pin.confirmed_version != Some(confirmed_update.table_version)
+            {
+                return UnexpectedMultistep;
+            }
+            if confirmed_transaction != &effect.planned_transaction
+                || observed_transaction != Some(confirmed_transaction)
+            {
+                return UnexpectedEffectIdentity;
+            }
+            RolledPastExpected
+        }
     }
 }
 
@@ -705,10 +2936,16 @@ pub(crate) fn decide(classifications: &[TableClassification]) -> SidecarDecision
     {
         return Abort;
     }
-    if classifications
-        .iter()
-        .any(|c| matches!(c, NoMovement | UnexpectedAtP1 | UnexpectedMultistep | IncompletePhaseB))
-    {
+    if classifications.iter().any(|c| {
+        matches!(
+            c,
+            NoMovement
+                | UnexpectedAtP1
+                | UnexpectedMultistep
+                | UnexpectedEffectIdentity
+                | IncompletePhaseB
+        )
+    }) {
         return RollBack;
     }
     // All RolledPastExpected (or the slice is empty — no-op trivially).
@@ -774,18 +3011,17 @@ pub(crate) async fn restore_table_to_version(
 /// violating sidecars are deferred to the next ReadWrite open, exactly
 /// as `Omnigraph::refresh` documents.
 ///
-/// Concurrency: unlike the open-time sweep, this runs while other
-/// writers may be in flight. Every sidecar writer (mutation/load
-/// finalize, schema_apply, branch_merge, ensure_indices, optimize)
-/// acquires its per-`(table_key, table_branch)` write queues *before*
-/// `write_sidecar` and holds them until after `delete_sidecar` — so
-/// acquiring the same queues here blocks until that writer either
-/// finished (sidecar deleted; the existence re-check skips it) or died
-/// (sidecar is genuinely orphaned; safe to process). Without this, the
+/// Concurrency: unlike the open-time sweep, this runs while other writers may
+/// be in flight. RFC-022 mutation/load holds root-scoped schema → branch →
+/// sorted table gates across its sidecar lifetime; legacy adapters hold their
+/// applicable schema/table gates. Healing takes the ordered superset, so it
+/// blocks until the sidecar writer either
+/// finished (sidecar deleted; the under-gate reread skips it) or died
+/// (the freshly parsed sidecar is genuinely orphaned and safe to process). Without this, the
 /// heal could observe a live writer's sidecar in its commit→publish
 /// window, roll it forward, and fail that writer's own publish CAS.
-/// Lock order is queues → coordinator, matching every writer's
-/// commit→publish path.
+/// Lock order is schema → branch → sorted tables → coordinator, matching the
+/// RFC-022 writer and Full-recovery paths.
 ///
 /// The schema-staging reconcile runs lazily, per SchemaApply sidecar,
 /// AFTER that sidecar's queue guards are held and its existence is
@@ -793,49 +3029,71 @@ pub(crate) async fn restore_table_to_version(
 /// LIVE schema apply's staging files and steal its commit (pinned by
 /// `tests/failpoints.rs::heal_does_not_promote_live_schema_apply_staging`).
 ///
-/// Returns `true` when at least one sidecar was processed (the caller
-/// should invalidate per-snapshot caches).
+/// One sidecar that RollForwardOnly deliberately left in place after acquiring
+/// its root-scoped gates and re-checking that the artifact still exists.
+///
+/// Write-entry barriers use the captured graph branch to reject only relevant
+/// intents. SchemaApply is graph-global and is filtered specially by the caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnresolvedRecoveryIntent {
+    pub(crate) operation_id: String,
+    /// Normalized graph branch (`None` means main; `Some("main")` is folded).
+    pub(crate) branch: Option<String>,
+    pub(crate) writer_kind: SidecarKind,
+    /// Diagnostic ownership surface for future table-aware barriers. RFC-022's
+    /// first adapter fences mutation/load at graph-branch granularity.
+    pub(crate) table_keys: Vec<String>,
+}
+
+/// Returns whether durable state changed and every guarded intent that could
+/// not be resolved without destructive recovery. Callers invalidate caches on
+/// `processed_any`; mutation/load barriers additionally filter `unresolved` by
+/// their captured graph branches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HealPendingOutcome {
+    pub(crate) processed_any: bool,
+    pub(crate) unresolved: Vec<UnresolvedRecoveryIntent>,
+}
+
 pub(crate) async fn heal_pending_sidecars_roll_forward(
     root_uri: &str,
     storage: std::sync::Arc<dyn StorageAdapter>,
     coordinator: &tokio::sync::RwLock<GraphCoordinator>,
     write_queue: &crate::db::write_queue::WriteQueueManager,
-) -> Result<bool> {
+) -> Result<HealPendingOutcome> {
     let sidecars = list_sidecars(root_uri, storage.as_ref()).await?;
     if sidecars.is_empty() {
-        return Ok(false);
+        return Ok(HealPendingOutcome {
+            processed_any: false,
+            unresolved: Vec::new(),
+        });
     }
+    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_POST_LIST_PRE_GATES)?;
     let mut processed_any = false;
+    let mut unresolved = Vec::new();
     for sidecar in sidecars {
-        // Serialize against a possibly-live writer (see fn docs). Guards
-        // are scoped per sidecar so two sidecars never hold queues
-        // simultaneously (no cross-sidecar lock-order surface).
-        let mut queue_keys: Vec<crate::db::write_queue::TableQueueKey> = sidecar
+        // Serialize against a possibly-live writer (see fn docs). Guards are
+        // scoped per sidecar and follow the one total order shared by writers,
+        // Full recovery, and live healing. Taking schema + branch even for an
+        // empty/legacy sidecar also serializes its audit/delete lifecycle.
+        let _schema_guard = write_queue.acquire(&schema_apply_serial_queue_key()).await;
+        let _branch_guard = write_queue.acquire_branch(sidecar.branch.as_deref()).await;
+        let queue_keys: Vec<crate::db::write_queue::TableQueueKey> = sidecar
             .tables
             .iter()
             .map(|pin| (pin.table_key.clone(), pin.table_branch.clone()))
             .collect();
         let is_schema_apply = matches!(sidecar.writer_kind, SidecarKind::SchemaApply);
-        if is_schema_apply {
-            // A SchemaApply sidecar's per-table pins don't cover a
-            // registration-only migration (no existing tables touched,
-            // but staging files + a sidecar on disk). The schema-apply
-            // writer holds this serialization key from before its
-            // sidecar write until after its sidecar delete, so blocking
-            // on it — then re-checking sidecar existence — guarantees
-            // the writer is gone before the reconcile below mutates
-            // schema staging.
-            queue_keys.push(schema_apply_serial_queue_key());
-        }
-        let _guards = write_queue.acquire_many(&queue_keys).await;
-        // Re-check after the wait: the writer we blocked on may have
-        // completed Phase C and deleted its sidecar.
-        if !storage
-            .exists(&sidecar_uri(root_uri, &sidecar.operation_id))
-            .await?
-        {
+        let _table_guards = write_queue.acquire_many(&queue_keys).await;
+        // Re-read after the wait: the writer we blocked on may have completed
+        // Phase C and deleted the sidecar, or may have durably confirmed Phase B
+        // before releasing its gates.  Processing the pre-wait body would turn a
+        // fully confirmed effect set back into an apparent partial one.
+        let Some(sidecar) =
+            reread_sidecar_under_gates(root_uri, storage.as_ref(), &sidecar).await?
+        else {
             continue;
-        }
+        };
         // Schema-staging reconcile, per SchemaApply sidecar, UNDER the
         // sidecar's guards: a sidecar still on disk after the queue wait
         // belongs to a dead writer, so promoting its staging files can no
@@ -901,12 +3159,29 @@ pub(crate) async fn heal_pending_sidecars_roll_forward(
         .await?
         {
             processed_any = true;
+        } else {
+            let mut table_keys = sidecar
+                .tables
+                .iter()
+                .map(|pin| pin.table_key.clone())
+                .collect::<Vec<_>>();
+            table_keys.sort();
+            table_keys.dedup();
+            unresolved.push(UnresolvedRecoveryIntent {
+                operation_id: sidecar.operation_id.clone(),
+                branch: sidecar.branch.clone().filter(|branch| branch != "main"),
+                writer_kind: sidecar.writer_kind,
+                table_keys,
+            });
         }
     }
     // Re-read coordinator state so the caller's handle observes the
     // post-heal manifest.
     coordinator.write().await.refresh().await?;
-    Ok(processed_any)
+    Ok(HealPendingOutcome {
+        processed_any,
+        unresolved,
+    })
 }
 
 /// Discard a sidecar whose branch no longer exists in the manifest (the
@@ -917,8 +3192,8 @@ pub(crate) async fn heal_pending_sidecars_roll_forward(
 /// unreachable and the sidecar is provably moot; leaving it would wedge
 /// every heal (write entry) and every ReadWrite open on a dead-branch
 /// open, with `repair` refusing while it pends. Records an
-/// `OrphanedBranchDiscarded` audit row (commit appended on main — the
-/// sidecar's own branch has no commit graph anymore).
+/// `OrphanedBranchDiscarded` audit row (lineage published on main — the
+/// sidecar's own branch no longer has a live graph head).
 async fn discard_orphaned_branch_sidecar(
     root_uri: &str,
     storage: &dyn StorageAdapter,
@@ -937,15 +3212,13 @@ async fn discard_orphaned_branch_sidecar(
     // the retry's sole remaining job is finishing the delete. (Cold
     // path: the list scan runs only when an orphaned sidecar exists.)
     //
-    // Documented residual: the commit append and the audit append are
-    // two writes. A failure BETWEEN them leaves a recovery commit with
-    // no audit row; the retry (keyed on the audit row, the operator-
-    // facing record) appends a second commit before the audit lands —
-    // bounded commit-graph noise, audit row still exactly-once. Same
-    // not-atomic-pair-write tolerance as `record_audit` and the
-    // manifest→commit-graph Known Gap; keying on commit rows instead
-    // would need an operation_id column on `_graph_commits`, and
-    // audit-before-commit would dangle the `graph_commit_id` join.
+    // Documented residual: the lineage CAS in `__manifest` and the audit append
+    // are two writes. A failure between them leaves a recovery commit with no
+    // audit row; a legacy sidecar carries no fixed recovery-commit id, so the
+    // retry (keyed on the operator-facing audit row) may append a second lineage
+    // commit before that one audit row lands. Keying idempotency on lineage
+    // would require a durable operation id there, while audit-before-lineage
+    // would leave a dangling `graph_commit_id` join.
     let already_recorded = audit.list().await?.iter().any(|record| {
         record.operation_id == sidecar.operation_id
             && record.recovery_kind == RecoveryKind::OrphanedBranchDiscarded
@@ -962,11 +3235,19 @@ async fn discard_orphaned_branch_sidecar(
             merged_parent_commit_id: None,
             created_at: crate::db::now_micros()?,
         };
-        let publisher = GraphNamespacePublisher::new(root_uri, None);
-        publisher.publish(&[], &HashMap::new(), Some(&intent)).await?;
+        let publisher = GraphNamespacePublisher::new_with_session(
+            root_uri,
+            None,
+            crate::lance_access::control_session(),
+        );
+        publisher
+            .publish(&[], &HashMap::new(), Some(&intent))
+            .await?;
         // Failpoint: the residual window above — commit published, audit
         // not yet durable.
-        crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_ORPHAN_DISCARD_AUDIT_APPEND)?;
+        crate::failpoints::maybe_fail(
+            crate::failpoints::names::RECOVERY_ORPHAN_DISCARD_AUDIT_APPEND,
+        )?;
         audit
             .append(RecoveryAuditRecord {
                 graph_commit_id: intent.graph_commit_id,
@@ -1004,28 +3285,36 @@ pub(crate) fn schema_apply_serial_queue_key() -> crate::db::write_queue::TableQu
 /// roll-forward (every table eligible), roll-back (mixed or unexpected
 /// state), or abort (invariant violation).
 ///
-/// Idempotency: a crash mid-sweep leaves the sidecar (deletion is the
-/// final step). Re-opening re-classifies; repeated rollbacks of the
-/// same table append extra Lance restore commits which `omnigraph
-/// cleanup` reclaims.
+/// Idempotency: a crash mid-sweep leaves the sidecar (deletion is the final
+/// step). v3/v4 persist an ownership-exact rollback audit plan before restoring;
+/// schema-v6 EnsureIndices persists its loose-classifier plan. All three use a
+/// fixed rollback commit id, so re-entry resumes that outcome without another
+/// restore or synthetic commit. Older legacy sidecars re-classify and may append
+/// an extra restore commit, which `omnigraph cleanup` reclaims.
 ///
-/// Concurrency: the open-time sweep runs synchronously in `Omnigraph::open`
-/// before the engine handle is published to any caller, so no request
-/// handler can race it and it does NOT acquire write queues. In-process
-/// callers (refresh, write entry points) must use
-/// [`heal_pending_sidecars_roll_forward`] instead, which serializes
-/// against live writers via per-(table_key, branch) queue acquisition.
+/// Concurrency: a newly-opening handle is not yet published, but another handle
+/// for the same root may already be serving writes. Every handle obtains the
+/// root-scoped [`WriteQueueManager`](crate::db::write_queue::WriteQueueManager).
+/// The caller holds its schema gate across schema-file recovery and this whole
+/// pass; Full recovery adds branch → sorted table gates per sidecar and
+/// re-reads/re-parses the sidecar after waiting. A live writer either finishes
+/// and deletes its sidecar (recovery skips it), durably confirms a newer body
+/// (recovery classifies that body), or releases the gates with a genuinely pending
+/// intent (recovery owns it). This is process-local serialization only;
+/// the documented foreign-process boundary remains.
 pub(crate) async fn recover_manifest_drift(
     root_uri: &str,
     storage: std::sync::Arc<dyn StorageAdapter>,
     coordinator: &mut GraphCoordinator,
     mode: RecoveryMode,
     schema_state_recovery: SchemaStateRecovery,
+    write_queue: &crate::db::write_queue::WriteQueueManager,
 ) -> Result<()> {
     let sidecars = list_sidecars(root_uri, storage.as_ref()).await?;
     if sidecars.is_empty() {
         return Ok(());
     }
+    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_POST_LIST_PRE_GATES)?;
 
     // For each sidecar, classify against a FRESH snapshot AT THE
     // SIDECAR'S BRANCH. Two reasons:
@@ -1039,6 +3328,28 @@ pub(crate) async fn recover_manifest_drift(
     //    no-op'ing or rolling back the wrong table version. Open a
     //    separate per-branch coordinator and use ITS snapshot.
     for sidecar in sidecars {
+        // Total order shared with RFC-022 writers. The caller already holds the
+        // root-scoped schema gate; add branch then sorted table gates so a
+        // concurrent open/refresh cannot Restore or delete a ref underneath a
+        // live writer from another `Omnigraph` handle.
+        let _branch_guard = write_queue.acquire_branch(sidecar.branch.as_deref()).await;
+        let table_keys = sidecar
+            .tables
+            .iter()
+            .map(|pin| (pin.table_key.clone(), pin.table_branch.clone()))
+            .collect::<Vec<_>>();
+        let _table_guards = write_queue.acquire_many(&table_keys).await;
+
+        // The writer may have completed Phase C/D or rewritten Armed ->
+        // confirmed while this recovery instance waited.  Re-read the complete
+        // body under the gates; an existence-only check still leaves recovery
+        // classifying stale confirmation state.
+        let Some(sidecar) =
+            reread_sidecar_under_gates(root_uri, storage.as_ref(), &sidecar).await?
+        else {
+            continue;
+        };
+
         let branch_snapshot = match sidecar.branch.as_deref() {
             Some(b) => {
                 // Orphan check against the manifest's branch list (the
@@ -1081,6 +3392,206 @@ pub(crate) async fn recover_manifest_drift(
     Ok(())
 }
 
+fn snapshot_entry_by_identity(
+    snapshot: &Snapshot,
+    identity: TableIdentity,
+) -> Option<&super::SubTableEntry> {
+    snapshot.entries().find(|entry| entry.identity == identity)
+}
+
+/// Resolve manifest authority by immutable identity. The alias is checked only
+/// as the captured diagnostic binding; a rename or same-name reincarnation is
+/// an authority change, never a substitute identity for recovery.
+fn snapshot_entry_for_pin<'a>(
+    snapshot: &'a Snapshot,
+    pin: &SidecarTablePin,
+) -> Result<Option<&'a super::SubTableEntry>> {
+    if let Some(entry) = snapshot_entry_by_identity(snapshot, pin.identity) {
+        if entry.table_key != pin.table_key {
+            return Err(OmniError::manifest_read_set_changed(
+                format!("table_binding:{}", pin.identity),
+                Some(pin.table_key.clone()),
+                Some(entry.table_key.clone()),
+            ));
+        }
+        return Ok(Some(entry));
+    }
+    if let Some(entry) = snapshot.entry(&pin.table_key) {
+        return Err(OmniError::manifest_read_set_changed(
+            format!("table_identity:{}", pin.table_key),
+            Some(pin.identity.to_string()),
+            Some(entry.identity.to_string()),
+        ));
+    }
+    Ok(None)
+}
+
+fn snapshot_entry_for_schema_pin<'a>(
+    snapshot: &'a Snapshot,
+    pin: &SidecarTablePin,
+    protocol: &RecoveryProtocolV7,
+) -> Result<Option<&'a super::SubTableEntry>> {
+    let expected_alias = protocol
+        .intended_delta
+        .renames
+        .iter()
+        .find(|rename| rename.identity == pin.identity)
+        .map(|rename| rename.expected_table_key.as_str())
+        .unwrap_or(pin.table_key.as_str());
+    if let Some(entry) = snapshot_entry_by_identity(snapshot, pin.identity) {
+        if entry.table_key != expected_alias {
+            return Err(OmniError::manifest_read_set_changed(
+                format!("table_binding:{}", pin.identity),
+                Some(expected_alias.to_string()),
+                Some(entry.table_key.clone()),
+            ));
+        }
+        return Ok(Some(entry));
+    }
+    if let Some(entry) = snapshot.entry(expected_alias) {
+        return Err(OmniError::manifest_read_set_changed(
+            format!("table_identity:{expected_alias}"),
+            Some(pin.identity.to_string()),
+            Some(entry.identity.to_string()),
+        ));
+    }
+    Ok(None)
+}
+
+/// Classify the exact physical ownership of every table named by a recovery
+/// sidecar against one manifest snapshot.
+///
+/// Keeping this probe separate from the recovery decision lets a live writer
+/// use the same transaction-identity evidence for RFC-023's narrow
+/// effect-free-finalization rule.  The probe itself never restores, publishes,
+/// or deletes anything.
+async fn classify_sidecar_tables(
+    snapshot: &Snapshot,
+    sidecar: &RecoverySidecar,
+) -> Result<Vec<ClassifiedTable>> {
+    let mut states = Vec::with_capacity(sidecar.tables.len());
+    for pin in &sidecar.tables {
+        let manifest_entry = snapshot_entry_for_pin(snapshot, pin)?;
+        let manifest_pinned = manifest_entry.map(|entry| entry.table_version).unwrap_or(0);
+        // A first-touch named-branch mutation/load stages against the inherited
+        // source snapshot, arms its v3 sidecar, and only then creates the Lance
+        // target ref. Until Phase C publishes, the branch snapshot therefore
+        // still points at the source ref. Armed recovery must tolerate the
+        // target ref not existing yet: that is the crash-before-fork state, not
+        // storage corruption. Once effects are confirmed, a missing ref is
+        // impossible and remains a loud error.
+        let unpublished_fork = (sidecar.protocol_v3.is_some()
+            || matches!(sidecar.writer_kind, SidecarKind::EnsureIndices))
+            && pin
+                .table_branch
+                .as_deref()
+                .is_some_and(|branch| branch != "main")
+            && sidecar.branch.as_deref() == pin.table_branch.as_deref()
+            && manifest_entry
+                .map(|entry| entry.table_branch != pin.table_branch)
+                .unwrap_or(true);
+        let allow_missing_target_ref = unpublished_fork
+            && (matches!(sidecar.writer_kind, SidecarKind::EnsureIndices)
+                || sidecar
+                    .protocol_v3
+                    .as_ref()
+                    .is_some_and(|protocol| protocol.effect_phase == RecoveryEffectPhase::Armed));
+        let planned_effect = sidecar.protocol_v3.as_ref().and_then(|protocol| {
+            protocol
+                .effects
+                .iter()
+                .find(|effect| effect.identity == pin.identity)
+                .map(|effect| {
+                    (
+                        pin.post_commit_pin,
+                        &effect.planned_transaction,
+                        manifest_pinned,
+                    )
+                })
+        });
+        let observation = open_lance_head_if_present(
+            &pin.table_path,
+            pin.table_branch.as_deref(),
+            planned_effect,
+            allow_missing_target_ref,
+            false,
+        )
+        .await?;
+        let observation = observation.unwrap_or(LanceHeadObservation {
+            version: manifest_pinned,
+            transaction: None,
+            effect_ownership: EffectOwnership::None,
+        });
+        let lance_head = observation.version;
+        states.push(ClassifiedTable {
+            classification: classify_table_observation(
+                pin,
+                lance_head,
+                observation.transaction.as_ref(),
+                manifest_pinned,
+                sidecar.writer_kind,
+                sidecar.schema_version,
+                sidecar.protocol_v3.as_ref(),
+            ),
+            manifest_pinned,
+            lance_head,
+            effect_ownership: observation.effect_ownership,
+            unpublished_fork,
+        });
+    }
+    Ok(states)
+}
+
+/// Retire an Armed mutation/load intent only when exact transaction-identity
+/// classification proves that none of its participants advanced.
+///
+/// This is deliberately narrower than a Full recovery sweep: it never rolls
+/// back or publishes an effect.  Callers must hold the normal
+/// schema -> branch -> table gate envelope, which is the same single-writer-
+/// process boundary under which destructive recovery is supported today.
+/// `false` means ownership was present or could not be retired safely; the
+/// sidecar remains the authority and the caller must return RecoveryRequired.
+pub(crate) async fn finalize_effect_free_occ_sidecar(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    snapshot: &Snapshot,
+    sidecar: &RecoverySidecar,
+) -> Result<bool> {
+    if sidecar.schema_version != IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION
+        || !matches!(
+            sidecar.writer_kind,
+            SidecarKind::Mutation | SidecarKind::Load
+        )
+    {
+        return Err(OmniError::manifest_internal(
+            "effect-free finalization requires an identity-aware mutation/load sidecar",
+        ));
+    }
+    let protocol = sidecar.protocol_v3.as_ref().ok_or_else(|| {
+        OmniError::manifest_internal(
+            "effect-free finalization requires an exact OCC protocol payload",
+        )
+    })?;
+    if protocol.effect_phase != RecoveryEffectPhase::Armed {
+        return Ok(false);
+    }
+
+    let states = classify_sidecar_tables(snapshot, sidecar).await?;
+    if states
+        .iter()
+        .any(|state| state.effect_ownership != EffectOwnership::None)
+    {
+        return Ok(false);
+    }
+
+    match cleanup_unpublished_no_effect_forks(root_uri, storage, sidecar, &states).await? {
+        NoEffectForkCleanup::Complete => {}
+        NoEffectForkCleanup::DeferredPathChild { .. } => return Ok(false),
+    }
+    delete_sidecar_by_operation_id(root_uri, storage, &sidecar.operation_id).await?;
+    Ok(true)
+}
+
 async fn process_sidecar(
     root_uri: &str,
     storage: &std::sync::Arc<dyn StorageAdapter>,
@@ -1093,24 +3604,240 @@ async fn process_sidecar(
     // stale-sidecar audit recovery). `false` = the sidecar was deferred
     // untouched -- callers must not treat that as a completed heal (no
     // schema reload / cache invalidation is warranted).
-    let mut states = Vec::with_capacity(sidecar.tables.len());
-    for pin in &sidecar.tables {
-        let lance_head = open_lance_head(&pin.table_path, pin.table_branch.as_deref()).await?;
-        let manifest_pinned = snapshot
-            .entry(&pin.table_key)
-            .map(|e| e.table_version)
-            .unwrap_or(0);
-        states.push(ClassifiedTable {
-            classification: classify_table(
-                pin,
-                lance_head,
-                manifest_pinned,
-                sidecar.writer_kind,
-                sidecar.schema_version,
-            ),
-            manifest_pinned,
-            lance_head,
+    // v9 is one identity-bearing envelope shared by all active writers. Route
+    // by the declared writer kind, never by whichever optional payload happens
+    // to be checked first. Shape validation makes foreign/multiple payloads
+    // malformed; this dispatch remains explicit defense in depth.
+    if sidecar.schema_version == IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION {
+        match sidecar.writer_kind {
+            SidecarKind::EnsureIndices => {
+                return process_ensure_indices_sidecar_v8(
+                    root_uri, storage, snapshot, sidecar, mode,
+                )
+                .await;
+            }
+            SidecarKind::SchemaApply => {
+                return process_schema_apply_sidecar_v7(root_uri, storage, snapshot, sidecar, mode)
+                    .await;
+            }
+            SidecarKind::BranchMerge => {
+                return process_branch_merge_sidecar_v4(root_uri, storage, snapshot, sidecar, mode)
+                    .await;
+            }
+            SidecarKind::Mutation | SidecarKind::Load => {
+                if let Some(outcome) = detect_visible_v3_outcome(root_uri, sidecar).await? {
+                    return finalize_visible_v3_outcome(
+                        root_uri,
+                        storage.as_ref(),
+                        sidecar,
+                        outcome,
+                    )
+                    .await;
+                }
+            }
+            SidecarKind::Optimize => {}
+        }
+    } else {
+        // Historical envelopes retain their original generation-specific
+        // payload dispatch.
+        if sidecar.protocol_v8.is_some() {
+            return process_ensure_indices_sidecar_v8(root_uri, storage, snapshot, sidecar, mode)
+                .await;
+        }
+        if sidecar.protocol_v7.is_some() {
+            return process_schema_apply_sidecar_v7(root_uri, storage, snapshot, sidecar, mode)
+                .await;
+        }
+        if sidecar.protocol_v4.is_some() {
+            return process_branch_merge_sidecar_v4(root_uri, storage, snapshot, sidecar, mode)
+                .await;
+        }
+        if sidecar.protocol_v3.is_some()
+            && let Some(outcome) = detect_visible_v3_outcome(root_uri, sidecar).await?
+        {
+            return finalize_visible_v3_outcome(root_uri, storage.as_ref(), sidecar, outcome).await;
+        }
+    }
+    if sidecar.ensure_indices_rollback_v6.is_some()
+        && detect_visible_ensure_indices_rollback(root_uri, sidecar).await?
+    {
+        return finalize_visible_ensure_indices_rollback(root_uri, storage.as_ref(), sidecar).await;
+    }
+    let states = classify_sidecar_tables(snapshot, sidecar).await?;
+
+    if let Some(protocol) = sidecar.protocol_v3.as_ref() {
+        let live_authority =
+            read_live_recovery_authority(root_uri, storage, sidecar.branch.as_deref()).await?;
+        let branch_recreated =
+            live_authority.branch_identifier != protocol.authority.branch_identifier;
+        let authority_changed = live_authority != protocol.authority;
+        let any_unverifiable = states
+            .iter()
+            .any(|state| state.effect_ownership == EffectOwnership::Unverifiable);
+        let any_own_effect = states.iter().any(|state| {
+            matches!(
+                state.effect_ownership,
+                EffectOwnership::OwnAtHead
+                    | EffectOwnership::OwnBeforeHead
+                    | EffectOwnership::OwnCompensatedAtHead
+            )
         });
+        let own_effect_not_at_head = states
+            .iter()
+            .any(|state| state.effect_ownership == EffectOwnership::OwnBeforeHead);
+        let ambiguous_manifest_advance =
+            sidecar
+                .tables
+                .iter()
+                .zip(states.iter())
+                .any(|(pin, state)| {
+                    // Lance's one-attempt commit can preflight-rebase our
+                    // staged append over a winner that already committed and
+                    // published: expected=v1, manifest winner=v2, our UUID
+                    // still HEAD=v3. Restoring to CURRENT manifest pin v2
+                    // preserves the winner and removes only our stale effect.
+                    // A manifest that selects our UUID (OwnBeforeHead or
+                    // manifest_pinned == lance_head) remains unsafe.
+                    // The same exception remains safe after a previous Full
+                    // pass has already appended Restore(current manifest pin)
+                    // but crashed before publishing that restore commit.
+                    // `OwnCompensatedAtHead` is assigned only when the HEAD
+                    // Restore target exactly equals this current pin.
+                    let safe_published_lower_winner = matches!(
+                        state.effect_ownership,
+                        EffectOwnership::OwnAtHead | EffectOwnership::OwnCompensatedAtHead
+                    ) && state.manifest_pinned
+                        > pin.expected_version
+                        && state.manifest_pinned < state.lance_head;
+                    state.effect_ownership != EffectOwnership::None
+                        && state.manifest_pinned != pin.expected_version
+                        && !safe_published_lower_winner
+                });
+        let foreign_table_drift = states.iter().any(|state| {
+            state.effect_ownership == EffectOwnership::None
+                && state.lance_head > state.manifest_pinned
+        });
+
+        if any_unverifiable {
+            let message = format!(
+                "OCC recovery sidecar '{}' cannot verify one or more planned Lance transaction \
+                 files; refusing destructive recovery",
+                sidecar.operation_id
+            );
+            return match mode {
+                RecoveryMode::RollForwardOnly => {
+                    warn!(operation_id = sidecar.operation_id.as_str(), "{message}");
+                    Ok(false)
+                }
+                RecoveryMode::Full => Err(OmniError::manifest_internal(message)),
+            };
+        }
+
+        if !any_own_effect {
+            // The sidecar was armed but this writer never landed a physical
+            // effect. RollForwardOnly recovery may be looking at a LIVE writer,
+            // so an Armed sidecar is still ownership and must be left untouched
+            // even though root-scoped queues make it wait for in-process
+            // handles. A quiesced Full sweep may abandon it; first remove only
+            // exact, unpublished first-touch forks that this intent owns. Do
+            // not manufacture lineage for an empty intent and never restore a
+            // foreign advance.
+            if matches!(mode, RecoveryMode::RollForwardOnly)
+                && (protocol.effect_phase == RecoveryEffectPhase::Armed
+                    || states.iter().any(|state| state.unpublished_fork))
+            {
+                warn!(
+                    operation_id = sidecar.operation_id.as_str(),
+                    "recovery: deferring v3 sidecar with no physical effects and live ownership"
+                );
+                return Ok(false);
+            }
+            if matches!(mode, RecoveryMode::Full) {
+                if let NoEffectForkCleanup::DeferredPathChild {
+                    table_path,
+                    target_branch,
+                    path_child,
+                } = cleanup_unpublished_no_effect_forks(
+                    root_uri,
+                    storage.as_ref(),
+                    sidecar,
+                    &states,
+                )
+                .await?
+                {
+                    warn!(
+                        operation_id = sidecar.operation_id.as_str(),
+                        table_path,
+                        branch = target_branch,
+                        path_child,
+                        "recovery: deferring no-effect fork cleanup until legacy path-child \
+                         branches are deleted leaf-first"
+                    );
+                    return Ok(false);
+                }
+            }
+            warn!(
+                operation_id = sidecar.operation_id.as_str(),
+                authority_changed, "recovery: abandoning v3 sidecar with no owned physical effects"
+            );
+            delete_sidecar_by_operation_id(root_uri, storage.as_ref(), &sidecar.operation_id)
+                .await?;
+            return Ok(true);
+        }
+
+        if branch_recreated {
+            // A restore through the reused branch name would target the NEW
+            // incarnation and can destroy unrelated data. Leave the sidecar for
+            // operator review in every mode; the old incarnation's effects are
+            // not safe to compensate through this ref.
+            let message = format!(
+                "OCC recovery sidecar '{}' targets a branch incarnation that was deleted and \
+                 recreated; refusing to restore through the reused branch name",
+                sidecar.operation_id
+            );
+            return match mode {
+                RecoveryMode::RollForwardOnly => {
+                    warn!(operation_id = sidecar.operation_id.as_str(), "{message}");
+                    Ok(false)
+                }
+                RecoveryMode::Full => Err(OmniError::manifest_internal(message)),
+            };
+        }
+
+        if own_effect_not_at_head || ambiguous_manifest_advance || foreign_table_drift {
+            let message = format!(
+                "OCC recovery sidecar '{}' is interleaved with a foreign table/manifest advance; \
+                 refusing a restore that could discard another writer",
+                sidecar.operation_id
+            );
+            return match mode {
+                RecoveryMode::RollForwardOnly => {
+                    warn!(operation_id = sidecar.operation_id.as_str(), "{message}");
+                    Ok(false)
+                }
+                RecoveryMode::Full => Err(OmniError::manifest_internal(message)),
+            };
+        }
+
+        if authority_changed {
+            // At least one exact owned effect is still HEAD, but the branch
+            // authority used to prepare it changed. It must never roll forward.
+            // In-process healing cannot restore safely; a quiesced Full sweep
+            // compensates only the owned-at-HEAD tables.
+            if matches!(mode, RecoveryMode::RollForwardOnly) {
+                warn!(
+                    operation_id = sidecar.operation_id.as_str(),
+                    "recovery: deferring token-mismatched v3 sidecar with physical effects"
+                );
+                return Ok(false);
+            }
+            warn!(
+                operation_id = sidecar.operation_id.as_str(),
+                "recovery: rolling back v3 sidecar because its captured authority changed"
+            );
+            roll_back_sidecar(root_uri, storage.as_ref(), sidecar, &states).await?;
+            return Ok(true);
+        }
     }
     let classifications = states
         .iter()
@@ -1166,7 +3893,72 @@ async fn process_sidecar(
                 .iter()
                 .zip(states.iter())
                 .any(|(pin, state)| state.manifest_pinned > pin.expected_version);
+            if matches!(sidecar.writer_kind, SidecarKind::EnsureIndices)
+                && all_no_movement
+                && !any_pin_advanced
+            {
+                if matches!(mode, RecoveryMode::RollForwardOnly) {
+                    return Ok(false);
+                }
+                if matches!(
+                    cleanup_unpublished_no_effect_forks(
+                        root_uri,
+                        storage.as_ref(),
+                        sidecar,
+                        &states,
+                    )
+                    .await?,
+                    NoEffectForkCleanup::DeferredPathChild { .. }
+                ) {
+                    return Ok(false);
+                }
+                delete_sidecar_by_operation_id(root_uri, storage.as_ref(), &sidecar.operation_id)
+                    .await?;
+                return Ok(true);
+            }
             if all_no_movement && any_pin_advanced {
+                if matches!(sidecar.writer_kind, SidecarKind::SchemaApply)
+                    && sidecar.schema_version == SCHEMA_APPLY_CONFIRMATION_SCHEMA_VERSION
+                    && !schema_apply_target_identity_is_live(root_uri, storage.as_ref(), sidecar)
+                        .await?
+                {
+                    if sidecar.schema_apply_manifest_published {
+                        let message = format!(
+                            "SchemaApply sidecar '{}' is manifest-aligned, but the live schema \
+                             identity does not match its confirmed target",
+                            sidecar.operation_id,
+                        );
+                        return match mode {
+                            RecoveryMode::RollForwardOnly => {
+                                warn!(operation_id = sidecar.operation_id.as_str(), "{message}");
+                                Ok(false)
+                            }
+                            RecoveryMode::Full => Err(OmniError::manifest_internal(message)),
+                        };
+                    }
+                    // A marker-false v5 sidecar whose live schema is still the
+                    // old contract is a rollback (possibly recovery re-entry
+                    // after its rollback publish), never stale roll-forward.
+                    if matches!(mode, RecoveryMode::RollForwardOnly) {
+                        return Ok(false);
+                    }
+                    return roll_back_sidecar(root_uri, storage.as_ref(), sidecar, &states)
+                        .await
+                        .map(|()| true);
+                }
+                if sidecar.protocol_v3.is_some() {
+                    // Fixed outcome ids were checked before table
+                    // classification. Alignment without either id is not proof
+                    // of this sidecar's outcome.
+                    return match mode {
+                        RecoveryMode::RollForwardOnly => Ok(false),
+                        RecoveryMode::Full => Err(OmniError::manifest_internal(format!(
+                            "OCC recovery sidecar '{}' is manifest-aligned but neither fixed \
+                             outcome id is visible; operator review required",
+                            sidecar.operation_id
+                        ))),
+                    };
+                }
                 if matches!(mode, RecoveryMode::RollForwardOnly) {
                     // Refresh-time audit-recovery is safe: no
                     // Dataset::restore involved; just an audit-row write
@@ -1186,7 +3978,11 @@ async fn process_sidecar(
                     );
                 }
                 return record_audit_recovery_rollforward(
-                    root_uri, storage.as_ref(), sidecar, &states,
+                    root_uri,
+                    storage.as_ref(),
+                    sidecar,
+                    &states,
+                    snapshot,
                 )
                 .await
                 .map(|()| true);
@@ -1216,26 +4012,85 @@ async fn process_sidecar(
             if matches!(sidecar.writer_kind, SidecarKind::SchemaApply)
                 && !schema_state_recovery.completed_schema_apply_sidecar_rename()
             {
-                return match mode {
-                    RecoveryMode::Full => {
+                if sidecar.schema_version == SCHEMA_APPLY_CONFIRMATION_SCHEMA_VERSION {
+                    let target_is_live =
+                        schema_apply_target_identity_is_live(root_uri, storage.as_ref(), sidecar)
+                            .await?;
+                    if target_is_live && sidecar.schema_apply_manifest_published {
+                        // Phase C and final schema promotion both landed; only
+                        // audit/delete bookkeeping remains.
                         warn!(
                             operation_id = sidecar.operation_id.as_str(),
-                            "recovery: rolling back SchemaApply sidecar because schema staging \
-                             files were not promoted in this recovery pass"
+                            "recovery: cleaning up stale SchemaApply sidecar after its manifest \
+                             publish and schema promotion completed"
                         );
-                        roll_back_sidecar(root_uri, storage.as_ref(), sidecar, &states)
-                            .await
-                            .map(|()| true)
+                        return record_audit_recovery_rollforward(
+                            root_uri,
+                            storage.as_ref(),
+                            sidecar,
+                            &states,
+                            snapshot,
+                        )
+                        .await
+                        .map(|()| true);
                     }
-                    RecoveryMode::RollForwardOnly => {
-                        warn!(
-                            operation_id = sidecar.operation_id.as_str(),
-                            "recovery: deferring SchemaApply sidecar because schema staging files \
-                             were not promoted in this recovery pass"
+                    if target_is_live {
+                        // Recovery may have promoted staging and crashed before
+                        // processing the sidecar. Marker=false proves original
+                        // Phase C is not known to have landed, so fall through
+                        // to normal roll_forward_all to publish registrations,
+                        // tombstones, and table pins.
+                    } else if sidecar.schema_apply_manifest_published {
+                        let message = format!(
+                            "SchemaApply sidecar '{}' confirms manifest publish, but the live \
+                             schema identity does not match its target; refusing to guess whether \
+                             schema promotion completed",
+                            sidecar.operation_id,
                         );
-                        Ok(false)
+                        return match mode {
+                            RecoveryMode::RollForwardOnly => {
+                                warn!(operation_id = sidecar.operation_id.as_str(), "{message}");
+                                Ok(false)
+                            }
+                            RecoveryMode::Full => Err(OmniError::manifest_internal(message)),
+                        };
+                    } else {
+                        return match mode {
+                            RecoveryMode::Full => {
+                                warn!(
+                                    operation_id = sidecar.operation_id.as_str(),
+                                    "recovery: rolling back SchemaApply sidecar because schema \
+                                     staging was not promoted"
+                                );
+                                roll_back_sidecar(root_uri, storage.as_ref(), sidecar, &states)
+                                    .await
+                                    .map(|()| true)
+                            }
+                            RecoveryMode::RollForwardOnly => Ok(false),
+                        };
                     }
-                };
+                } else {
+                    return match mode {
+                        RecoveryMode::Full => {
+                            warn!(
+                                operation_id = sidecar.operation_id.as_str(),
+                                "recovery: rolling back SchemaApply sidecar because schema staging \
+                                 files were not promoted in this recovery pass"
+                            );
+                            roll_back_sidecar(root_uri, storage.as_ref(), sidecar, &states)
+                                .await
+                                .map(|()| true)
+                        }
+                        RecoveryMode::RollForwardOnly => {
+                            warn!(
+                                operation_id = sidecar.operation_id.as_str(),
+                                "recovery: deferring SchemaApply sidecar because schema staging \
+                                 files were not promoted in this recovery pass"
+                            );
+                            Ok(false)
+                        }
+                    };
+                }
             }
             warn!(
                 operation_id = sidecar.operation_id.as_str(),
@@ -1256,6 +4111,23 @@ async fn process_sidecar(
             let (new_manifest_version, published_versions, graph_commit_id) =
                 match roll_forward_all(root_uri, sidecar, &states, snapshot).await {
                     Ok(published) => published,
+                    // Another recovery instance may have published this exact
+                    // fixed intent after our classification but before our CAS.
+                    // Exact-head OCC correctly rejects our stale attempt; prove
+                    // the original id + delta are now visible and converge
+                    // without manufacturing another commit.
+                    Err(err) if sidecar.protocol_v3.is_some() && err.is_read_set_changed() => {
+                        if let Some(outcome) = detect_visible_v3_outcome(root_uri, sidecar).await? {
+                            return finalize_visible_v3_outcome(
+                                root_uri,
+                                storage.as_ref(),
+                                sidecar,
+                                outcome,
+                            )
+                            .await;
+                        }
+                        return Err(err);
+                    }
                     // Convergence-idempotent (invariants 7 & 15): a roll-forward's
                     // postcondition is "the manifest reflects the sidecar's committed
                     // Lance state", NOT "this sweep personally won the CAS". A
@@ -1287,7 +4159,7 @@ async fn process_sidecar(
                     table_key: pin.table_key.clone(),
                     from_version: pin.expected_version,
                     to_version: published_versions
-                        .get(&pin.table_key)
+                        .get(&pin.identity)
                         .copied()
                         .unwrap_or(pin.post_commit_pin),
                 })
@@ -1296,7 +4168,7 @@ async fn process_sidecar(
                 outcomes.push(TableOutcome {
                     table_key: reg.table_key.clone(),
                     from_version: 0,
-                    to_version: published_versions.get(&reg.table_key).copied().unwrap_or(0),
+                    to_version: published_versions.get(&reg.identity).copied().unwrap_or(0),
                 });
             }
             record_audit(
@@ -1312,6 +4184,1647 @@ async fn process_sidecar(
             Ok(true)
         }
     }
+}
+
+async fn schema_apply_target_identity_is_live(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    sidecar: &RecoverySidecar,
+) -> Result<bool> {
+    let target_hash = sidecar
+        .schema_apply_target_schema_ir_hash
+        .as_deref()
+        .ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "SchemaApply sidecar '{}' has no target schema identity",
+                sidecar.operation_id,
+            ))
+        })?;
+    let live_schema = read_schema_state_identity(root_uri, storage).await?;
+    Ok(live_schema.schema_ir_hash == target_hash)
+}
+
+struct BranchMergeRefObservation {
+    dataset: lance::Dataset,
+    version: u64,
+    branch_identifier: lance::dataset::refs::BranchIdentifier,
+    parent_version: Option<u64>,
+}
+
+/// Observe one physical target ref without treating an absent first-touch ref
+/// as a storage error. A named ref's BranchContents identity is separate from
+/// the graph-manifest branch identity carried by `RecoveryAuthorityToken`; both
+/// are required to close their respective delete/recreate ABA windows.
+async fn observe_branch_merge_target_ref(
+    pin: &SidecarTablePin,
+) -> Result<Option<BranchMergeRefObservation>> {
+    let dataset = crate::instrumentation::open_dataset(
+        &pin.table_path,
+        crate::instrumentation::VersionResolution::Latest,
+        None,
+        crate::instrumentation::table_wrapper(),
+    )
+    .await?;
+    let Some(branch) = pin
+        .table_branch
+        .as_deref()
+        .filter(|branch| *branch != "main")
+    else {
+        let branch_identifier = dataset
+            .branch_identifier()
+            .await
+            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        let version = dataset.version().version;
+        return Ok(Some(BranchMergeRefObservation {
+            dataset,
+            version,
+            branch_identifier,
+            parent_version: None,
+        }));
+    };
+    let branches = dataset
+        .list_branches()
+        .await
+        .map_err(|error| OmniError::Lance(error.to_string()))?;
+    let Some(contents) = branches.get(branch) else {
+        return Ok(None);
+    };
+    let target = dataset
+        .checkout_branch(branch)
+        .await
+        .map_err(|error| OmniError::Lance(error.to_string()))?;
+    let version = target.version().version;
+    Ok(Some(BranchMergeRefObservation {
+        dataset: target,
+        version,
+        branch_identifier: contents.identifier.clone(),
+        parent_version: Some(contents.parent_version),
+    }))
+}
+
+struct BranchMergeMultiCommitProof {
+    effect_ownership: EffectOwnership,
+    /// Every planned logical-data transaction is present in exact order and
+    /// the only later commit, if any, is BranchMerge's one derived CreateIndex
+    /// tail. Confirmation still has to bind that exact HEAD before recovery may
+    /// roll it forward.
+    full_effect_at_head: bool,
+    unsafe_reason: Option<String>,
+}
+
+/// Prove that the exact owned UUID in a schema-v8 intent belongs to Lance's
+/// `CreateIndex` operation rather than merely trusting the UUID string. The
+/// bounded scan also covers an Armed transaction that Lance preflight-rebased
+/// over a winner and a later compensation Restore.
+async fn prove_ensure_indices_create_index_operation(
+    dataset: &lance::Dataset,
+    planned: &StagedTransactionIdentity,
+) -> Result<bool> {
+    let first_version = planned.read_version.checked_add(1).ok_or_else(|| {
+        OmniError::manifest_internal("EnsureIndices transaction output version overflow")
+    })?;
+    let head = dataset.version().version;
+    if head < first_version
+        || head.saturating_sub(first_version).saturating_add(1) > MAX_EFFECT_IDENTITY_SCAN_VERSIONS
+    {
+        return Ok(false);
+    }
+    for version in first_version..=head {
+        let transaction = if version == head {
+            dataset
+                .read_transaction()
+                .await
+                .map_err(|error| OmniError::Lance(error.to_string()))?
+        } else {
+            dataset
+                .read_transaction_by_version(version)
+                .await
+                .map_err(|error| OmniError::Lance(error.to_string()))?
+        };
+        let Some(transaction) = transaction else {
+            return Ok(false);
+        };
+        if transaction.uuid == planned.uuid {
+            return Ok(matches!(
+                transaction.operation,
+                lance::dataset::transaction::Operation::CreateIndex { .. }
+            ));
+        }
+    }
+    Ok(false)
+}
+
+impl BranchMergeMultiCommitProof {
+    fn unverifiable(reason: String) -> Self {
+        Self {
+            effect_ownership: EffectOwnership::Unverifiable,
+            full_effect_at_head: false,
+            unsafe_reason: Some(reason),
+        }
+    }
+}
+
+/// Prove ownership of a BranchMerge multi-commit effect from Lance's durable
+/// transaction history. Numeric version movement is only a scan bound: each
+/// logical data commit must match its pre-minted identity at its exact output
+/// version. Once the full chain is present, inline index reconciliation may
+/// contribute a derived `CreateIndex` tail. No other operation is attributable
+/// to this merge.
+///
+/// A final Restore to the still-manifest-pinned version is the compensation a
+/// previous Full recovery created. Recognizing it makes the restore→manifest
+/// publish crash window restartable without appending another Restore commit.
+async fn prove_branch_merge_multi_commit_effect(
+    observation: &BranchMergeRefObservation,
+    planned_transactions: &[StagedTransactionIdentity],
+    manifest_pinned: u64,
+    table_key: &str,
+) -> Result<BranchMergeMultiCommitProof> {
+    let first = planned_transactions
+        .first()
+        .expect("v4 sidecar validation requires a non-empty transaction chain");
+    let base_version = first.read_version;
+    let lance_head = observation.version;
+    if lance_head < base_version {
+        return Ok(BranchMergeMultiCommitProof::unverifiable(format!(
+            "table '{table_key}' HEAD {lance_head} is behind its planned transaction base {base_version}"
+        )));
+    }
+    if lance_head == base_version {
+        return Ok(BranchMergeMultiCommitProof {
+            effect_ownership: EffectOwnership::None,
+            full_effect_at_head: false,
+            unsafe_reason: None,
+        });
+    }
+    if lance_head.saturating_sub(base_version) > MAX_EFFECT_IDENTITY_SCAN_VERSIONS {
+        return Ok(BranchMergeMultiCommitProof::unverifiable(format!(
+            "table '{table_key}' requires scanning {} transaction versions, above the recovery bound {}",
+            lance_head.saturating_sub(base_version),
+            MAX_EFFECT_IDENTITY_SCAN_VERSIONS
+        )));
+    }
+
+    let mut planned_index = 0usize;
+    let mut derived_index_tail_seen = false;
+    for version in base_version + 1..=lance_head {
+        let transaction = if version == lance_head {
+            observation
+                .dataset
+                .read_transaction()
+                .await
+                .map_err(|error| OmniError::Lance(error.to_string()))?
+        } else {
+            observation
+                .dataset
+                .read_transaction_by_version(version)
+                .await
+                .map_err(|error| OmniError::Lance(error.to_string()))?
+        };
+        let Some(transaction) = transaction else {
+            return Ok(BranchMergeMultiCommitProof::unverifiable(format!(
+                "table '{table_key}' has no readable transaction identity at version {version}"
+            )));
+        };
+
+        // Rollback can interrupt a proper prefix of the logical chain, not
+        // only the complete chain. Its final Restore is attributable after at
+        // least one exact planned transaction has established ownership.
+        if version == lance_head
+            && planned_index > 0
+            && matches!(
+                &transaction.operation,
+                lance::dataset::transaction::Operation::Restore { version }
+                    if *version == manifest_pinned
+            )
+        {
+            return Ok(BranchMergeMultiCommitProof {
+                effect_ownership: EffectOwnership::OwnCompensatedAtHead,
+                full_effect_at_head: false,
+                unsafe_reason: None,
+            });
+        }
+
+        let observed_identity = StagedTransactionIdentity::from(&transaction);
+        if let Some(planned) = planned_transactions.get(planned_index) {
+            let expected_output_version = planned.read_version.checked_add(1).ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "BranchMerge transaction version overflow for table '{table_key}'"
+                ))
+            })?;
+            if version != expected_output_version || &observed_identity != planned {
+                return Ok(BranchMergeMultiCommitProof::unverifiable(format!(
+                    "table '{table_key}' transaction at version {version} is {observed_identity:?}, expected exact planned identity {planned:?} at version {expected_output_version}"
+                )));
+            }
+            planned_index += 1;
+            continue;
+        }
+
+        if !matches!(
+            &transaction.operation,
+            lance::dataset::transaction::Operation::CreateIndex { .. }
+        ) || derived_index_tail_seen
+        {
+            return Ok(BranchMergeMultiCommitProof::unverifiable(format!(
+                "table '{table_key}' has an operation outside its single derived CreateIndex tail at version {version}: {:?}",
+                transaction.operation
+            )));
+        }
+        derived_index_tail_seen = true;
+    }
+
+    let full_effect_at_head = planned_index == planned_transactions.len();
+    Ok(BranchMergeMultiCommitProof {
+        effect_ownership: if planned_index > 0 {
+            EffectOwnership::OwnAtHead
+        } else {
+            EffectOwnership::None
+        },
+        full_effect_at_head,
+        unsafe_reason: None,
+    })
+}
+
+async fn process_ensure_indices_sidecar_v8(
+    root_uri: &str,
+    storage: &std::sync::Arc<dyn StorageAdapter>,
+    snapshot: &Snapshot,
+    sidecar: &RecoverySidecar,
+    mode: RecoveryMode,
+) -> Result<bool> {
+    if let Some(outcome) = detect_visible_v8_outcome(root_uri, sidecar).await? {
+        return finalize_visible_v8_outcome(root_uri, storage.as_ref(), sidecar, outcome).await;
+    }
+    let protocol = sidecar
+        .protocol_v8
+        .as_ref()
+        .expect("caller checked protocol_v8");
+    let mut states = Vec::with_capacity(sidecar.tables.len());
+    let mut unsafe_observation: Option<String> = None;
+    let mut any_physical_ref = false;
+
+    for pin in &sidecar.tables {
+        let effect = protocol
+            .effects
+            .iter()
+            .find(|effect| effect.identity == pin.identity)
+            .expect("validated schema-v8 key sets");
+        let manifest_entry = snapshot_entry_for_pin(snapshot, pin)?;
+        let manifest_pinned = manifest_entry.map(|entry| entry.table_version).unwrap_or(0);
+        let first_touch = effect.is_first_touch();
+        let unpublished_fork = first_touch
+            && manifest_entry
+                .map(|entry| entry.table_branch != pin.table_branch)
+                .unwrap_or(true);
+        let target_ref = observe_branch_merge_target_ref(pin).await?;
+        if first_touch {
+            if let Some(target_ref) = target_ref.as_ref() {
+                any_physical_ref = true;
+                if target_ref.parent_version != effect.source_fork_version {
+                    unsafe_observation.get_or_insert_with(|| {
+                        format!(
+                            "first-touch target ref for table '{}' was forked at {:?}, expected {:?}",
+                            pin.table_key,
+                            target_ref.parent_version,
+                            effect.source_fork_version
+                        )
+                    });
+                }
+                if let Some(expected_identifier) = effect.confirmed_branch_identifier.as_ref()
+                    && &target_ref.branch_identifier != expected_identifier
+                {
+                    unsafe_observation.get_or_insert_with(|| {
+                        format!(
+                            "first-touch target ref identity for table '{}' differs from its confirmed EnsureIndices effect",
+                            pin.table_key
+                        )
+                    });
+                }
+            }
+        } else if target_ref.is_none() {
+            unsafe_observation.get_or_insert_with(|| {
+                format!(
+                    "existing target ref for table '{}' disappeared while EnsureIndices recovery was pending",
+                    pin.table_key
+                )
+            });
+        }
+
+        let observation = if target_ref.is_some() {
+            open_lance_head_if_present(
+                &pin.table_path,
+                pin.table_branch.as_deref(),
+                Some((
+                    pin.post_commit_pin,
+                    &effect.planned_transaction,
+                    manifest_pinned,
+                )),
+                first_touch,
+                false,
+            )
+            .await?
+            .unwrap_or(LanceHeadObservation {
+                version: manifest_pinned,
+                transaction: None,
+                effect_ownership: EffectOwnership::None,
+            })
+        } else {
+            LanceHeadObservation {
+                version: manifest_pinned,
+                transaction: None,
+                effect_ownership: EffectOwnership::None,
+            }
+        };
+        if observation.effect_ownership != EffectOwnership::None {
+            let operation_is_owned_create_index = match target_ref.as_ref() {
+                Some(target_ref) => {
+                    prove_ensure_indices_create_index_operation(
+                        &target_ref.dataset,
+                        &effect.planned_transaction,
+                    )
+                    .await?
+                }
+                None => false,
+            };
+            if !operation_is_owned_create_index {
+                unsafe_observation.get_or_insert_with(|| {
+                    format!(
+                        "owned transaction UUID for table '{}' is not a verifiable CreateIndex operation",
+                        pin.table_key
+                    )
+                });
+            }
+        }
+        let confirmed_update = protocol
+            .intended_delta
+            .table_updates
+            .iter()
+            .find(|slot| slot.identity == pin.identity)
+            .and_then(|slot| slot.confirmed.as_ref());
+        let classification = if observation.version < manifest_pinned {
+            TableClassification::InvariantViolation {
+                observed: observation.version,
+            }
+        } else if observation.version == manifest_pinned {
+            if observation.effect_ownership == EffectOwnership::None {
+                TableClassification::NoMovement
+            } else {
+                TableClassification::UnexpectedEffectIdentity
+            }
+        } else if protocol.effect_phase == RecoveryEffectPhase::EffectsConfirmed
+            && observation.effect_ownership == EffectOwnership::OwnAtHead
+            && effect.confirmed_transaction.as_ref() == Some(&effect.planned_transaction)
+            && observation.transaction.as_ref() == effect.confirmed_transaction.as_ref()
+            && pin.confirmed_version == Some(observation.version)
+            && confirmed_update
+                .is_some_and(|confirmed| confirmed.table_version == observation.version)
+            && (!first_touch || effect.confirmed_branch_identifier.is_some())
+            && manifest_pinned == pin.expected_version
+        {
+            TableClassification::RolledPastExpected
+        } else if matches!(
+            observation.effect_ownership,
+            EffectOwnership::OwnAtHead | EffectOwnership::OwnCompensatedAtHead
+        ) {
+            TableClassification::IncompletePhaseB
+        } else {
+            TableClassification::UnexpectedEffectIdentity
+        };
+        states.push(ClassifiedTable {
+            classification,
+            manifest_pinned,
+            lance_head: observation.version,
+            effect_ownership: observation.effect_ownership,
+            unpublished_fork,
+        });
+    }
+
+    let any_unverifiable = states
+        .iter()
+        .any(|state| state.effect_ownership == EffectOwnership::Unverifiable);
+    let own_effect_buried = states
+        .iter()
+        .any(|state| state.effect_ownership == EffectOwnership::OwnBeforeHead);
+    let foreign_existing_drift = states.iter().any(|state| {
+        state.effect_ownership == EffectOwnership::None
+            && state.lance_head > state.manifest_pinned
+            && !state.unpublished_fork
+    });
+    let ambiguous_manifest_advance =
+        sidecar
+            .tables
+            .iter()
+            .zip(states.iter())
+            .any(|(pin, state)| {
+                let safe_published_lower_winner = matches!(
+                    state.effect_ownership,
+                    EffectOwnership::OwnAtHead | EffectOwnership::OwnCompensatedAtHead
+                ) && state.manifest_pinned > pin.expected_version
+                    && state.manifest_pinned < state.lance_head;
+                state.effect_ownership != EffectOwnership::None
+                    && state.manifest_pinned != pin.expected_version
+                    && !safe_published_lower_winner
+            });
+    if any_unverifiable
+        || own_effect_buried
+        || foreign_existing_drift
+        || ambiguous_manifest_advance
+        || unsafe_observation.is_some()
+    {
+        let detail = unsafe_observation.unwrap_or_else(|| {
+            "unverifiable, buried, or foreign table/manifest movement".to_string()
+        });
+        let message = format!(
+            "EnsureIndices recovery sidecar '{}' observed unsafe physical state: {}",
+            sidecar.operation_id, detail
+        );
+        return match mode {
+            RecoveryMode::RollForwardOnly => {
+                warn!(operation_id = sidecar.operation_id.as_str(), "{message}");
+                Ok(false)
+            }
+            RecoveryMode::Full => Err(OmniError::manifest_internal(message)),
+        };
+    }
+
+    let live_authority =
+        read_live_recovery_authority(root_uri, storage, sidecar.branch.as_deref()).await?;
+    let branch_recreated = live_authority.branch_identifier != protocol.authority.branch_identifier;
+    let authority_changed = live_authority != protocol.authority;
+    let any_owned_effect = states.iter().any(|state| {
+        matches!(
+            state.effect_ownership,
+            EffectOwnership::OwnAtHead
+                | EffectOwnership::OwnBeforeHead
+                | EffectOwnership::OwnCompensatedAtHead
+        )
+    });
+    if branch_recreated && (any_owned_effect || any_physical_ref) {
+        let message = format!(
+            "EnsureIndices recovery sidecar '{}' targets a branch incarnation that was deleted and recreated; refusing to act through the reused name",
+            sidecar.operation_id
+        );
+        return match mode {
+            RecoveryMode::RollForwardOnly => {
+                warn!(operation_id = sidecar.operation_id.as_str(), "{message}");
+                Ok(false)
+            }
+            RecoveryMode::Full => Err(OmniError::manifest_internal(message)),
+        };
+    }
+    if branch_recreated {
+        // Nothing physical from the old incarnation remains reachable. Do not
+        // publish either fixed outcome into the new branch lineage.
+        if matches!(mode, RecoveryMode::RollForwardOnly) {
+            return Ok(false);
+        }
+        delete_sidecar_by_operation_id(root_uri, storage.as_ref(), &sidecar.operation_id).await?;
+        return Ok(true);
+    }
+
+    if protocol.rollback_audit_outcomes.is_some()
+        || protocol.effect_phase == RecoveryEffectPhase::Armed
+        || authority_changed
+    {
+        if matches!(mode, RecoveryMode::RollForwardOnly) {
+            return Ok(false);
+        }
+        roll_back_ensure_indices_v8(root_uri, storage.as_ref(), sidecar, &states, snapshot).await?;
+        return Ok(true);
+    }
+
+    let all_confirmed_at_head = states
+        .iter()
+        .all(|state| state.classification == TableClassification::RolledPastExpected);
+    if !all_confirmed_at_head {
+        if matches!(mode, RecoveryMode::RollForwardOnly) {
+            return Ok(false);
+        }
+        roll_back_ensure_indices_v8(root_uri, storage.as_ref(), sidecar, &states, snapshot).await?;
+        return Ok(true);
+    }
+
+    roll_forward_ensure_indices_v8(root_uri, storage, sidecar, mode).await
+}
+
+async fn roll_back_ensure_indices_v8(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    sidecar: &RecoverySidecar,
+    states: &[ClassifiedTable],
+    snapshot: &Snapshot,
+) -> Result<()> {
+    // Remove untouched first-touch refs before freezing the audit plan. A
+    // path-child overlap cannot be left behind once this rollback also owns a
+    // table effect, because a successful open would expose unresolved state.
+    if let NoEffectForkCleanup::DeferredPathChild {
+        table_path,
+        target_branch,
+        path_child,
+    } = cleanup_unpublished_no_effect_forks(root_uri, storage, sidecar, states).await?
+    {
+        return Err(OmniError::manifest_internal(format!(
+            "EnsureIndices sidecar '{}' cannot clean first-touch '{}:{}' while path-child '{}' is live",
+            sidecar.operation_id, table_path, target_branch, path_child
+        )));
+    }
+
+    // Persist the original observations before deleting a first-touch ref or
+    // restoring an existing one. Re-entry after either physical action reuses
+    // this exact operator-facing outcome set.
+    let prepared = prepare_fixed_rollback_audit_plan(root_uri, storage, sidecar, states).await?;
+    let protocol = prepared
+        .protocol_v8
+        .as_ref()
+        .expect("prepared schema-v8 protocol");
+    let all_sidecars = list_sidecars(root_uri, storage).await?;
+
+    for ((pin, state), effect) in prepared.tables.iter().zip(states.iter()).map(|pair| {
+        let effect = protocol
+            .effects
+            .iter()
+            .find(|effect| effect.identity == pair.0.identity)
+            .expect("validated schema-v8 key sets");
+        (pair, effect)
+    }) {
+        let Some(source_fork_version) = effect.source_fork_version else {
+            continue;
+        };
+        if snapshot_entry_by_identity(snapshot, pin.identity)
+            .is_some_and(|entry| entry.table_branch == pin.table_branch)
+        {
+            return Err(OmniError::manifest_internal(format!(
+                "EnsureIndices sidecar '{}' cannot reclaim first-touch ref for '{}' because the manifest now owns it without the fixed original lineage",
+                prepared.operation_id, pin.table_key
+            )));
+        }
+        let Some(target_branch) = pin
+            .table_branch
+            .as_deref()
+            .filter(|branch| *branch != "main")
+        else {
+            return Err(OmniError::manifest_internal(format!(
+                "EnsureIndices first-touch table '{}' has no named target ref",
+                pin.table_key
+            )));
+        };
+        if all_sidecars.iter().any(|candidate| {
+            candidate.operation_id != prepared.operation_id
+                && candidate.tables.iter().any(|candidate_pin| {
+                    candidate_pin.table_path == pin.table_path
+                        && candidate_pin.table_branch.as_deref() == Some(target_branch)
+                })
+        }) {
+            return Err(OmniError::manifest_internal(format!(
+                "EnsureIndices sidecar '{}' cannot reclaim first-touch '{}:{}' while another recovery intent claims it",
+                prepared.operation_id, pin.table_path, target_branch
+            )));
+        }
+
+        let mut dataset = crate::instrumentation::open_dataset(
+            &pin.table_path,
+            crate::instrumentation::VersionResolution::Latest,
+            None,
+            crate::instrumentation::table_wrapper(),
+        )
+        .await?;
+        let branches = dataset
+            .list_branches()
+            .await
+            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        if let Some(child) = crate::branch_control::path_descendant(&branches, target_branch) {
+            return Err(OmniError::manifest_internal(format!(
+                "EnsureIndices sidecar '{}' cannot reclaim first-touch '{}:{}' while path-child '{}' is live",
+                prepared.operation_id, pin.table_path, target_branch, child
+            )));
+        }
+        let Some(contents) = branches.get(target_branch) else {
+            // Either the writer crashed before ref creation or a prior recovery
+            // deleted the exact owned ref and crashed before manifest publish.
+            if !crate::branch_control::reclaim_ref_absent_tree(&mut dataset, target_branch).await? {
+                return Err(OmniError::manifest_conflict(format!(
+                    "target ref '{target_branch}' appeared during EnsureIndices rollback"
+                )));
+            }
+            continue;
+        };
+        if contents.parent_version != source_fork_version {
+            return Err(OmniError::manifest_internal(format!(
+                "EnsureIndices sidecar '{}' first-touch '{}:{}' has parent {}, expected {}",
+                prepared.operation_id,
+                pin.table_path,
+                target_branch,
+                contents.parent_version,
+                source_fork_version
+            )));
+        }
+        if let Some(expected_identifier) = effect.confirmed_branch_identifier.as_ref()
+            && &contents.identifier != expected_identifier
+        {
+            return Err(OmniError::manifest_internal(format!(
+                "EnsureIndices sidecar '{}' cannot reclaim first-touch '{}:{}' because its ref identity changed",
+                prepared.operation_id, pin.table_path, target_branch
+            )));
+        }
+
+        match state.effect_ownership {
+            EffectOwnership::OwnAtHead | EffectOwnership::OwnCompensatedAtHead => {
+                let target = dataset
+                    .checkout_branch(target_branch)
+                    .await
+                    .map_err(|error| OmniError::Lance(error.to_string()))?;
+                if target.version().version != state.lance_head
+                    || !prove_ensure_indices_create_index_operation(
+                        &target,
+                        &effect.planned_transaction,
+                    )
+                    .await?
+                {
+                    return Err(OmniError::manifest_internal(format!(
+                        "EnsureIndices sidecar '{}' cannot prove its exact first-touch CreateIndex effect for '{}' before deletion",
+                        prepared.operation_id, pin.table_key
+                    )));
+                }
+                dataset
+                    .force_delete_branch(target_branch)
+                    .await
+                    .map_err(|error| OmniError::Lance(error.to_string()))?;
+            }
+            EffectOwnership::None => {
+                // An untouched owned fork was removed by the helper above. A
+                // remaining moved ref has no exact owned UUID and is therefore
+                // a foreign first-touch winner: preserve it, never adopt it.
+            }
+            EffectOwnership::OwnBeforeHead | EffectOwnership::Unverifiable => {
+                return Err(OmniError::manifest_internal(format!(
+                    "EnsureIndices sidecar '{}' cannot safely reclaim first-touch '{}': its exact effect is buried or unverifiable",
+                    prepared.operation_id, pin.table_key
+                )));
+            }
+        }
+    }
+
+    let mut changes = Vec::new();
+    let mut expected = HashMap::new();
+    for ((pin, state), effect) in prepared.tables.iter().zip(states.iter()).map(|pair| {
+        let effect = protocol
+            .effects
+            .iter()
+            .find(|effect| effect.identity == pair.0.identity)
+            .expect("validated schema-v8 key sets");
+        (pair, effect)
+    }) {
+        if effect.is_first_touch()
+            || !matches!(
+                state.effect_ownership,
+                EffectOwnership::OwnAtHead | EffectOwnership::OwnCompensatedAtHead
+            )
+        {
+            continue;
+        }
+        if state.effect_ownership != EffectOwnership::OwnCompensatedAtHead {
+            restore_table_to_version(
+                &pin.table_path,
+                pin.table_branch.as_deref(),
+                state.manifest_pinned,
+            )
+            .await?;
+            crate::failpoints::maybe_fail(
+                crate::failpoints::names::RECOVERY_POST_TABLE_RESTORE_PRE_PUBLISH,
+            )?;
+        }
+        push_table_update(
+            root_uri,
+            pin.identity,
+            &pin.table_key,
+            &pin.table_path,
+            pin.table_branch.as_deref(),
+            state.manifest_pinned,
+            None,
+            &mut changes,
+            &mut expected,
+        )
+        .await?;
+    }
+
+    let rollback_outcomes = protocol.rollback_audit_outcomes.clone().unwrap_or_default();
+    let (_manifest_version, graph_commit_id) = publish_recovery_commit(
+        root_uri,
+        &prepared,
+        RecoveryKind::RolledBack,
+        &changes,
+        &expected,
+    )
+    .await?;
+    crate::failpoints::maybe_fail(
+        crate::failpoints::names::RECOVERY_POST_ROLLBACK_PUBLISH_PRE_AUDIT,
+    )?;
+    record_audit(
+        root_uri,
+        &prepared,
+        graph_commit_id,
+        RecoveryKind::RolledBack,
+        rollback_outcomes,
+    )
+    .await?;
+    delete_sidecar_by_operation_id(root_uri, storage, &prepared.operation_id).await?;
+    Ok(())
+}
+
+async fn roll_forward_ensure_indices_v8(
+    root_uri: &str,
+    storage: &std::sync::Arc<dyn StorageAdapter>,
+    sidecar: &RecoverySidecar,
+    mode: RecoveryMode,
+) -> Result<bool> {
+    let protocol = sidecar
+        .protocol_v8
+        .as_ref()
+        .expect("caller checked protocol_v8");
+    let mut updates = Vec::with_capacity(protocol.intended_delta.table_updates.len());
+    let mut expected =
+        ExpectedTableVersions::with_capacity(protocol.intended_delta.table_updates.len());
+    let mut outcomes = Vec::with_capacity(protocol.intended_delta.table_updates.len());
+    for slot in &protocol.intended_delta.table_updates {
+        let confirmed = slot.confirmed.as_ref().ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "EnsureIndices recovery sidecar '{}' delta slot '{}' is not confirmed",
+                sidecar.operation_id, slot.table_key
+            ))
+        })?;
+        expected.insert(
+            slot.identity,
+            TableVersionExpectation {
+                table_key: slot.table_key.clone(),
+                table_version: slot.expected_version,
+            },
+        );
+        updates.push(ManifestChange::Update(SubTableUpdate {
+            identity: slot.identity,
+            table_key: slot.table_key.clone(),
+            table_version: confirmed.table_version,
+            table_branch: confirmed.table_branch.clone(),
+            row_count: confirmed.row_count,
+            version_metadata: confirmed.version_metadata.clone(),
+        }));
+        outcomes.push(TableOutcome {
+            table_key: slot.table_key.clone(),
+            from_version: slot.expected_version,
+            to_version: confirmed.table_version,
+        });
+    }
+    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH)?;
+    let graph_commit_id = match publish_recovery_commit(
+        root_uri,
+        sidecar,
+        RecoveryKind::RolledForward,
+        &updates,
+        &expected,
+    )
+    .await
+    {
+        Ok((_, graph_commit_id)) => graph_commit_id,
+        Err(error) if error.is_read_set_changed() => {
+            if let Some(outcome) = detect_visible_v8_outcome(root_uri, sidecar).await? {
+                return finalize_visible_v8_outcome(root_uri, storage.as_ref(), sidecar, outcome)
+                    .await;
+            }
+            return match mode {
+                RecoveryMode::RollForwardOnly => Ok(false),
+                RecoveryMode::Full => Err(error),
+            };
+        }
+        Err(error) => return Err(error),
+    };
+    record_audit(
+        root_uri,
+        sidecar,
+        graph_commit_id,
+        RecoveryKind::RolledForward,
+        outcomes,
+    )
+    .await?;
+    delete_sidecar_by_operation_id(root_uri, storage.as_ref(), &sidecar.operation_id).await?;
+    Ok(true)
+}
+
+async fn process_schema_apply_sidecar_v7(
+    root_uri: &str,
+    storage: &std::sync::Arc<dyn StorageAdapter>,
+    snapshot: &Snapshot,
+    sidecar: &RecoverySidecar,
+    mode: RecoveryMode,
+) -> Result<bool> {
+    let protocol = sidecar
+        .protocol_v7
+        .as_ref()
+        .expect("caller checked protocol_v7");
+
+    if let Some(outcome) = detect_visible_v7_outcome(root_uri, sidecar).await? {
+        return finalize_visible_v7_outcome(root_uri, storage.as_ref(), sidecar, outcome).await;
+    }
+
+    let mut states = Vec::with_capacity(sidecar.tables.len());
+    for pin in &sidecar.tables {
+        let effect = protocol
+            .effects
+            .iter()
+            .find(|effect| effect.identity == pin.identity)
+            .expect("validated schema-v7 key sets");
+        let manifest_entry = snapshot_entry_for_schema_pin(snapshot, pin, protocol)?;
+        let manifest_pinned = manifest_entry.map(|entry| entry.table_version).unwrap_or(0);
+        let first_touch = effect.kind.is_first_touch();
+        let observation = open_lance_head_if_present(
+            &pin.table_path,
+            None,
+            Some((
+                pin.post_commit_pin,
+                effect.kind.planned_transaction(),
+                manifest_pinned,
+            )),
+            false,
+            first_touch,
+        )
+        .await?
+        .unwrap_or(LanceHeadObservation {
+            version: 0,
+            transaction: None,
+            effect_ownership: EffectOwnership::None,
+        });
+        let classification = if observation.version < manifest_pinned {
+            TableClassification::InvariantViolation {
+                observed: observation.version,
+            }
+        } else if observation.version == manifest_pinned {
+            if observation.effect_ownership == EffectOwnership::None {
+                TableClassification::NoMovement
+            } else {
+                // Some manifest commit selected our physical UUID without the
+                // fixed SchemaApply lineage. Numeric alignment is not proof of
+                // the intended logical outcome.
+                TableClassification::UnexpectedEffectIdentity
+            }
+        } else if protocol.effect_phase == RecoveryEffectPhase::EffectsConfirmed
+            && observation.effect_ownership == EffectOwnership::OwnAtHead
+            && effect.kind.confirmed_transaction() == Some(effect.kind.planned_transaction())
+            && observation.transaction.as_ref() == effect.kind.confirmed_transaction()
+            && pin.confirmed_version == Some(observation.version)
+            && protocol
+                .intended_delta
+                .table_updates
+                .iter()
+                .find(|slot| slot.identity == pin.identity)
+                .and_then(|slot| slot.confirmed.as_ref())
+                .is_some_and(|confirmed| confirmed.table_version == observation.version)
+            && manifest_pinned == pin.expected_version
+        {
+            TableClassification::RolledPastExpected
+        } else if protocol.effect_phase == RecoveryEffectPhase::Armed
+            && matches!(
+                observation.effect_ownership,
+                EffectOwnership::OwnAtHead | EffectOwnership::OwnCompensatedAtHead
+            )
+        {
+            TableClassification::IncompletePhaseB
+        } else {
+            TableClassification::UnexpectedEffectIdentity
+        };
+        states.push(ClassifiedTable {
+            classification,
+            manifest_pinned,
+            lance_head: observation.version,
+            effect_ownership: observation.effect_ownership,
+            unpublished_fork: first_touch && manifest_entry.is_none(),
+        });
+    }
+
+    let any_unverifiable = states
+        .iter()
+        .any(|state| state.effect_ownership == EffectOwnership::Unverifiable);
+    let own_effect_buried = states
+        .iter()
+        .any(|state| state.effect_ownership == EffectOwnership::OwnBeforeHead);
+    let foreign_unpublished_drift = states.iter().any(|state| {
+        state.effect_ownership == EffectOwnership::None
+            && state.lance_head > state.manifest_pinned
+            // A strict read-version-zero create can lose to another creator.
+            // That foreign first-touch dataset is not selected by the graph
+            // manifest and is never ours to delete; recovery may compensate
+            // its other owned effects and retire this intent while preserving
+            // the winner. Existing manifest-owned tables remain fail-closed.
+            && !state.unpublished_fork
+    });
+    let own_effect_selected_without_fixed_lineage =
+        sidecar
+            .tables
+            .iter()
+            .zip(states.iter())
+            .any(|(pin, state)| {
+                state.effect_ownership != EffectOwnership::None
+                    && state.manifest_pinned != pin.expected_version
+                    && !(matches!(
+                        state.effect_ownership,
+                        EffectOwnership::OwnAtHead | EffectOwnership::OwnCompensatedAtHead
+                    ) && state.manifest_pinned > pin.expected_version
+                        && state.manifest_pinned < state.lance_head)
+            });
+    if any_unverifiable
+        || own_effect_buried
+        || foreign_unpublished_drift
+        || own_effect_selected_without_fixed_lineage
+    {
+        let message = format!(
+            "SchemaApply recovery sidecar '{}' is interleaved with unverifiable or foreign table movement; refusing destructive recovery",
+            sidecar.operation_id
+        );
+        return match mode {
+            RecoveryMode::RollForwardOnly => {
+                warn!(operation_id = sidecar.operation_id.as_str(), "{message}");
+                Ok(false)
+            }
+            RecoveryMode::Full => Err(OmniError::manifest_internal(message)),
+        };
+    }
+
+    let live_authority = read_live_recovery_authority(root_uri, storage, None).await?;
+    let authority_changed = live_authority != protocol.authority;
+    if protocol.rollback_audit_outcomes.is_some() {
+        if matches!(mode, RecoveryMode::RollForwardOnly) {
+            return Ok(false);
+        }
+        roll_back_schema_apply_v7(root_uri, storage.as_ref(), sidecar, &states, snapshot).await?;
+        return Ok(true);
+    }
+
+    if protocol.effect_phase == RecoveryEffectPhase::Armed {
+        if matches!(mode, RecoveryMode::RollForwardOnly) {
+            return Ok(false);
+        }
+        // Even an empty-pin metadata migration crossed the durable sidecar
+        // boundary. Give it the same fixed RolledBack lineage/audit outcome as
+        // a physical partial effect instead of silently deleting its intent.
+        roll_back_schema_apply_v7(root_uri, storage.as_ref(), sidecar, &states, snapshot).await?;
+        return Ok(true);
+    }
+
+    let all_confirmed_at_head = states
+        .iter()
+        .all(|state| state.classification == TableClassification::RolledPastExpected);
+    if authority_changed || !all_confirmed_at_head {
+        if matches!(mode, RecoveryMode::RollForwardOnly) {
+            return Ok(false);
+        }
+        // EffectsConfirmed has a fixed original/rollback outcome even when its
+        // only durable effect is schema staging. Preserve that outcome model
+        // for metadata-only applies and for effects that disappeared before a
+        // quiesced recovery pass.
+        roll_back_schema_apply_v7(root_uri, storage.as_ref(), sidecar, &states, snapshot).await?;
+        return Ok(true);
+    }
+
+    crate::db::schema_state::validate_exact_schema_staging_target(
+        root_uri,
+        storage.as_ref(),
+        &protocol.target_schema_ir_hash,
+    )
+    .await?;
+    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH)?;
+    let (_manifest_version, graph_commit_id) =
+        match publish_schema_apply_v7_forward(root_uri, sidecar).await {
+            Ok(published) => published,
+            Err(error) if error.is_read_set_changed() => {
+                if let Some(outcome) = detect_visible_v7_outcome(root_uri, sidecar).await? {
+                    return finalize_visible_v7_outcome(
+                        root_uri,
+                        storage.as_ref(),
+                        sidecar,
+                        outcome,
+                    )
+                    .await;
+                }
+                if matches!(mode, RecoveryMode::RollForwardOnly) {
+                    return Ok(false);
+                }
+                roll_back_schema_apply_v7(root_uri, storage.as_ref(), sidecar, &states, snapshot)
+                    .await?;
+                return Ok(true);
+            }
+            Err(error) => return Err(error),
+        };
+    crate::db::schema_state::promote_exact_schema_staging(
+        root_uri,
+        storage.as_ref(),
+        &protocol.target_schema_ir_hash,
+    )
+    .await?;
+    let outcomes = protocol
+        .intended_delta
+        .table_updates
+        .iter()
+        .map(|slot| {
+            let confirmed = slot
+                .confirmed
+                .as_ref()
+                .expect("validated EffectsConfirmed schema-v7 delta");
+            TableOutcome {
+                table_key: slot.table_key.clone(),
+                from_version: slot.expected_version,
+                to_version: confirmed.table_version,
+            }
+        })
+        .collect();
+    record_audit(
+        root_uri,
+        sidecar,
+        graph_commit_id,
+        RecoveryKind::RolledForward,
+        outcomes,
+    )
+    .await?;
+    delete_sidecar_by_operation_id(root_uri, storage.as_ref(), &sidecar.operation_id).await?;
+    Ok(true)
+}
+
+async fn publish_schema_apply_v7_forward(
+    root_uri: &str,
+    sidecar: &RecoverySidecar,
+) -> Result<(u64, String)> {
+    let protocol = sidecar
+        .protocol_v7
+        .as_ref()
+        .expect("caller checked protocol_v7");
+    let mut changes = Vec::with_capacity(
+        protocol.intended_delta.registrations.len()
+            + protocol.intended_delta.renames.len()
+            + protocol.intended_delta.table_updates.len()
+            + protocol.intended_delta.tombstones.len(),
+    );
+    let mut expected = ExpectedTableVersions::new();
+    for registration in &protocol.intended_delta.registrations {
+        expected.insert(
+            registration.identity,
+            TableVersionExpectation {
+                table_key: registration.table_key.clone(),
+                table_version: 0,
+            },
+        );
+        changes.push(ManifestChange::RegisterTable(TableRegistration {
+            identity: registration.identity,
+            table_key: registration.table_key.clone(),
+            table_path: registration.table_path.clone(),
+        }));
+    }
+    for rename in &protocol.intended_delta.renames {
+        expected.insert(
+            rename.identity,
+            TableVersionExpectation {
+                table_key: rename.expected_table_key.clone(),
+                table_version: rename.expected_version,
+            },
+        );
+        changes.push(ManifestChange::RenameTable(TableRename {
+            identity: rename.identity,
+            expected_table_key: rename.expected_table_key.clone(),
+            table_key: rename.table_key.clone(),
+            table_path: rename.table_path.clone(),
+        }));
+    }
+    for slot in &protocol.intended_delta.table_updates {
+        let confirmed = slot.confirmed.as_ref().ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "SchemaApply recovery delta table '{}' is not confirmed",
+                slot.table_key
+            ))
+        })?;
+        expected
+            .entry(slot.identity)
+            .or_insert_with(|| TableVersionExpectation {
+                table_key: slot.table_key.clone(),
+                table_version: slot.expected_version,
+            });
+        changes.push(ManifestChange::Update(SubTableUpdate {
+            identity: slot.identity,
+            table_key: slot.table_key.clone(),
+            table_version: confirmed.table_version,
+            table_branch: confirmed.table_branch.clone(),
+            row_count: confirmed.row_count,
+            version_metadata: confirmed.version_metadata.clone(),
+        }));
+    }
+    for tombstone in &protocol.intended_delta.tombstones {
+        expected.insert(
+            tombstone.identity,
+            TableVersionExpectation {
+                table_key: tombstone.table_key.clone(),
+                table_version: tombstone.tombstone_version.saturating_sub(1),
+            },
+        );
+        changes.push(ManifestChange::Tombstone(TableTombstone {
+            identity: tombstone.identity,
+            table_key: tombstone.table_key.clone(),
+            tombstone_version: tombstone.tombstone_version,
+        }));
+    }
+    publish_recovery_commit(
+        root_uri,
+        sidecar,
+        RecoveryKind::RolledForward,
+        &changes,
+        &expected,
+    )
+    .await
+}
+
+async fn roll_back_schema_apply_v7(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    sidecar: &RecoverySidecar,
+    states: &[ClassifiedTable],
+    snapshot: &Snapshot,
+) -> Result<()> {
+    let prepared = prepare_fixed_rollback_audit_plan(root_uri, storage, sidecar, states).await?;
+    let protocol = prepared
+        .protocol_v7
+        .as_ref()
+        .expect("prepared schema-v7 protocol");
+    let all_sidecars = list_sidecars(root_uri, storage).await?;
+
+    // First-touch paths have no version zero to Restore. Delete only an absent
+    // dataset's staged artifacts or the exact owned version-one transaction,
+    // and only before publishing the fixed rollback outcome.
+    for ((pin, state), effect) in prepared.tables.iter().zip(states.iter()).map(|pair| {
+        let effect = protocol
+            .effects
+            .iter()
+            .find(|effect| effect.identity == pair.0.identity)
+            .expect("validated schema-v7 key sets");
+        (pair, effect)
+    }) {
+        if !effect.kind.is_first_touch() {
+            continue;
+        }
+        if snapshot_entry_by_identity(snapshot, pin.identity).is_some() {
+            return Err(OmniError::manifest_internal(format!(
+                "SchemaApply sidecar '{}' cannot delete first-touch dataset '{}' because the manifest now registers it without the fixed original lineage",
+                prepared.operation_id, pin.table_key
+            )));
+        }
+        if all_sidecars.iter().any(|candidate| {
+            candidate.operation_id != prepared.operation_id
+                && candidate
+                    .tables
+                    .iter()
+                    .any(|candidate_pin| candidate_pin.table_path == pin.table_path)
+        }) {
+            return Err(OmniError::manifest_internal(format!(
+                "SchemaApply sidecar '{}' cannot delete first-touch path '{}' while another recovery intent claims it",
+                prepared.operation_id, pin.table_path
+            )));
+        }
+        match state.effect_ownership {
+            EffectOwnership::OwnAtHead => {
+                if state.lance_head != 1 {
+                    return Err(OmniError::manifest_internal(format!(
+                        "SchemaApply sidecar '{}' owns first-touch '{}' at version {}, expected exact version one",
+                        prepared.operation_id, pin.table_key, state.lance_head
+                    )));
+                }
+                storage.delete_prefix(&pin.table_path).await?;
+            }
+            EffectOwnership::None if state.lance_head == 0 => {
+                // Crash after staging files but before the first manifest.
+                storage.delete_prefix(&pin.table_path).await?;
+            }
+            EffectOwnership::OwnCompensatedAtHead => {
+                // A first-touch dataset is compensated by deletion, never by a
+                // Restore commit, so this state would indicate a foreign chain.
+                return Err(OmniError::manifest_internal(format!(
+                    "SchemaApply first-touch '{}' has an impossible restore compensation",
+                    pin.table_key
+                )));
+            }
+            EffectOwnership::None => {}
+            EffectOwnership::OwnBeforeHead | EffectOwnership::Unverifiable => {
+                return Err(OmniError::manifest_internal(format!(
+                    "SchemaApply sidecar '{}' cannot safely delete first-touch '{}': its exact effect is buried or unverifiable",
+                    prepared.operation_id, pin.table_key
+                )));
+            }
+        }
+    }
+
+    let mut changes = Vec::new();
+    let mut expected = HashMap::new();
+    for ((pin, state), effect) in prepared.tables.iter().zip(states.iter()).map(|pair| {
+        let effect = protocol
+            .effects
+            .iter()
+            .find(|effect| effect.identity == pair.0.identity)
+            .expect("validated schema-v7 key sets");
+        (pair, effect)
+    }) {
+        if effect.kind.is_first_touch()
+            || !matches!(
+                state.effect_ownership,
+                EffectOwnership::OwnAtHead | EffectOwnership::OwnCompensatedAtHead
+            )
+        {
+            continue;
+        }
+        if state.effect_ownership != EffectOwnership::OwnCompensatedAtHead {
+            restore_table_to_version(&pin.table_path, None, state.manifest_pinned).await?;
+            crate::failpoints::maybe_fail(
+                crate::failpoints::names::RECOVERY_POST_TABLE_RESTORE_PRE_PUBLISH,
+            )?;
+        }
+        let restored_table_key = schema_apply_rollback_table_key(protocol, pin);
+        push_table_update(
+            root_uri,
+            pin.identity,
+            restored_table_key,
+            &pin.table_path,
+            None,
+            state.manifest_pinned,
+            None,
+            &mut changes,
+            &mut expected,
+        )
+        .await?;
+    }
+
+    crate::db::schema_state::discard_exact_schema_staging(
+        root_uri,
+        storage,
+        &protocol.authority.schema_ir_hash,
+        &protocol.target_schema_ir_hash,
+    )
+    .await?;
+    let (_manifest_version, graph_commit_id) = publish_recovery_commit(
+        root_uri,
+        &prepared,
+        RecoveryKind::RolledBack,
+        &changes,
+        &expected,
+    )
+    .await?;
+    crate::failpoints::maybe_fail(
+        crate::failpoints::names::RECOVERY_POST_ROLLBACK_PUBLISH_PRE_AUDIT,
+    )?;
+    record_audit(
+        root_uri,
+        &prepared,
+        graph_commit_id,
+        RecoveryKind::RolledBack,
+        protocol.rollback_audit_outcomes.clone().unwrap_or_default(),
+    )
+    .await?;
+    delete_sidecar_by_operation_id(root_uri, storage, &prepared.operation_id).await?;
+    Ok(())
+}
+
+async fn process_branch_merge_sidecar_v4(
+    root_uri: &str,
+    storage: &std::sync::Arc<dyn StorageAdapter>,
+    snapshot: &Snapshot,
+    sidecar: &RecoverySidecar,
+    mode: RecoveryMode,
+) -> Result<bool> {
+    if let Some(outcome) = detect_visible_v4_outcome(root_uri, sidecar).await? {
+        return finalize_visible_v4_outcome(root_uri, storage.as_ref(), sidecar, outcome).await;
+    }
+    let protocol = sidecar
+        .protocol_v4
+        .as_ref()
+        .expect("caller checked protocol_v4");
+    let mut states = Vec::with_capacity(sidecar.tables.len());
+    let mut any_physical_effect = false;
+    let mut any_head_movement = false;
+    let mut confirmed_mismatch: Option<String> = None;
+    let mut unsafe_observation: Option<String> = None;
+    let mut all_confirmed_effects_at_head =
+        protocol.effect_phase == RecoveryEffectPhase::EffectsConfirmed;
+
+    for pin in &sidecar.tables {
+        let effect = protocol
+            .effects
+            .iter()
+            .find(|effect| effect.identity == pin.identity)
+            .expect("v4 sidecar shape validates effect/pin key sets");
+        let manifest_entry = snapshot_entry_for_pin(snapshot, pin)?;
+        let manifest_pinned = manifest_entry.map(|entry| entry.table_version).unwrap_or(0);
+        let unpublished_fork = pin
+            .table_branch
+            .as_deref()
+            .is_some_and(|branch| branch != "main")
+            && manifest_entry
+                .map(|entry| entry.table_branch != pin.table_branch)
+                .unwrap_or(true);
+        if manifest_pinned != pin.expected_version {
+            unsafe_observation.get_or_insert_with(|| {
+                format!(
+                    "table '{}' manifest pin changed from {} to {} while its merge effect remained pending",
+                    pin.table_key, pin.expected_version, manifest_pinned
+                )
+            });
+        }
+
+        let observed = observe_branch_merge_target_ref(pin).await?;
+        let first_touch_version = effect.kind.source_fork_version();
+        if observed.is_none() && first_touch_version.is_none() {
+            unsafe_observation.get_or_insert_with(|| {
+                format!(
+                    "existing target ref for table '{}' disappeared while BranchMerge recovery was pending",
+                    pin.table_key
+                )
+            });
+        }
+        if let (Some(observed), Some(source_version)) = (&observed, first_touch_version) {
+            any_physical_effect = true;
+            if observed.parent_version != Some(source_version) {
+                unsafe_observation.get_or_insert_with(|| {
+                    format!(
+                        "first-touch target ref for table '{}' was forked at {:?}, expected exact source version {}",
+                        pin.table_key, observed.parent_version, source_version
+                    )
+                });
+            }
+            if let Some(expected_identifier) = effect.kind.confirmed_branch_identifier()
+                && &observed.branch_identifier != expected_identifier
+            {
+                unsafe_observation.get_or_insert_with(|| {
+                    format!(
+                        "first-touch target ref identity for table '{}' differs from its confirmed merge effect",
+                        pin.table_key
+                    )
+                });
+            }
+        }
+
+        let (classification, lance_head, effect_ownership) = match &effect.kind {
+            RecoveryBranchMergeEffectKind::MultiCommitHead {
+                planned_transactions,
+                confirmed_version,
+                ..
+            } => {
+                let lance_head = observed
+                    .as_ref()
+                    .map(|observation| observation.version)
+                    .unwrap_or(manifest_pinned);
+                if lance_head < pin.expected_version {
+                    unsafe_observation.get_or_insert_with(|| {
+                        format!(
+                            "table '{}' HEAD {} is behind prepared merge pin {}",
+                            pin.table_key, lance_head, pin.expected_version
+                        )
+                    });
+                }
+                let moved = lance_head > pin.expected_version;
+                any_physical_effect |= moved;
+                any_head_movement |= moved;
+                let proof = if let Some(observation) = observed.as_ref() {
+                    prove_branch_merge_multi_commit_effect(
+                        observation,
+                        planned_transactions,
+                        manifest_pinned,
+                        &pin.table_key,
+                    )
+                    .await?
+                } else {
+                    BranchMergeMultiCommitProof {
+                        effect_ownership: EffectOwnership::None,
+                        full_effect_at_head: false,
+                        unsafe_reason: None,
+                    }
+                };
+                if let Some(reason) = proof.unsafe_reason.as_ref() {
+                    unsafe_observation.get_or_insert_with(|| reason.clone());
+                }
+                let complete = protocol.effect_phase == RecoveryEffectPhase::EffectsConfirmed
+                    && proof.full_effect_at_head
+                    && confirmed_version == &Some(lance_head)
+                    && pin.confirmed_version == Some(lance_head);
+                all_confirmed_effects_at_head &= complete;
+                if protocol.effect_phase == RecoveryEffectPhase::EffectsConfirmed
+                    && !complete
+                    && proof.effect_ownership != EffectOwnership::OwnCompensatedAtHead
+                {
+                    confirmed_mismatch.get_or_insert_with(|| {
+                        format!(
+                            "confirmed multi-commit effect '{}' expected HEAD {:?}, observed {}",
+                            pin.table_key, confirmed_version, lance_head
+                        )
+                    });
+                }
+                let classification = if complete {
+                    TableClassification::RolledPastExpected
+                } else if moved {
+                    TableClassification::IncompletePhaseB
+                } else {
+                    TableClassification::NoMovement
+                };
+                (classification, lance_head, proof.effect_ownership)
+            }
+            RecoveryBranchMergeEffectKind::RefOnlyFork { source_version, .. } => {
+                let complete = protocol.effect_phase == RecoveryEffectPhase::EffectsConfirmed
+                    && observed
+                        .as_ref()
+                        .is_some_and(|observation| observation.version == *source_version)
+                    && pin.confirmed_version == Some(*source_version);
+                all_confirmed_effects_at_head &= complete;
+                if protocol.effect_phase == RecoveryEffectPhase::EffectsConfirmed && !complete {
+                    confirmed_mismatch.get_or_insert_with(|| {
+                        format!(
+                            "confirmed ref-only effect '{}' expected exact fork version {}, observed {:?}",
+                            pin.table_key,
+                            source_version,
+                            observed.as_ref().map(|observation| observation.version)
+                        )
+                    });
+                }
+                (
+                    if complete {
+                        TableClassification::RolledPastExpected
+                    } else if observed.is_some() {
+                        TableClassification::IncompletePhaseB
+                    } else {
+                        TableClassification::NoMovement
+                    },
+                    // A ref-only fork never represents a data-HEAD delta. Keep
+                    // rollback on the explicit ref-cleanup path rather than
+                    // presenting the source version as a restore candidate.
+                    manifest_pinned,
+                    EffectOwnership::None,
+                )
+            }
+        };
+        states.push(ClassifiedTable {
+            classification,
+            manifest_pinned,
+            lance_head,
+            effect_ownership,
+            unpublished_fork,
+        });
+    }
+
+    if let Some(reason) = unsafe_observation {
+        let message = format!(
+            "BranchMerge recovery sidecar '{}' observed foreign or unverifiable physical state: {}",
+            sidecar.operation_id, reason
+        );
+        return match mode {
+            RecoveryMode::RollForwardOnly => {
+                warn!(operation_id = sidecar.operation_id.as_str(), "{message}");
+                Ok(false)
+            }
+            RecoveryMode::Full => Err(OmniError::manifest_internal(message)),
+        };
+    }
+    if let Some(reason) = confirmed_mismatch {
+        let message = format!(
+            "BranchMerge recovery sidecar '{}' no longer matches its exact confirmed effects: {}",
+            sidecar.operation_id, reason
+        );
+        return match mode {
+            RecoveryMode::RollForwardOnly => {
+                warn!(operation_id = sidecar.operation_id.as_str(), "{message}");
+                Ok(false)
+            }
+            RecoveryMode::Full => Err(OmniError::manifest_internal(message)),
+        };
+    }
+
+    let live_authority =
+        read_live_recovery_authority(root_uri, storage, sidecar.branch.as_deref()).await?;
+    let branch_recreated = live_authority.branch_identifier != protocol.authority.branch_identifier;
+    let authority_changed = live_authority != protocol.authority;
+    if branch_recreated && any_physical_effect {
+        let message = format!(
+            "BranchMerge recovery sidecar '{}' targets a branch incarnation that was deleted and recreated; refusing to act through the reused name",
+            sidecar.operation_id
+        );
+        return match mode {
+            RecoveryMode::RollForwardOnly => {
+                warn!(operation_id = sidecar.operation_id.as_str(), "{message}");
+                Ok(false)
+            }
+            RecoveryMode::Full => Err(OmniError::manifest_internal(message)),
+        };
+    }
+
+    if !authority_changed && all_confirmed_effects_at_head {
+        return roll_forward_branch_merge_v4(root_uri, storage, sidecar, mode).await;
+    }
+
+    // A first-touch ref with no data commit is a recoverable physical artifact,
+    // but cleaning it restores the exact pre-attempt graph state. Do not
+    // manufacture a rollback graph commit: doing so would advance the target
+    // lineage and turn a later logical fast-forward into a three-way merge.
+    if !any_head_movement {
+        if matches!(mode, RecoveryMode::RollForwardOnly) {
+            warn!(
+                operation_id = sidecar.operation_id.as_str(),
+                "recovery: deferring armed BranchMerge intent with no proven physical effects"
+            );
+            return Ok(false);
+        }
+        if let NoEffectForkCleanup::DeferredPathChild { .. } =
+            cleanup_unpublished_no_effect_forks(root_uri, storage.as_ref(), sidecar, &states)
+                .await?
+        {
+            return Ok(false);
+        }
+        delete_sidecar_by_operation_id(root_uri, storage.as_ref(), &sidecar.operation_id).await?;
+        return Ok(true);
+    }
+
+    if matches!(mode, RecoveryMode::RollForwardOnly) {
+        warn!(
+            operation_id = sidecar.operation_id.as_str(),
+            authority_changed, "recovery: deferring rollback-eligible BranchMerge sidecar"
+        );
+        return Ok(false);
+    }
+    roll_back_sidecar(root_uri, storage.as_ref(), sidecar, &states).await?;
+    Ok(true)
+}
+
+async fn roll_forward_branch_merge_v4(
+    root_uri: &str,
+    storage: &std::sync::Arc<dyn StorageAdapter>,
+    sidecar: &RecoverySidecar,
+    mode: RecoveryMode,
+) -> Result<bool> {
+    let protocol = sidecar
+        .protocol_v4
+        .as_ref()
+        .expect("caller checked protocol_v4");
+    let mut updates = Vec::with_capacity(protocol.intended_delta.table_updates.len());
+    let mut expected =
+        ExpectedTableVersions::with_capacity(protocol.intended_delta.table_updates.len());
+    let mut outcomes = Vec::with_capacity(protocol.intended_delta.table_updates.len());
+    for slot in &protocol.intended_delta.table_updates {
+        let confirmed = slot.confirmed.as_ref().ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "BranchMerge recovery sidecar '{}' delta slot '{}' is not confirmed",
+                sidecar.operation_id, slot.table_key
+            ))
+        })?;
+        expected.insert(
+            slot.identity,
+            TableVersionExpectation {
+                table_key: slot.table_key.clone(),
+                table_version: slot.expected_version,
+            },
+        );
+        updates.push(ManifestChange::Update(SubTableUpdate {
+            identity: slot.identity,
+            table_key: slot.table_key.clone(),
+            table_version: confirmed.table_version,
+            table_branch: confirmed.table_branch.clone(),
+            row_count: confirmed.row_count,
+            version_metadata: confirmed.version_metadata.clone(),
+        }));
+        outcomes.push(TableOutcome {
+            table_key: slot.table_key.clone(),
+            from_version: slot.expected_version,
+            to_version: confirmed.table_version,
+        });
+    }
+
+    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_BEFORE_ROLL_FORWARD_PUBLISH)?;
+    let graph_commit_id = match publish_recovery_commit(
+        root_uri,
+        sidecar,
+        RecoveryKind::RolledForward,
+        &updates,
+        &expected,
+    )
+    .await
+    {
+        Ok((_, graph_commit_id)) => graph_commit_id,
+        Err(error) if error.is_read_set_changed() => {
+            if let Some(outcome) = detect_visible_v4_outcome(root_uri, sidecar).await? {
+                return finalize_visible_v4_outcome(root_uri, storage.as_ref(), sidecar, outcome)
+                    .await;
+            }
+            return match mode {
+                RecoveryMode::RollForwardOnly => Ok(false),
+                RecoveryMode::Full => Err(error),
+            };
+        }
+        Err(error) => return Err(error),
+    };
+    record_audit(
+        root_uri,
+        sidecar,
+        graph_commit_id,
+        RecoveryKind::RolledForward,
+        outcomes,
+    )
+    .await?;
+    delete_sidecar_by_operation_id(root_uri, storage.as_ref(), &sidecar.operation_id).await?;
+    Ok(true)
 }
 
 /// True if `err` is the publisher's per-table CAS precondition failure
@@ -1350,21 +5863,26 @@ fn sidecar_intent_satisfied(
     states: &[ClassifiedTable],
 ) -> bool {
     for (pin, state) in sidecar.tables.iter().zip(states.iter()) {
-        let current = snapshot
-            .entry(&pin.table_key)
-            .map(|e| e.table_version)
-            .unwrap_or(0);
+        let Some(entry) = snapshot_entry_by_identity(snapshot, pin.identity) else {
+            return false;
+        };
+        if entry.table_key != pin.table_key {
+            return false;
+        }
+        let current = entry.table_version;
         if current < state.lance_head {
             return false;
         }
     }
     for reg in &sidecar.additional_registrations {
-        if snapshot.entry(&reg.table_key).is_none() {
+        if snapshot_entry_by_identity(snapshot, reg.identity)
+            .is_none_or(|entry| entry.table_key != reg.table_key)
+        {
             return false;
         }
     }
     for tomb in &sidecar.tombstones {
-        if snapshot.entry(&tomb.table_key).is_some() {
+        if snapshot_entry_by_identity(snapshot, tomb.identity).is_some() {
             return false;
         }
     }
@@ -1385,6 +5903,31 @@ async fn fresh_snapshot_for_sidecar(
     };
     coordinator.refresh().await?;
     Ok(coordinator.snapshot())
+}
+
+/// Read the complete coarse authority token from current storage state. Called
+/// only for a pending v3 sidecar after fixed outcome ids were proven absent.
+async fn read_live_recovery_authority(
+    root_uri: &str,
+    storage: &std::sync::Arc<dyn StorageAdapter>,
+    branch: Option<&str>,
+) -> Result<RecoveryAuthorityToken> {
+    let coordinator = match branch {
+        Some(branch) if branch != "main" => {
+            GraphCoordinator::open_branch(root_uri, branch, std::sync::Arc::clone(storage)).await?
+        }
+        _ => GraphCoordinator::open(root_uri, std::sync::Arc::clone(storage)).await?,
+    };
+    let schema_state =
+        crate::db::schema_state::validate_schema_contract(root_uri, std::sync::Arc::clone(storage))
+            .await?;
+    Ok(RecoveryAuthorityToken {
+        branch_identifier: coordinator.branch_identifier().await?,
+        graph_head: coordinator.exact_graph_head(),
+        schema_identity_domain: schema_state.schema_identity_domain,
+        schema_ir_hash: schema_state.schema_ir_hash,
+        schema_identity_version: schema_state.schema_identity_version,
+    })
 }
 
 /// Convergence-idempotent handling of a roll-forward publish CAS that lost to a
@@ -1424,7 +5967,7 @@ async fn converge_or_defer_roll_forward(
     // `expected_version` first healed THIS sidecar (recorded its RolledForward
     // audit and deleted it). So the audit row already exists; recording another
     // here would put two RolledForward rows in `_graph_commit_recoveries` for
-    // one recovery event (visible in `commit list --filter actor=…recovery`).
+    // one recovery event.
     // Only finish the bookkeeping if the sidecar is still on disk (the winner
     // crashed between audit and delete); if it is already gone, the winner
     // completed it — return success WITHOUT a duplicate audit, keeping the
@@ -1451,8 +5994,7 @@ async fn converge_or_defer_roll_forward(
         .map(|pin| TableOutcome {
             table_key: pin.table_key.clone(),
             from_version: pin.expected_version,
-            to_version: fresh
-                .entry(&pin.table_key)
+            to_version: snapshot_entry_by_identity(&fresh, pin.identity)
                 .map(|e| e.table_version)
                 .unwrap_or(pin.post_commit_pin),
         })
@@ -1465,17 +6007,17 @@ async fn converge_or_defer_roll_forward(
         outcomes.push(TableOutcome {
             table_key: reg.table_key.clone(),
             from_version: 0,
-            to_version: fresh
-                .entry(&reg.table_key)
+            to_version: snapshot_entry_by_identity(&fresh, reg.identity)
                 .map(|e| e.table_version)
                 .unwrap_or(0),
         });
     }
-    // RFC-013 Phase 7: the winning writer folded its recovery commit into the
-    // manifest CAS, so the converge audit references THAT commit. We lost the CAS
-    // and never minted it, but a recovery commit is distinguishable by its
-    // `RECOVERY_ACTOR` authorship (`publish_recovery_commit`), so the latest
-    // recovery-actored commit on this branch IS it. Do NOT use the branch head:
+    // RFC-013 Phase 7: the winning legacy recovery folded its commit into the
+    // manifest CAS, so the converge audit references THAT commit. (v3 fixed-id
+    // outcomes are detected and finalized before this fallback.) We lost the
+    // CAS and never minted it, but a legacy recovery commit is distinguishable
+    // by `RECOVERY_ACTOR` authorship, so the latest recovery-actored commit on
+    // this branch is it. Do NOT use the branch head:
     // a concurrent USER write can advance `graph_head` past the recovery commit
     // between the winner's publish and this read, which would attribute the audit
     // row to the wrong (later, user) commit. (We only reach here with the sidecar
@@ -1487,17 +6029,13 @@ async fn converge_or_defer_roll_forward(
         }
         None => crate::db::commit_graph::CommitGraph::open(root_uri).await?,
     };
-    let converged_commit_id = match cache
-        .load_commits()
-        .await?
-        .into_iter()
-        .rfind(|c| c.actor_id.as_deref() == Some(RECOVERY_ACTOR))
-    {
-        Some(recovery_commit) => recovery_commit.graph_commit_id,
-        // No recovery commit visible — unexpected on this path (the winner just
-        // published one); fall back to the head rather than an empty id.
-        None => cache.head_commit_id().await?.unwrap_or_default(),
-    };
+    let converged_commit_id =
+        match cache.latest_commit_matching(|c| c.actor_id.as_deref() == Some(RECOVERY_ACTOR)) {
+            Some(recovery_commit) => recovery_commit.graph_commit_id,
+            // No recovery commit visible — unexpected on this path (the winner just
+            // published one); fall back to the head rather than an empty id.
+            None => cache.head_commit_id().await?.unwrap_or_default(),
+        };
     record_audit(
         root_uri,
         sidecar,
@@ -1520,6 +6058,387 @@ struct ClassifiedTable {
     /// `_graph_commit_recoveries.lance` see actual drift, not
     /// `from_version == to_version == manifest_pinned`).
     lance_head: u64,
+    effect_ownership: EffectOwnership,
+    /// The branch snapshot still inherits this table from another Lance ref,
+    /// while the sidecar's final pin names a first-touch target ref. This is the
+    /// durable distinction between an unpublished fork and an already-owned
+    /// table on the branch.
+    unpublished_fork: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EffectOwnership {
+    None,
+    OwnAtHead,
+    OwnBeforeHead,
+    /// A previous Full recovery restored this owned effect to the manifest pin
+    /// but crashed before publishing the restored HEAD. The compensation is
+    /// complete and recovery should publish it, not restore again or wedge.
+    OwnCompensatedAtHead,
+    Unverifiable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NoEffectForkCleanup {
+    Complete,
+    DeferredPathChild {
+        table_path: String,
+        target_branch: String,
+        path_child: String,
+    },
+}
+
+fn has_exact_protocol(sidecar: &RecoverySidecar) -> bool {
+    sidecar.protocol_v3.is_some()
+        || sidecar.protocol_v4.is_some()
+        || sidecar.protocol_v7.is_some()
+        || sidecar.protocol_v8.is_some()
+}
+
+fn has_fixed_rollback_identity(sidecar: &RecoverySidecar) -> bool {
+    has_exact_protocol(sidecar) || sidecar.ensure_indices_rollback_v6.is_some()
+}
+
+fn v4_effect_for(
+    sidecar: &RecoverySidecar,
+    identity: TableIdentity,
+) -> Option<&RecoveryBranchMergeEffect> {
+    sidecar
+        .protocol_v4
+        .as_ref()?
+        .effects
+        .iter()
+        .find(|effect| effect.identity == identity)
+}
+
+fn first_touch_fork_version(sidecar: &RecoverySidecar, pin: &SidecarTablePin) -> u64 {
+    v4_effect_for(sidecar, pin.identity)
+        .and_then(|effect| effect.kind.source_fork_version())
+        .or_else(|| {
+            sidecar.protocol_v8.as_ref().and_then(|protocol| {
+                protocol
+                    .effects
+                    .iter()
+                    .find(|effect| effect.identity == pin.identity)
+                    .and_then(|effect| effect.source_fork_version)
+            })
+        })
+        .unwrap_or(pin.expected_version)
+}
+
+/// Remove first-touch named-branch refs created by an Armed exact-protocol
+/// attempt, or by the legacy EnsureIndices adapter, that never completed this
+/// table's planned effect.
+///
+/// The sidecar is durable before the ref is created, so it is the ownership
+/// record while the manifest still inherits the table from another branch.
+/// Destruction is deliberately narrow: the manifest must not select the ref,
+/// no other pending sidecar may claim the same `(table_path, branch)`, and the
+/// live ref must still be exactly the fork point. Full recovery is quiesced, so
+/// this fresh re-check closes ordinary crash/retry races. Lance does not expose
+/// a compare-and-delete-by-branch-identifier primitive; callers must retain the
+/// Full-sweep quiescence guarantee rather than reusing this helper in a live
+/// reconciler.
+async fn cleanup_unpublished_no_effect_forks(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    sidecar: &RecoverySidecar,
+    states: &[ClassifiedTable],
+) -> Result<NoEffectForkCleanup> {
+    if !has_exact_protocol(sidecar) && !matches!(sidecar.writer_kind, SidecarKind::EnsureIndices) {
+        return Ok(NoEffectForkCleanup::Complete);
+    }
+
+    let all_sidecars = list_sidecars(root_uri, storage).await?;
+    for (pin, state) in sidecar.tables.iter().zip(states.iter()) {
+        if !state.unpublished_fork || state.effect_ownership != EffectOwnership::None {
+            continue;
+        }
+        // Legacy EnsureIndices has no transaction-identity ownership signal.
+        // Its loose classifier can still prove the no-effect case exactly:
+        // only `NoMovement` is an untouched fork. A moved HEAD must flow into
+        // the normal derived-state rollback path; treating it as a no-effect
+        // ref would try to delete a ref past its fork point and wedge recovery.
+        if matches!(sidecar.writer_kind, SidecarKind::EnsureIndices)
+            && !matches!(state.classification, TableClassification::NoMovement)
+        {
+            continue;
+        }
+        let Some(target_branch) = pin
+            .table_branch
+            .as_deref()
+            .filter(|branch| *branch != "main")
+        else {
+            continue;
+        };
+
+        let has_competing_claim = all_sidecars.iter().any(|candidate| {
+            candidate.operation_id != sidecar.operation_id
+                && candidate.tables.iter().any(|candidate_pin| {
+                    candidate_pin.table_path == pin.table_path
+                        && candidate_pin.table_branch.as_deref() == Some(target_branch)
+                })
+        });
+        if has_competing_claim {
+            // Never delete a ref while another pending intent claims it. Full
+            // recovery is quiesced by the shared gates, so this no-effect
+            // sidecar can safely discard itself without touching the ref. A
+            // later/last claimant either cleans the still-untouched fork or
+            // recovers its owned effect. RollForwardOnly never calls this
+            // helper and continues to defer the unresolved ownership.
+            continue;
+        }
+
+        let mut dataset = crate::instrumentation::open_dataset(
+            &pin.table_path,
+            crate::instrumentation::VersionResolution::Latest,
+            None,
+            crate::instrumentation::table_wrapper(),
+        )
+        .await?;
+        let branches = dataset
+            .list_branches()
+            .await
+            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        if let Some(child) = crate::branch_control::path_descendant(&branches, target_branch) {
+            // Lance cannot reclaim an ancestor tree while a slash-separated
+            // path-child remains. Old stores could admit that namespace shape.
+            // Keep the ownership sidecar and let open complete so the operator
+            // can delete the child branch first; the next Full sweep then
+            // rechecks authority and reclaims the ancestor fork.
+            warn!(
+                operation_id = sidecar.operation_id.as_str(),
+                table_path = pin.table_path.as_str(),
+                branch = target_branch,
+                path_child = child,
+                "recovery: deferring unpublished fork cleanup for legacy path overlap"
+            );
+            return Ok(NoEffectForkCleanup::DeferredPathChild {
+                table_path: pin.table_path.clone(),
+                target_branch: target_branch.to_string(),
+                path_child: child.to_string(),
+            });
+        }
+        let Some(contents) = branches.get(target_branch) else {
+            // BranchContents is authoritative, but Lance create writes the
+            // shallow-cloned target dataset first. The absent-ref state is
+            // therefore either crash-before-fork (idempotent no-op) or an
+            // exact clone-only zombie owned by this already-armed sidecar.
+            // Reclaim both through Lance's force API before retiring intent;
+            // merely skipping here leaves the zombie blocking every retry.
+            if !crate::branch_control::reclaim_ref_absent_tree(&mut dataset, target_branch).await? {
+                return Err(OmniError::manifest_conflict(format!(
+                    "target ref '{target_branch}' appeared during no-effect recovery; refusing \
+                     to retire its ownership intent"
+                )));
+            }
+            continue;
+        };
+        let exact_fork_version = first_touch_fork_version(sidecar, pin);
+        if contents.parent_version != exact_fork_version {
+            return Err(OmniError::manifest_internal(format!(
+                "OCC recovery sidecar '{}' cannot discard unpublished fork '{}:{}': \
+                 parent version is {}, expected exact fork point {}",
+                sidecar.operation_id,
+                pin.table_path,
+                target_branch,
+                contents.parent_version,
+                exact_fork_version
+            )));
+        }
+        if let Some(expected_identifier) = v4_effect_for(sidecar, pin.identity)
+            .and_then(|effect| effect.kind.confirmed_branch_identifier())
+            .or_else(|| {
+                sidecar.protocol_v8.as_ref().and_then(|protocol| {
+                    protocol
+                        .effects
+                        .iter()
+                        .find(|effect| effect.identity == pin.identity)
+                        .and_then(|effect| effect.confirmed_branch_identifier.as_ref())
+                })
+            })
+            && &contents.identifier != expected_identifier
+        {
+            return Err(OmniError::manifest_internal(format!(
+                "BranchMerge recovery sidecar '{}' cannot discard unpublished fork '{}:{}': \
+                 live target ref identity differs from the confirmed effect",
+                sidecar.operation_id, pin.table_path, target_branch
+            )));
+        }
+        let target = dataset
+            .checkout_branch(target_branch)
+            .await
+            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        if target.version().version != exact_fork_version {
+            return Err(OmniError::manifest_internal(format!(
+                "OCC recovery sidecar '{}' cannot discard unpublished fork '{}:{}': \
+                 live HEAD is {}, expected untouched version {}",
+                sidecar.operation_id,
+                pin.table_path,
+                target_branch,
+                target.version().version,
+                exact_fork_version
+            )));
+        }
+        dataset
+            .force_delete_branch(target_branch)
+            .await
+            .map_err(|error| OmniError::Lance(error.to_string()))?;
+    }
+    Ok(NoEffectForkCleanup::Complete)
+}
+
+fn table_requires_rollback_effect(state: &ClassifiedTable) -> bool {
+    matches!(
+        state.classification,
+        TableClassification::RolledPastExpected
+            | TableClassification::UnexpectedAtP1
+            | TableClassification::UnexpectedMultistep
+            | TableClassification::UnexpectedEffectIdentity
+            | TableClassification::IncompletePhaseB
+    )
+}
+
+/// A SchemaApply rewrite pin uses the desired alias because that is the
+/// forward manifest output. Compensation restores the accepted pre-apply
+/// binding, which is the rename's expected/source alias.
+fn schema_apply_rollback_table_key<'a>(
+    protocol: &'a RecoveryProtocolV7,
+    pin: &'a SidecarTablePin,
+) -> &'a str {
+    protocol
+        .intended_delta
+        .renames
+        .iter()
+        .find(|rename| rename.identity == pin.identity)
+        .map(|rename| rename.expected_table_key.as_str())
+        .unwrap_or(pin.table_key.as_str())
+}
+
+fn rollback_table_key<'a>(sidecar: &'a RecoverySidecar, pin: &'a SidecarTablePin) -> &'a str {
+    sidecar
+        .protocol_v7
+        .as_ref()
+        .map(|protocol| schema_apply_rollback_table_key(protocol, pin))
+        .unwrap_or(pin.table_key.as_str())
+}
+
+fn exact_rollback_audit_outcomes(
+    sidecar: &RecoverySidecar,
+    states: &[ClassifiedTable],
+) -> Vec<TableOutcome> {
+    sidecar
+        .tables
+        .iter()
+        .zip(states.iter())
+        .filter(|(_, state)| {
+            matches!(
+                state.effect_ownership,
+                EffectOwnership::OwnAtHead | EffectOwnership::OwnCompensatedAtHead
+            ) && table_requires_rollback_effect(state)
+        })
+        .map(|(pin, state)| TableOutcome {
+            table_key: rollback_table_key(sidecar, pin).to_string(),
+            from_version: state.lance_head,
+            to_version: state.manifest_pinned,
+        })
+        .collect()
+}
+
+fn rollback_audit_outcomes_for_plan(
+    sidecar: &RecoverySidecar,
+    states: &[ClassifiedTable],
+) -> Vec<TableOutcome> {
+    if has_exact_protocol(sidecar) {
+        return exact_rollback_audit_outcomes(sidecar, states);
+    }
+    sidecar
+        .tables
+        .iter()
+        .zip(states.iter())
+        .filter(|(_, state)| table_requires_rollback_effect(state))
+        .map(|(pin, state)| TableOutcome {
+            table_key: pin.table_key.clone(),
+            from_version: state.lance_head,
+            to_version: state.manifest_pinned,
+        })
+        .collect()
+}
+
+/// Durably bind the audit payload for every fixed-identity rollback before the
+/// first restore or rollback publish. A retry must replay the original
+/// observation, not reconstruct it from post-restore HEADs. v3/v4 filter by
+/// exact ownership; schema-v6 EnsureIndices deliberately retains loose table
+/// classification while making only the rollback outcome exact.
+async fn prepare_fixed_rollback_audit_plan(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    sidecar: &RecoverySidecar,
+    states: &[ClassifiedTable],
+) -> Result<RecoverySidecar> {
+    let mut prepared = sidecar.clone();
+    let already_prepared = prepared
+        .protocol_v3
+        .as_ref()
+        .and_then(|protocol| protocol.rollback_audit_outcomes.as_ref())
+        .or_else(|| {
+            prepared
+                .protocol_v4
+                .as_ref()
+                .and_then(|protocol| protocol.rollback_audit_outcomes.as_ref())
+        })
+        .or_else(|| {
+            prepared
+                .protocol_v7
+                .as_ref()
+                .and_then(|protocol| protocol.rollback_audit_outcomes.as_ref())
+        })
+        .or_else(|| {
+            prepared
+                .protocol_v8
+                .as_ref()
+                .and_then(|protocol| protocol.rollback_audit_outcomes.as_ref())
+        })
+        .or_else(|| {
+            prepared
+                .ensure_indices_rollback_v6
+                .as_ref()
+                .and_then(|protocol| protocol.rollback_audit_outcomes.as_ref())
+        })
+        .is_some();
+    if already_prepared {
+        return Ok(prepared);
+    }
+
+    let outcomes = rollback_audit_outcomes_for_plan(sidecar, states);
+    if let Some(protocol) = prepared.protocol_v3.as_mut() {
+        protocol.rollback_audit_outcomes = Some(outcomes);
+    } else if let Some(protocol) = prepared.protocol_v4.as_mut() {
+        protocol.rollback_audit_outcomes = Some(outcomes);
+    } else if let Some(protocol) = prepared.protocol_v7.as_mut() {
+        protocol.rollback_audit_outcomes = Some(outcomes);
+    } else if let Some(protocol) = prepared.protocol_v8.as_mut() {
+        protocol.rollback_audit_outcomes = Some(outcomes);
+    } else if let Some(protocol) = prepared.ensure_indices_rollback_v6.as_mut() {
+        protocol.rollback_audit_outcomes = Some(outcomes);
+    } else {
+        return Err(OmniError::manifest_internal(
+            "prepare_fixed_rollback_audit_plan called without a fixed rollback identity",
+        ));
+    }
+    let uri = sidecar_uri(root_uri, &prepared.operation_id);
+    validate_sidecar_shape(&uri, &prepared)?;
+    let json = serde_json::to_string_pretty(&prepared).map_err(|error| {
+        OmniError::manifest_internal(format!(
+            "failed to serialize fixed rollback audit plan for sidecar '{}': {}",
+            prepared.operation_id, error
+        ))
+    })?;
+    // `write_text` replaces one complete object atomically (temp+rename for
+    // local storage, PutObject for object stores), the same durability contract
+    // as arming and Phase-B confirmation.
+    storage.write_text(&uri, &json).await?;
+    Ok(prepared)
 }
 
 async fn roll_back_sidecar(
@@ -1528,6 +6447,40 @@ async fn roll_back_sidecar(
     sidecar: &RecoverySidecar,
     states: &[ClassifiedTable],
 ) -> Result<()> {
+    // An Armed multi-table attempt can create every first-touch ref and then
+    // land effects on only a subset. No-effect refs are not selected by the
+    // rollback manifest publish, so they must be removed BEFORE that publish.
+    // If recovery crashed after publishing first, the fixed rollback outcome
+    // would make the next pass finalize/delete the sidecar without ever seeing
+    // the still-orphaned refs. A rollback that owns any physical effect may not
+    // defer and let read-write open succeed: legacy writers are not all enrolled
+    // in the v3 preparation barrier. Fail closed until the path child is removed.
+    if let NoEffectForkCleanup::DeferredPathChild {
+        table_path,
+        target_branch,
+        path_child,
+    } = cleanup_unpublished_no_effect_forks(root_uri, storage, sidecar, states).await?
+    {
+        return Err(OmniError::manifest_internal(format!(
+            "OCC recovery sidecar '{}' owns physical effects but cannot clean unpublished fork \
+             '{}:{}' while legacy path-child '{}' is live; refusing read-write open; delete the \
+             child branch leaf-first using an existing handle or an offline Lance-level branch \
+             tool, then reopen",
+            sidecar.operation_id, table_path, target_branch, path_child
+        )));
+    }
+
+    // Once the fixed rollback commit is visible, early recovery finalization no
+    // longer has pre-restore table observations. Persist the exact audit plan
+    // after fork cleanup and before the first restore so that path can replay it
+    // without fabricating outcomes from pins.
+    let prepared_fixed = if has_fixed_rollback_identity(sidecar) {
+        Some(prepare_fixed_rollback_audit_plan(root_uri, storage, sidecar, states).await?)
+    } else {
+        None
+    };
+    let sidecar = prepared_fixed.as_ref().unwrap_or(sidecar);
+
     // Restore every drifted table (RolledPastExpected / UnexpectedAtP1 /
     // UnexpectedMultistep) to its manifest-pinned content, then PUBLISH so
     // `manifest == Lance HEAD` for each — symmetric with roll-forward. The
@@ -1545,27 +6498,38 @@ async fn roll_back_sidecar(
     // asymmetry so the audit records the drift (`from_version > to_version`).
     let mut outcomes = Vec::with_capacity(sidecar.tables.len());
     let mut updates: Vec<ManifestChange> = Vec::with_capacity(sidecar.tables.len());
-    let mut expected: HashMap<String, u64> = HashMap::with_capacity(sidecar.tables.len());
+    let mut expected = ExpectedTableVersions::with_capacity(sidecar.tables.len());
     for (pin, state) in sidecar.tables.iter().zip(states.iter()) {
-        if matches!(
-            state.classification,
-            TableClassification::RolledPastExpected
-                | TableClassification::UnexpectedAtP1
-                | TableClassification::UnexpectedMultistep
-                | TableClassification::IncompletePhaseB
-        ) {
-            restore_table_to_version(
-                &pin.table_path,
-                pin.table_branch.as_deref(),
-                state.manifest_pinned,
+        if has_exact_protocol(sidecar)
+            && !matches!(
+                state.effect_ownership,
+                EffectOwnership::OwnAtHead | EffectOwnership::OwnCompensatedAtHead
             )
-            .await?;
+        {
+            // v3 compensation is ownership-exact. Never restore a table whose
+            // current HEAD is foreign (or whose owned effect is buried beneath
+            // another writer); callers reject the latter before reaching here.
+            continue;
+        }
+        if table_requires_rollback_effect(state) {
+            if state.effect_ownership != EffectOwnership::OwnCompensatedAtHead {
+                restore_table_to_version(
+                    &pin.table_path,
+                    pin.table_branch.as_deref(),
+                    state.manifest_pinned,
+                )
+                .await?;
+                crate::failpoints::maybe_fail(
+                    crate::failpoints::names::RECOVERY_POST_TABLE_RESTORE_PRE_PUBLISH,
+                )?;
+            }
             // Publish the post-restore HEAD (the restore commit we just made),
             // CAS against the current (unmoved) manifest pin — the same helper
             // roll-forward uses. `None` target: there is no prior observation to
             // pin to; the version to publish is the HEAD the restore produced.
             push_table_update(
                 root_uri,
+                pin.identity,
                 &pin.table_key,
                 &pin.table_path,
                 pin.table_branch.as_deref(),
@@ -1589,9 +6553,34 @@ async fn roll_back_sidecar(
     // roll-back restores no table — `updates` is empty — but the recovery commit
     // lineage still publishes (a lineage-only merge), so the rollback is recorded
     // in the commit history just like a roll-forward.
-    let (_manifest_version, graph_commit_id) =
-        publish_recovery_commit(root_uri, sidecar, RecoveryKind::RolledBack, &updates, &expected)
-            .await?;
+    let (_manifest_version, graph_commit_id) = publish_recovery_commit(
+        root_uri,
+        sidecar,
+        RecoveryKind::RolledBack,
+        &updates,
+        &expected,
+    )
+    .await?;
+    crate::failpoints::maybe_fail(
+        crate::failpoints::names::RECOVERY_POST_ROLLBACK_PUBLISH_PRE_AUDIT,
+    )?;
+    let outcomes = sidecar
+        .protocol_v3
+        .as_ref()
+        .and_then(|protocol| protocol.rollback_audit_outcomes.clone())
+        .or_else(|| {
+            sidecar
+                .protocol_v4
+                .as_ref()
+                .and_then(|protocol| protocol.rollback_audit_outcomes.clone())
+        })
+        .or_else(|| {
+            sidecar
+                .ensure_indices_rollback_v6
+                .as_ref()
+                .and_then(|protocol| protocol.rollback_audit_outcomes.clone())
+        })
+        .unwrap_or(outcomes);
     record_audit(
         root_uri,
         sidecar,
@@ -1623,8 +6612,9 @@ async fn record_audit_recovery_rollforward(
     storage: &dyn StorageAdapter,
     sidecar: &RecoverySidecar,
     states: &[ClassifiedTable],
+    snapshot: &Snapshot,
 ) -> Result<()> {
-    let outcomes: Vec<TableOutcome> = sidecar
+    let mut outcomes: Vec<TableOutcome> = sidecar
         .tables
         .iter()
         .zip(states.iter())
@@ -1634,6 +6624,15 @@ async fn record_audit_recovery_rollforward(
             to_version: state.manifest_pinned,
         })
         .collect();
+    for registration in &sidecar.additional_registrations {
+        outcomes.push(TableOutcome {
+            table_key: registration.table_key.clone(),
+            from_version: 0,
+            to_version: snapshot_entry_by_identity(snapshot, registration.identity)
+                .map(|entry| entry.table_version)
+                .unwrap_or(0),
+        });
+    }
     // The substrate is already in the post-roll-forward state (the prior pass's
     // table re-pin landed), so there are no table `updates` — but a recovery
     // commit is still recorded for this cleanup pass via a lineage-only publish
@@ -1656,6 +6655,837 @@ async fn record_audit_recovery_rollforward(
     .await?;
     delete_sidecar_by_operation_id(root_uri, storage, &sidecar.operation_id).await?;
     Ok(())
+}
+
+/// A schema-v6 EnsureIndices sidecar has no fixed original/forward identity,
+/// but its rollback id is pre-minted before effects. Seeing that id in the
+/// authoritative lineage is therefore exact proof that compensation already
+/// published, even though the physical index effects remain loosely matched.
+async fn detect_visible_ensure_indices_rollback(
+    root_uri: &str,
+    sidecar: &RecoverySidecar,
+) -> Result<bool> {
+    let protocol = sidecar
+        .ensure_indices_rollback_v6
+        .as_ref()
+        .expect("caller checked ensure_indices_rollback_v6");
+    let (commits, _) =
+        ManifestCoordinator::read_graph_lineage_at(root_uri, sidecar.branch.as_deref()).await?;
+    let Some(commit) = commits
+        .iter()
+        .find(|commit| commit.graph_commit_id == protocol.rollback_graph_commit_id)
+    else {
+        return Ok(false);
+    };
+    let expected_branch = sidecar.branch.as_deref().filter(|branch| *branch != "main");
+    let expected_created_at = sidecar.started_at.parse::<i64>().map_err(|error| {
+        OmniError::manifest_internal(format!(
+            "EnsureIndices recovery sidecar '{}' has invalid started_at '{}': {}",
+            sidecar.operation_id, sidecar.started_at, error,
+        ))
+    })?;
+    if commit.manifest_branch.as_deref() != expected_branch
+        || commit.actor_id.as_deref() != Some(RECOVERY_ACTOR)
+        || commit.merged_parent_commit_id.is_some()
+        || commit.created_at != expected_created_at
+    {
+        return Err(OmniError::manifest_internal(format!(
+            "EnsureIndices recovery sidecar '{}' found rollback commit id '{}' with mismatched lineage",
+            sidecar.operation_id, protocol.rollback_graph_commit_id,
+        )));
+    }
+    Ok(true)
+}
+
+async fn finalize_visible_ensure_indices_rollback(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    sidecar: &RecoverySidecar,
+) -> Result<bool> {
+    let protocol = sidecar
+        .ensure_indices_rollback_v6
+        .as_ref()
+        .expect("caller checked ensure_indices_rollback_v6");
+    let outcomes = protocol.rollback_audit_outcomes.clone().ok_or_else(|| {
+        OmniError::manifest_internal(format!(
+            "EnsureIndices recovery sidecar '{}' has visible fixed rollback commit '{}' but no durable rollback audit outcomes",
+            sidecar.operation_id, protocol.rollback_graph_commit_id,
+        ))
+    })?;
+    let mut audit = RecoveryAudit::open(root_uri).await?;
+    let already_recorded = audit.list().await?.iter().any(|record| {
+        record.operation_id == sidecar.operation_id
+            && record.recovery_kind == RecoveryKind::RolledBack
+    });
+    if !already_recorded {
+        crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_RECORD_AUDIT)?;
+        audit
+            .append(RecoveryAuditRecord {
+                graph_commit_id: protocol.rollback_graph_commit_id.clone(),
+                recovery_kind: RecoveryKind::RolledBack,
+                recovery_for_actor: sidecar.actor_id.clone(),
+                operation_id: sidecar.operation_id.clone(),
+                sidecar_writer_kind: format!("{:?}", sidecar.writer_kind),
+                per_table_outcomes: outcomes,
+                created_at: crate::db::now_micros()?,
+            })
+            .await?;
+    }
+    delete_sidecar_by_operation_id(root_uri, storage, &sidecar.operation_id).await?;
+    Ok(true)
+}
+
+/// Finalize an exact-protocol sidecar whose tables are already manifest-aligned.
+///
+/// Numeric table alignment alone is not evidence of WHICH outcome happened:
+/// the original manifest CAS may have succeeded before sidecar deletion, or a
+/// prior full recovery may have rolled the effects back and then failed during
+/// audit/delete. v3/v4 give both outcomes fixed graph-commit ids, so inspect the
+/// authoritative lineage and finish exactly that outcome without publishing a
+/// second synthetic commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VisibleExactOutcome {
+    Original,
+    RolledBack,
+}
+
+/// Prove that a read-only open can pair its manifest snapshot with the live
+/// schema contract without performing recovery writes.
+///
+/// Unpublished v7 effects are safe to ignore because reads stay pinned to the
+/// old manifest versions. Once the fixed original manifest outcome is visible,
+/// however, the target schema must already be fully promoted; otherwise a
+/// read-only handle would combine the new table set with the old catalog. A
+/// visible rollback (or no fixed outcome yet) analogously requires the captured
+/// accepted schema. Legacy SchemaApply sidecars lack enough exact outcome data
+/// for a non-mutating proof, so read-only open conservatively defers them to a
+/// read-write recovery pass.
+pub(crate) async fn ensure_read_only_schema_coherent(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+) -> Result<()> {
+    let (sidecars, unparseable) = list_parseable_sidecars_for_read_only(root_uri, storage).await?;
+    if let Some((uri, parse_error)) = unparseable.first() {
+        let has_schema_staging = storage.exists(&schema_source_staging_uri(root_uri)).await?
+            || storage.exists(&schema_ir_staging_uri(root_uri)).await?
+            || storage.exists(&schema_state_staging_uri(root_uri)).await?;
+        if has_schema_staging {
+            let operation_id = uri
+                .rsplit('/')
+                .next()
+                .and_then(|name| name.strip_suffix(".json"))
+                .unwrap_or(uri)
+                .to_string();
+            return Err(OmniError::recovery_required(
+                operation_id,
+                format!(
+                    "read-only open found schema-staging artifacts alongside unparseable recovery sidecar '{}', so schema coherence cannot be proven: {}; run a read-write open or inspect the sidecar",
+                    uri, parse_error
+                ),
+            ));
+        }
+    }
+
+    for sidecar in sidecars {
+        if !matches!(sidecar.writer_kind, SidecarKind::SchemaApply) {
+            continue;
+        }
+        let Some(protocol) = sidecar.protocol_v7.as_ref() else {
+            // v5's narrow bridge cannot classify an active intent exactly, but
+            // its durable marker is written only after the manifest publish.
+            // Marker=true plus the target identity already live proves that
+            // schema and manifest are coherent and only audit/delete cleanup
+            // remains. Every other legacy state still needs mutable recovery.
+            if sidecar.schema_version == SCHEMA_APPLY_CONFIRMATION_SCHEMA_VERSION
+                && sidecar.schema_apply_manifest_published
+            {
+                let target_is_live =
+                    schema_apply_target_identity_is_live(root_uri, storage, &sidecar)
+                        .await
+                        .map_err(|error| {
+                            OmniError::recovery_required(
+                                sidecar.operation_id.clone(),
+                                error.to_string(),
+                            )
+                        })?;
+                if target_is_live {
+                    continue;
+                }
+            }
+            return Err(OmniError::recovery_required(
+                sidecar.operation_id,
+                "read-only open cannot prove schema coherence for an active or incomplete legacy SchemaApply recovery intent; run a read-write open to recover it",
+            ));
+        };
+        let outcome = detect_visible_v7_outcome(root_uri, &sidecar)
+            .await
+            .map_err(|error| {
+                OmniError::recovery_required(sidecar.operation_id.clone(), error.to_string())
+            })?;
+        let live = read_schema_state_identity(root_uri, storage)
+            .await
+            .map_err(|error| {
+                OmniError::recovery_required(sidecar.operation_id.clone(), error.to_string())
+            })?;
+        let expected_hash = match outcome {
+            Some(VisibleExactOutcome::Original) => &protocol.target_schema_ir_hash,
+            Some(VisibleExactOutcome::RolledBack) | None => &protocol.authority.schema_ir_hash,
+        };
+        if &live.schema_ir_hash != expected_hash
+            || live.schema_identity_domain != protocol.authority.schema_identity_domain
+            || live.schema_identity_version != protocol.authority.schema_identity_version
+        {
+            return Err(OmniError::recovery_required(
+                sidecar.operation_id,
+                format!(
+                    "read-only open found SchemaApply manifest outcome {:?} but live schema authority ({}, {}, v{}) does not match expected ({}, {}, v{}); run a read-write open to finish recovery",
+                    outcome,
+                    live.schema_identity_domain,
+                    live.schema_ir_hash,
+                    live.schema_identity_version,
+                    protocol.authority.schema_identity_domain,
+                    expected_hash,
+                    protocol.authority.schema_identity_version,
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn detect_visible_v7_outcome(
+    root_uri: &str,
+    sidecar: &RecoverySidecar,
+) -> Result<Option<VisibleExactOutcome>> {
+    let protocol = sidecar
+        .protocol_v7
+        .as_ref()
+        .expect("caller checked protocol_v7");
+    let (commits, _) = ManifestCoordinator::read_graph_lineage_at(root_uri, None).await?;
+    let original_commit = commits
+        .iter()
+        .find(|commit| commit.graph_commit_id == protocol.lineage.graph_commit_id);
+    let rollback_visible = commits
+        .iter()
+        .any(|commit| commit.graph_commit_id == protocol.rollback_graph_commit_id);
+    let original_visible = if let Some(commit) = original_commit {
+        if commit.manifest_branch.is_some()
+            || protocol
+                .authority
+                .graph_head
+                .as_ref()
+                .is_some_and(|head| commit.parent_commit_id.as_ref() != Some(head))
+            || commit.merged_parent_commit_id.is_some()
+            || commit.actor_id != protocol.lineage.actor_id
+            || commit.created_at != protocol.lineage.created_at
+        {
+            return Err(OmniError::manifest_internal(format!(
+                "SchemaApply sidecar '{}' found original commit id '{}' with mismatched lineage",
+                sidecar.operation_id, protocol.lineage.graph_commit_id
+            )));
+        }
+        let committed_snapshot =
+            ManifestCoordinator::snapshot_at(root_uri, None, commit.manifest_version).await?;
+        let updates_match = protocol.intended_delta.table_updates.iter().all(|slot| {
+            let Some(confirmed) = slot.confirmed.as_ref() else {
+                return false;
+            };
+            snapshot_entry_by_identity(&committed_snapshot, slot.identity).is_some_and(|entry| {
+                entry.table_key == slot.table_key
+                    && entry.table_version == confirmed.table_version
+                    && entry.table_branch == confirmed.table_branch
+                    && entry.row_count == confirmed.row_count
+                    && entry.version_metadata == confirmed.version_metadata
+            })
+        });
+        let registrations_match =
+            protocol
+                .intended_delta
+                .registrations
+                .iter()
+                .all(|registration| {
+                    snapshot_entry_by_identity(&committed_snapshot, registration.identity)
+                        .is_some_and(|entry| {
+                            entry.table_key == registration.table_key
+                                && entry.table_path == registration.table_path
+                                && entry.table_branch == registration.table_branch
+                        })
+                });
+        let renames_match = protocol.intended_delta.renames.iter().all(|rename| {
+            snapshot_entry_by_identity(&committed_snapshot, rename.identity).is_some_and(|entry| {
+                entry.table_key == rename.table_key && entry.table_path == rename.table_path
+            })
+        });
+        let tombstones_match = protocol.intended_delta.tombstones.iter().all(|tombstone| {
+            snapshot_entry_by_identity(&committed_snapshot, tombstone.identity).is_none()
+        });
+        if !updates_match || !registrations_match || !renames_match || !tombstones_match {
+            return Err(OmniError::manifest_internal(format!(
+                "SchemaApply sidecar '{}' found original commit id '{}' but its exact manifest delta differs",
+                sidecar.operation_id, protocol.lineage.graph_commit_id
+            )));
+        }
+        true
+    } else {
+        false
+    };
+
+    match (original_visible, rollback_visible) {
+        (true, false) => Ok(Some(VisibleExactOutcome::Original)),
+        (false, true) => Ok(Some(VisibleExactOutcome::RolledBack)),
+        (false, false) => Ok(None),
+        (true, true) => Err(OmniError::manifest_internal(format!(
+            "SchemaApply sidecar '{}' has both original commit '{}' and rollback commit '{}' visible; refusing ambiguous finalization",
+            sidecar.operation_id,
+            protocol.lineage.graph_commit_id,
+            protocol.rollback_graph_commit_id
+        ))),
+    }
+}
+
+async fn finalize_visible_v7_outcome(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    sidecar: &RecoverySidecar,
+    outcome: VisibleExactOutcome,
+) -> Result<bool> {
+    let protocol = sidecar
+        .protocol_v7
+        .as_ref()
+        .expect("caller checked protocol_v7");
+    let (kind, graph_commit_id, outcomes) = match outcome {
+        VisibleExactOutcome::Original => {
+            crate::db::schema_state::promote_exact_schema_staging(
+                root_uri,
+                storage,
+                &protocol.target_schema_ir_hash,
+            )
+            .await?;
+            let outcomes = protocol
+                .intended_delta
+                .table_updates
+                .iter()
+                .map(|slot| {
+                    let confirmed = slot
+                        .confirmed
+                        .as_ref()
+                        .expect("visible schema-v7 original requires confirmed delta");
+                    TableOutcome {
+                        table_key: slot.table_key.clone(),
+                        from_version: slot.expected_version,
+                        to_version: confirmed.table_version,
+                    }
+                })
+                .collect();
+            (
+                RecoveryKind::RolledForward,
+                protocol.lineage.graph_commit_id.clone(),
+                outcomes,
+            )
+        }
+        VisibleExactOutcome::RolledBack => {
+            crate::db::schema_state::discard_exact_schema_staging(
+                root_uri,
+                storage,
+                &protocol.authority.schema_ir_hash,
+                &protocol.target_schema_ir_hash,
+            )
+            .await?;
+            let outcomes = protocol.rollback_audit_outcomes.clone().ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "SchemaApply sidecar '{}' has visible fixed rollback commit '{}' but no durable rollback audit outcomes",
+                    sidecar.operation_id, protocol.rollback_graph_commit_id
+                ))
+            })?;
+            (
+                RecoveryKind::RolledBack,
+                protocol.rollback_graph_commit_id.clone(),
+                outcomes,
+            )
+        }
+    };
+
+    let mut audit = RecoveryAudit::open(root_uri).await?;
+    let already_recorded =
+        audit.list().await?.iter().any(|record| {
+            record.operation_id == sidecar.operation_id && record.recovery_kind == kind
+        });
+    if !already_recorded {
+        crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_RECORD_AUDIT)?;
+        audit
+            .append(RecoveryAuditRecord {
+                graph_commit_id,
+                recovery_kind: kind,
+                recovery_for_actor: sidecar.actor_id.clone(),
+                operation_id: sidecar.operation_id.clone(),
+                sidecar_writer_kind: format!("{:?}", sidecar.writer_kind),
+                per_table_outcomes: outcomes,
+                created_at: crate::db::now_micros()?,
+            })
+            .await?;
+    }
+    delete_sidecar_by_operation_id(root_uri, storage, &sidecar.operation_id).await?;
+    Ok(true)
+}
+
+async fn detect_visible_v8_outcome(
+    root_uri: &str,
+    sidecar: &RecoverySidecar,
+) -> Result<Option<VisibleExactOutcome>> {
+    let protocol = sidecar
+        .protocol_v8
+        .as_ref()
+        .expect("caller checked protocol_v8");
+    let (commits, _) =
+        ManifestCoordinator::read_graph_lineage_at(root_uri, sidecar.branch.as_deref()).await?;
+    let original_commit = commits
+        .iter()
+        .find(|commit| commit.graph_commit_id == protocol.lineage.graph_commit_id);
+    let rollback_visible = commits
+        .iter()
+        .any(|commit| commit.graph_commit_id == protocol.rollback_graph_commit_id);
+    let original_visible = if let Some(commit) = original_commit {
+        let expected_branch = protocol
+            .lineage
+            .branch
+            .as_deref()
+            .filter(|branch| *branch != "main");
+        if commit.manifest_branch.as_deref() != expected_branch
+            || protocol
+                .authority
+                .graph_head
+                .as_ref()
+                .is_some_and(|head| commit.parent_commit_id.as_ref() != Some(head))
+            || commit.merged_parent_commit_id != protocol.lineage.merged_parent_commit_id
+            || commit.actor_id != protocol.lineage.actor_id
+            || commit.created_at != protocol.lineage.created_at
+        {
+            return Err(OmniError::manifest_internal(format!(
+                "EnsureIndices recovery sidecar '{}' found original commit id '{}' with mismatched lineage",
+                sidecar.operation_id, protocol.lineage.graph_commit_id
+            )));
+        }
+        let committed_snapshot = ManifestCoordinator::snapshot_at(
+            root_uri,
+            sidecar.branch.as_deref(),
+            commit.manifest_version,
+        )
+        .await?;
+        let delta_matches = protocol.intended_delta.table_updates.iter().all(|slot| {
+            let Some(confirmed) = slot.confirmed.as_ref() else {
+                return false;
+            };
+            snapshot_entry_by_identity(&committed_snapshot, slot.identity).is_some_and(|entry| {
+                entry.table_key == slot.table_key
+                    && entry.table_version == confirmed.table_version
+                    && entry.table_branch == confirmed.table_branch
+                    && entry.row_count == confirmed.row_count
+                    && entry.version_metadata == confirmed.version_metadata
+            })
+        });
+        if !delta_matches {
+            return Err(OmniError::manifest_internal(format!(
+                "EnsureIndices recovery sidecar '{}' found original commit id '{}' but its exact manifest delta differs",
+                sidecar.operation_id, protocol.lineage.graph_commit_id
+            )));
+        }
+        true
+    } else {
+        false
+    };
+
+    match (original_visible, rollback_visible) {
+        (true, false) => Ok(Some(VisibleExactOutcome::Original)),
+        (false, true) => Ok(Some(VisibleExactOutcome::RolledBack)),
+        (false, false) => Ok(None),
+        (true, true) => Err(OmniError::manifest_internal(format!(
+            "EnsureIndices recovery sidecar '{}' has both original commit '{}' and rollback commit '{}' visible; refusing ambiguous finalization",
+            sidecar.operation_id,
+            protocol.lineage.graph_commit_id,
+            protocol.rollback_graph_commit_id
+        ))),
+    }
+}
+
+async fn finalize_visible_v8_outcome(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    sidecar: &RecoverySidecar,
+    outcome: VisibleExactOutcome,
+) -> Result<bool> {
+    let protocol = sidecar
+        .protocol_v8
+        .as_ref()
+        .expect("caller checked protocol_v8");
+    let (kind, graph_commit_id, outcomes) = match outcome {
+        VisibleExactOutcome::Original => {
+            let outcomes = protocol
+                .intended_delta
+                .table_updates
+                .iter()
+                .map(|slot| {
+                    let confirmed = slot
+                        .confirmed
+                        .as_ref()
+                        .expect("visible schema-v8 original requires confirmed delta");
+                    TableOutcome {
+                        table_key: slot.table_key.clone(),
+                        from_version: slot.expected_version,
+                        to_version: confirmed.table_version,
+                    }
+                })
+                .collect();
+            (
+                RecoveryKind::RolledForward,
+                protocol.lineage.graph_commit_id.clone(),
+                outcomes,
+            )
+        }
+        VisibleExactOutcome::RolledBack => {
+            let outcomes = protocol.rollback_audit_outcomes.clone().ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "EnsureIndices sidecar '{}' has visible fixed rollback commit '{}' but no durable rollback audit outcomes",
+                    sidecar.operation_id, protocol.rollback_graph_commit_id
+                ))
+            })?;
+            (
+                RecoveryKind::RolledBack,
+                protocol.rollback_graph_commit_id.clone(),
+                outcomes,
+            )
+        }
+    };
+    let mut audit = RecoveryAudit::open(root_uri).await?;
+    let already_recorded =
+        audit.list().await?.iter().any(|record| {
+            record.operation_id == sidecar.operation_id && record.recovery_kind == kind
+        });
+    if !already_recorded {
+        crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_RECORD_AUDIT)?;
+        audit
+            .append(RecoveryAuditRecord {
+                graph_commit_id,
+                recovery_kind: kind,
+                recovery_for_actor: sidecar.actor_id.clone(),
+                operation_id: sidecar.operation_id.clone(),
+                sidecar_writer_kind: format!("{:?}", sidecar.writer_kind),
+                per_table_outcomes: outcomes,
+                created_at: crate::db::now_micros()?,
+            })
+            .await?;
+    }
+    delete_sidecar_by_operation_id(root_uri, storage, &sidecar.operation_id).await?;
+    Ok(true)
+}
+
+async fn detect_visible_v3_outcome(
+    root_uri: &str,
+    sidecar: &RecoverySidecar,
+) -> Result<Option<VisibleExactOutcome>> {
+    let protocol = sidecar
+        .protocol_v3
+        .as_ref()
+        .expect("caller checked protocol_v3");
+    let (commits, _) =
+        ManifestCoordinator::read_graph_lineage_at(root_uri, sidecar.branch.as_deref()).await?;
+    let original_commit = commits
+        .iter()
+        .find(|commit| commit.graph_commit_id == protocol.lineage.graph_commit_id);
+    let rollback_visible = commits
+        .iter()
+        .any(|commit| commit.graph_commit_id == protocol.rollback_graph_commit_id);
+    let original_visible = if let Some(commit) = original_commit {
+        let expected_branch = protocol
+            .lineage
+            .branch
+            .as_deref()
+            .filter(|branch| *branch != "main");
+        if commit.manifest_branch.as_deref() != expected_branch
+            || protocol
+                .authority
+                .graph_head
+                .as_ref()
+                .is_some_and(|head| commit.parent_commit_id.as_ref() != Some(head))
+            || commit.merged_parent_commit_id != protocol.lineage.merged_parent_commit_id
+            || commit.actor_id != protocol.lineage.actor_id
+            || commit.created_at != protocol.lineage.created_at
+        {
+            return Err(OmniError::manifest_internal(format!(
+                "OCC recovery sidecar '{}' found original commit id '{}' with mismatched lineage",
+                sidecar.operation_id, protocol.lineage.graph_commit_id
+            )));
+        }
+        let committed_snapshot = ManifestCoordinator::snapshot_at(
+            root_uri,
+            sidecar.branch.as_deref(),
+            commit.manifest_version,
+        )
+        .await?;
+        let delta_matches = protocol.intended_delta.table_updates.iter().all(|slot| {
+            let Some(confirmed) = slot.confirmed.as_ref() else {
+                return false;
+            };
+            snapshot_entry_by_identity(&committed_snapshot, slot.identity).is_some_and(|entry| {
+                entry.table_key == slot.table_key
+                    && entry.table_version == confirmed.table_version
+                    && entry.table_branch == confirmed.table_branch
+                    && entry.row_count == confirmed.row_count
+                    && entry.version_metadata == confirmed.version_metadata
+            })
+        });
+        if !delta_matches {
+            return Err(OmniError::manifest_internal(format!(
+                "OCC recovery sidecar '{}' found original commit id '{}' but its manifest delta differs",
+                sidecar.operation_id, protocol.lineage.graph_commit_id
+            )));
+        }
+        true
+    } else {
+        false
+    };
+
+    match (original_visible, rollback_visible) {
+        (true, false) => Ok(Some(VisibleExactOutcome::Original)),
+        (false, true) => Ok(Some(VisibleExactOutcome::RolledBack)),
+        (false, false) => Ok(None),
+        (true, true) => Err(OmniError::manifest_internal(format!(
+            "OCC recovery sidecar '{}' has both original commit '{}' and rollback commit '{}' \
+             visible; refusing ambiguous finalization",
+            sidecar.operation_id,
+            protocol.lineage.graph_commit_id,
+            protocol.rollback_graph_commit_id
+        ))),
+    }
+}
+
+async fn finalize_visible_v3_outcome(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    sidecar: &RecoverySidecar,
+    outcome: VisibleExactOutcome,
+) -> Result<bool> {
+    let protocol = sidecar
+        .protocol_v3
+        .as_ref()
+        .expect("caller checked protocol_v3");
+
+    let (kind, graph_commit_id, outcomes) = match outcome {
+        VisibleExactOutcome::Original => {
+            let outcomes = sidecar
+                .tables
+                .iter()
+                .map(|pin| {
+                    let confirmed = protocol
+                        .intended_delta
+                        .table_updates
+                        .iter()
+                        .find(|slot| slot.identity == pin.identity)
+                        .and_then(|slot| slot.confirmed.as_ref())
+                        .expect("validated EffectsConfirmed v3 sidecar");
+                    TableOutcome {
+                        table_key: pin.table_key.clone(),
+                        from_version: pin.expected_version,
+                        to_version: confirmed.table_version,
+                    }
+                })
+                .collect();
+            (
+                RecoveryKind::RolledForward,
+                protocol.lineage.graph_commit_id.clone(),
+                outcomes,
+            )
+        }
+        VisibleExactOutcome::RolledBack => {
+            let outcomes = protocol.rollback_audit_outcomes.clone().ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "OCC recovery sidecar '{}' has visible fixed rollback commit '{}' but no \
+                     durable rollback audit outcomes; refusing to infer them from table pins",
+                    sidecar.operation_id, protocol.rollback_graph_commit_id
+                ))
+            })?;
+            (
+                RecoveryKind::RolledBack,
+                protocol.rollback_graph_commit_id.clone(),
+                outcomes,
+            )
+        }
+    };
+
+    // Idempotent across an audit-success / sidecar-delete failure. The fixed
+    // outcome id is already durable in __manifest; the only remaining work is
+    // to ensure one audit row exists and delete the artifact.
+    let mut audit = RecoveryAudit::open(root_uri).await?;
+    let already_recorded =
+        audit.list().await?.iter().any(|record| {
+            record.operation_id == sidecar.operation_id && record.recovery_kind == kind
+        });
+    if !already_recorded {
+        crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_RECORD_AUDIT)?;
+        audit
+            .append(RecoveryAuditRecord {
+                graph_commit_id,
+                recovery_kind: kind,
+                recovery_for_actor: sidecar.actor_id.clone(),
+                operation_id: sidecar.operation_id.clone(),
+                sidecar_writer_kind: format!("{:?}", sidecar.writer_kind),
+                per_table_outcomes: outcomes,
+                created_at: crate::db::now_micros()?,
+            })
+            .await?;
+    }
+    delete_sidecar_by_operation_id(root_uri, storage, &sidecar.operation_id).await?;
+    Ok(true)
+}
+
+async fn detect_visible_v4_outcome(
+    root_uri: &str,
+    sidecar: &RecoverySidecar,
+) -> Result<Option<VisibleExactOutcome>> {
+    let protocol = sidecar
+        .protocol_v4
+        .as_ref()
+        .expect("caller checked protocol_v4");
+    let (commits, _) =
+        ManifestCoordinator::read_graph_lineage_at(root_uri, sidecar.branch.as_deref()).await?;
+    let original_commit = commits
+        .iter()
+        .find(|commit| commit.graph_commit_id == protocol.lineage.graph_commit_id);
+    let rollback_visible = commits
+        .iter()
+        .any(|commit| commit.graph_commit_id == protocol.rollback_graph_commit_id);
+    let original_visible = if let Some(commit) = original_commit {
+        let expected_branch = protocol
+            .lineage
+            .branch
+            .as_deref()
+            .filter(|branch| *branch != "main");
+        if commit.manifest_branch.as_deref() != expected_branch
+            || protocol
+                .authority
+                .graph_head
+                .as_ref()
+                .is_some_and(|head| commit.parent_commit_id.as_ref() != Some(head))
+            || commit.merged_parent_commit_id != protocol.lineage.merged_parent_commit_id
+            || commit.actor_id != protocol.lineage.actor_id
+            || commit.created_at != protocol.lineage.created_at
+        {
+            return Err(OmniError::manifest_internal(format!(
+                "BranchMerge recovery sidecar '{}' found original commit id '{}' with mismatched lineage",
+                sidecar.operation_id, protocol.lineage.graph_commit_id
+            )));
+        }
+        let committed_snapshot = ManifestCoordinator::snapshot_at(
+            root_uri,
+            sidecar.branch.as_deref(),
+            commit.manifest_version,
+        )
+        .await?;
+        let delta_matches = protocol.intended_delta.table_updates.iter().all(|slot| {
+            let Some(confirmed) = slot.confirmed.as_ref() else {
+                return false;
+            };
+            snapshot_entry_by_identity(&committed_snapshot, slot.identity).is_some_and(|entry| {
+                entry.table_key == slot.table_key
+                    && entry.table_version == confirmed.table_version
+                    && entry.table_branch == confirmed.table_branch
+                    && entry.row_count == confirmed.row_count
+                    && entry.version_metadata == confirmed.version_metadata
+            })
+        });
+        if !delta_matches {
+            return Err(OmniError::manifest_internal(format!(
+                "BranchMerge recovery sidecar '{}' found original commit id '{}' but its exact manifest delta differs",
+                sidecar.operation_id, protocol.lineage.graph_commit_id
+            )));
+        }
+        true
+    } else {
+        false
+    };
+
+    match (original_visible, rollback_visible) {
+        (true, false) => Ok(Some(VisibleExactOutcome::Original)),
+        (false, true) => Ok(Some(VisibleExactOutcome::RolledBack)),
+        (false, false) => Ok(None),
+        (true, true) => Err(OmniError::manifest_internal(format!(
+            "BranchMerge recovery sidecar '{}' has both original commit '{}' and rollback commit '{}' visible; refusing ambiguous finalization",
+            sidecar.operation_id,
+            protocol.lineage.graph_commit_id,
+            protocol.rollback_graph_commit_id
+        ))),
+    }
+}
+
+async fn finalize_visible_v4_outcome(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    sidecar: &RecoverySidecar,
+    outcome: VisibleExactOutcome,
+) -> Result<bool> {
+    let protocol = sidecar
+        .protocol_v4
+        .as_ref()
+        .expect("caller checked protocol_v4");
+    let (kind, graph_commit_id, outcomes) = match outcome {
+        VisibleExactOutcome::Original => {
+            let outcomes = protocol
+                .intended_delta
+                .table_updates
+                .iter()
+                .map(|slot| {
+                    let confirmed = slot
+                        .confirmed
+                        .as_ref()
+                        .expect("visible v4 original requires confirmed delta");
+                    TableOutcome {
+                        table_key: slot.table_key.clone(),
+                        from_version: slot.expected_version,
+                        to_version: confirmed.table_version,
+                    }
+                })
+                .collect();
+            (
+                RecoveryKind::RolledForward,
+                protocol.lineage.graph_commit_id.clone(),
+                outcomes,
+            )
+        }
+        VisibleExactOutcome::RolledBack => {
+            let outcomes = protocol.rollback_audit_outcomes.clone().ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "BranchMerge recovery sidecar '{}' has visible fixed rollback commit '{}' but no durable rollback audit outcomes",
+                    sidecar.operation_id, protocol.rollback_graph_commit_id
+                ))
+            })?;
+            (
+                RecoveryKind::RolledBack,
+                protocol.rollback_graph_commit_id.clone(),
+                outcomes,
+            )
+        }
+    };
+
+    let mut audit = RecoveryAudit::open(root_uri).await?;
+    let already_recorded =
+        audit.list().await?.iter().any(|record| {
+            record.operation_id == sidecar.operation_id && record.recovery_kind == kind
+        });
+    if !already_recorded {
+        crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_RECORD_AUDIT)?;
+        audit
+            .append(RecoveryAuditRecord {
+                graph_commit_id,
+                recovery_kind: kind,
+                recovery_for_actor: sidecar.actor_id.clone(),
+                operation_id: sidecar.operation_id.clone(),
+                sidecar_writer_kind: format!("{:?}", sidecar.writer_kind),
+                per_table_outcomes: outcomes,
+                created_at: crate::db::now_micros()?,
+            })
+            .await?;
+    }
+    delete_sidecar_by_operation_id(root_uri, storage, &sidecar.operation_id).await?;
+    Ok(true)
 }
 
 /// Atomically extend every table's manifest pin from `expected_version` to
@@ -1681,15 +7511,61 @@ async fn roll_forward_all(
     sidecar: &RecoverySidecar,
     states: &[ClassifiedTable],
     snapshot: &Snapshot,
-) -> Result<(u64, HashMap<String, u64>, String)> {
+) -> Result<(u64, HashMap<TableIdentity, u64>, String)> {
     let total_changes =
         sidecar.tables.len() + sidecar.additional_registrations.len() + sidecar.tombstones.len();
     let mut updates: Vec<ManifestChange> = Vec::with_capacity(total_changes);
-    let mut expected: HashMap<String, u64> = HashMap::with_capacity(total_changes);
-    let mut published_versions: HashMap<String, u64> =
+    let mut expected = ExpectedTableVersions::with_capacity(total_changes);
+    let mut published_versions: HashMap<TableIdentity, u64> =
         HashMap::with_capacity(sidecar.tables.len() + sidecar.additional_registrations.len());
 
     for (pin, state) in sidecar.tables.iter().zip(states.iter()) {
+        if let Some(protocol) = sidecar.protocol_v3.as_ref() {
+            // Exact-effect recovery publishes the durably confirmed output
+            // slot, byte-for-byte, rather than deriving metadata from whatever
+            // HEAD happens to be live later. Classification already proved the
+            // observed HEAD transaction identity and version equal this slot.
+            let slot = protocol
+                .intended_delta
+                .table_updates
+                .iter()
+                .find(|slot| slot.identity == pin.identity)
+                .ok_or_else(|| {
+                    OmniError::manifest_internal(format!(
+                        "OCC recovery delta missing table '{}'",
+                        pin.table_key
+                    ))
+                })?;
+            let confirmed = slot.confirmed.as_ref().ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "OCC recovery delta table '{}' is not confirmed",
+                    pin.table_key
+                ))
+            })?;
+            if confirmed.table_version != state.lance_head {
+                return Err(OmniError::manifest_internal(format!(
+                    "OCC recovery table '{}' observed HEAD {} but confirmed delta names {}",
+                    pin.table_key, state.lance_head, confirmed.table_version
+                )));
+            }
+            expected.insert(
+                pin.identity,
+                TableVersionExpectation {
+                    table_key: pin.table_key.clone(),
+                    table_version: slot.expected_version,
+                },
+            );
+            updates.push(ManifestChange::Update(SubTableUpdate {
+                identity: pin.identity,
+                table_key: pin.table_key.clone(),
+                table_version: confirmed.table_version,
+                table_branch: confirmed.table_branch.clone(),
+                row_count: confirmed.row_count,
+                version_metadata: confirmed.version_metadata.clone(),
+            }));
+            published_versions.insert(pin.identity, confirmed.table_version);
+            continue;
+        }
         // Publish the version classification OBSERVED (`state.lance_head`), not a
         // fresh HEAD re-read. For a `Confirmed` pin classify already validated
         // `lance_head == confirmed_version`, so this publishes the recorded WAL
@@ -1698,6 +7574,7 @@ async fn roll_forward_all(
         // against the pin's pre-write `expected_version`.
         let published = push_table_update(
             root_uri,
+            pin.identity,
             &pin.table_key,
             &pin.table_path,
             pin.table_branch.as_deref(),
@@ -1707,7 +7584,7 @@ async fn roll_forward_all(
             &mut expected,
         )
         .await?;
-        published_versions.insert(pin.table_key.clone(), published);
+        published_versions.insert(pin.identity, published);
     }
 
     // SchemaApply-only: register added tables (and renamed targets) and
@@ -1722,12 +7599,26 @@ async fn roll_forward_all(
     // registration — skip it to avoid the publisher's ExpectedVersionMismatch
     // (expected=0, actual=current_version) on the redundant Register.
     for reg in &sidecar.additional_registrations {
-        if snapshot.entry(&reg.table_key).is_some() {
+        if snapshot
+            .entries()
+            .find(|entry| entry.identity == reg.identity)
+            .is_some()
+        {
             // Already registered — record the current version in
             // published_versions so the audit row's `to_version` reflects
             // reality, but emit no manifest change.
-            if let Some(entry) = snapshot.entry(&reg.table_key) {
-                published_versions.insert(reg.table_key.clone(), entry.table_version);
+            if let Some(entry) = snapshot
+                .entries()
+                .find(|entry| entry.identity == reg.identity)
+            {
+                if entry.table_key != reg.table_key {
+                    return Err(OmniError::manifest_read_set_changed(
+                        format!("table_binding:{}", reg.identity),
+                        Some(reg.table_key.clone()),
+                        Some(entry.table_key.clone()),
+                    ));
+                }
+                published_versions.insert(reg.identity, entry.table_version);
             }
             continue;
         }
@@ -1758,10 +7649,12 @@ async fn roll_forward_all(
         )?;
 
         updates.push(ManifestChange::RegisterTable(TableRegistration {
+            identity: reg.identity,
             table_key: reg.table_key.clone(),
             table_path: reg.table_path.clone(),
         }));
         updates.push(ManifestChange::Update(SubTableUpdate {
+            identity: reg.identity,
             table_key: reg.table_key.clone(),
             table_version: head_version,
             table_branch: reg.table_branch.clone(),
@@ -1769,8 +7662,14 @@ async fn roll_forward_all(
             version_metadata,
         }));
         // No prior manifest entry expected for an added table.
-        expected.insert(reg.table_key.clone(), 0);
-        published_versions.insert(reg.table_key.clone(), head_version);
+        expected.insert(
+            reg.identity,
+            TableVersionExpectation {
+                table_key: reg.table_key.clone(),
+                table_version: 0,
+            },
+        );
+        published_versions.insert(reg.identity, head_version);
     }
 
     // SchemaApply-only: tombstone removed types (and renamed sources).
@@ -1780,10 +7679,15 @@ async fn roll_forward_all(
     // a prior recovery / the writer's Phase C — skip emit so the
     // publisher doesn't error on a redundant tombstone.
     for tomb in &sidecar.tombstones {
-        if snapshot.entry(&tomb.table_key).is_none() {
+        if snapshot
+            .entries()
+            .find(|entry| entry.identity == tomb.identity)
+            .is_none()
+        {
             continue;
         }
         updates.push(ManifestChange::Tombstone(TableTombstone {
+            identity: tomb.identity,
             table_key: tomb.table_key.clone(),
             tombstone_version: tomb.tombstone_version,
         }));
@@ -1791,14 +7695,22 @@ async fn roll_forward_all(
         // `tombstone_version - 1` (the pre-tombstone version, since
         // schema_apply sets `tombstone_version = source.table_version + 1`).
         expected.insert(
-            tomb.table_key.clone(),
-            tomb.tombstone_version.saturating_sub(1),
+            tomb.identity,
+            TableVersionExpectation {
+                table_key: tomb.table_key.clone(),
+                table_version: tomb.tombstone_version.saturating_sub(1),
+            },
         );
     }
 
-    let (new_manifest_version, graph_commit_id) =
-        publish_recovery_commit(root_uri, sidecar, RecoveryKind::RolledForward, &updates, &expected)
-            .await?;
+    let (new_manifest_version, graph_commit_id) = publish_recovery_commit(
+        root_uri,
+        sidecar,
+        RecoveryKind::RolledForward,
+        &updates,
+        &expected,
+    )
+    .await?;
     Ok((new_manifest_version, published_versions, graph_commit_id))
 }
 
@@ -1825,13 +7737,14 @@ async fn roll_forward_all(
 ///   created the restore commit, so HEAD *is* the version to publish.
 async fn push_table_update(
     root_uri: &str,
+    identity: TableIdentity,
     table_key: &str,
     table_path: &str,
     branch: Option<&str>,
     expected_version: u64,
     target_version: Option<u64>,
     updates: &mut Vec<ManifestChange>,
-    expected: &mut HashMap<String, u64>,
+    expected: &mut ExpectedTableVersions,
 ) -> Result<u64> {
     let ds = crate::instrumentation::open_dataset(
         table_path,
@@ -1859,17 +7772,24 @@ async fn push_table_update(
         .count_rows(None)
         .await
         .map_err(|e| OmniError::Lance(e.to_string()))? as u64;
-    let table_relative_path = super::table_path_for_table_key(table_key)?;
+    let table_relative_path = super::table_path_for_identity(table_key, identity)?;
     let version_metadata =
         super::metadata::TableVersionMetadata::from_dataset(root_uri, &table_relative_path, &ds)?;
     updates.push(ManifestChange::Update(SubTableUpdate {
+        identity,
         table_key: table_key.to_string(),
         table_version: published_version,
         table_branch: branch.map(str::to_string),
         row_count,
         version_metadata,
     }));
-    expected.insert(table_key.to_string(), expected_version);
+    expected.insert(
+        identity,
+        TableVersionExpectation {
+            table_key: table_key.to_string(),
+            table_version: expected_version,
+        },
+    );
     Ok(published_version)
 }
 
@@ -1880,9 +7800,10 @@ async fn push_table_update(
 /// CAS as the table re-pin), so this only writes the `_graph_commit_recoveries`
 /// row, referencing that commit by `graph_commit_id`. A crash between the
 /// recovery publish and this audit append leaves a recovery commit with no audit
-/// row — the same not-atomic-pair-write shape as before; the sweep tolerates it
-/// (on re-entry the classifier surfaces `NoMovement`, the action is a no-op, and
-/// the audit append is retried, minting a fresh recovery commit).
+/// row. v3/v4 re-entry detects the fixed original/rollback commit and replays
+/// its durable exact audit payload; schema-v6 EnsureIndices does the same for
+/// its fixed rollback outcome. Older legacy sidecars retain their stale-sidecar
+/// cleanup behavior.
 async fn record_audit(
     root_uri: &str,
     sidecar: &RecoverySidecar,
@@ -1909,47 +7830,161 @@ async fn record_audit(
     Ok(())
 }
 
-/// Returns `true` if any `SchemaApply` sidecar is present in
-/// `__recovery/`. Schema-state recovery (`recover_schema_state_files`)
-/// uses this to skip its normal pre-vs-post-commit disambiguation —
-/// when a SchemaApply sidecar is present, we know the writer reached
-/// Phase B (Lance HEADs advanced) but didn't complete Phase C (manifest
-/// publish + staging→final renames). The right action is to complete
-/// the rename so the recovery sweep's roll-forward step sees the new
-/// catalog. Without this, the disambiguation logic deletes the staging
-/// files (since manifest still pins the old table set) and leaves the
-/// graph with new-schema data on disk but the old `_schema.pg` live —
-/// real corruption.
-pub(crate) async fn has_schema_apply_sidecar(
-    root_uri: &str,
-    storage: &dyn StorageAdapter,
-) -> Result<bool> {
-    let sidecars = list_sidecars(root_uri, storage).await?;
-    Ok(sidecars
-        .iter()
-        .any(|s| matches!(s.writer_kind, SidecarKind::SchemaApply)))
-}
-
 /// Open the Lance dataset at `table_path` checked out at the given
 /// branch ref (or default if `branch` is None or "main") and return its
 /// HEAD version. Recovery uses this so feature-branch sidecars classify
 /// against the feature-branch's Lance HEAD, not main's.
-async fn open_lance_head(table_path: &str, branch: Option<&str>) -> Result<u64> {
-    let ds = crate::instrumentation::open_dataset(
-        table_path,
-        crate::instrumentation::VersionResolution::Latest,
-        None,
-        crate::instrumentation::table_wrapper(),
-    )
-    .await?;
-    let ds = match branch {
-        Some(b) if b != "main" => ds
-            .checkout_branch(b)
+struct LanceHeadObservation {
+    version: u64,
+    transaction: Option<StagedTransactionIdentity>,
+    effect_ownership: EffectOwnership,
+}
+
+#[cfg(test)]
+async fn open_lance_head(
+    table_path: &str,
+    branch: Option<&str>,
+    planned_effect: Option<(u64, &StagedTransactionIdentity, u64)>,
+) -> Result<LanceHeadObservation> {
+    open_lance_head_if_present(table_path, branch, planned_effect, false, false)
+        .await?
+        .ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "required Lance branch '{}' is missing for table '{}'",
+                branch.unwrap_or("main"),
+                table_path
+            ))
+        })
+}
+
+/// Variant used only for an Armed v3 first-touch fork. `allow_missing_branch`
+/// turns an absent named target ref into `None`; every storage/list failure and
+/// every missing ref outside that exact recovery state remains a loud error.
+async fn open_lance_head_if_present(
+    table_path: &str,
+    branch: Option<&str>,
+    planned_effect: Option<(u64, &StagedTransactionIdentity, u64)>,
+    allow_missing_branch: bool,
+    allow_missing_dataset: bool,
+) -> Result<Option<LanceHeadObservation>> {
+    let ds = if allow_missing_dataset {
+        // A schema-v7 first-touch create may crash after writing staged data
+        // files but before committing version one. Preserve Lance's typed
+        // DatasetNotFound distinction here; the shared instrumented opener
+        // intentionally erases it into OmniError::Lance for ordinary callers.
+        let control_session = crate::lance_access::control_session();
+        match lance::dataset::builder::DatasetBuilder::from_uri(table_path)
+            .with_session(control_session)
+            .load()
             .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?,
+        {
+            Ok(dataset) => dataset,
+            Err(lance::Error::DatasetNotFound { .. } | lance::Error::NotFound { .. }) => {
+                return Ok(None);
+            }
+            Err(error) => return Err(OmniError::Lance(error.to_string())),
+        }
+    } else {
+        crate::instrumentation::open_dataset(
+            table_path,
+            crate::instrumentation::VersionResolution::Latest,
+            None,
+            crate::instrumentation::table_wrapper(),
+        )
+        .await?
+    };
+    let ds = match branch {
+        Some(b) if b != "main" => {
+            if allow_missing_branch {
+                let branches = ds
+                    .list_branches()
+                    .await
+                    .map_err(|error| OmniError::Lance(error.to_string()))?;
+                if !branches.contains_key(b) {
+                    return Ok(None);
+                }
+            }
+            ds.checkout_branch(b)
+                .await
+                .map_err(|e| OmniError::Lance(e.to_string()))?
+        }
         _ => ds,
     };
-    Ok(ds.version().version)
+    let head_transaction = if planned_effect.is_some() {
+        ds.read_transaction()
+            .await
+            .map_err(|error| OmniError::Lance(error.to_string()))?
+    } else {
+        None
+    };
+    let transaction = head_transaction
+        .as_ref()
+        .map(StagedTransactionIdentity::from);
+    let head_restore_target = head_transaction
+        .as_ref()
+        .and_then(|transaction| match &transaction.operation {
+            lance::dataset::transaction::Operation::Restore { version } => Some(*version),
+            _ => None,
+        });
+    let mut effect_ownership = EffectOwnership::None;
+    if let Some((first_possible_version, planned, compensation_target)) = planned_effect {
+        if ds.version().version >= first_possible_version {
+            if ds
+                .version()
+                .version
+                .saturating_sub(first_possible_version)
+                .saturating_add(1)
+                > MAX_EFFECT_IDENTITY_SCAN_VERSIONS
+            {
+                return Ok(Some(LanceHeadObservation {
+                    version: ds.version().version,
+                    transaction,
+                    effect_ownership: EffectOwnership::Unverifiable,
+                }));
+            }
+            let mut unverifiable = false;
+            for version in first_possible_version..=ds.version().version {
+                let observed = if version == ds.version().version {
+                    transaction.clone()
+                } else {
+                    ds.read_transaction_by_version(version)
+                        .await
+                        .map_err(|error| OmniError::Lance(error.to_string()))?
+                        .as_ref()
+                        .map(StagedTransactionIdentity::from)
+                };
+                match observed {
+                    // UUID is the durable ownership marker. A transparent
+                    // Lance rebase is still this writer's physical effect
+                    // whether or not Lance preserves `read_version`; exact
+                    // classification separately refuses to roll it forward.
+                    Some(observed) if observed.uuid == planned.uuid => {
+                        effect_ownership = if version == ds.version().version {
+                            EffectOwnership::OwnAtHead
+                        } else {
+                            EffectOwnership::OwnBeforeHead
+                        };
+                        break;
+                    }
+                    Some(_) => {}
+                    None => unverifiable = true,
+                }
+            }
+            if effect_ownership == EffectOwnership::None && unverifiable {
+                effect_ownership = EffectOwnership::Unverifiable;
+            }
+            if effect_ownership == EffectOwnership::OwnBeforeHead
+                && head_restore_target == Some(compensation_target)
+            {
+                effect_ownership = EffectOwnership::OwnCompensatedAtHead;
+            }
+        }
+    }
+    Ok(Some(LanceHeadObservation {
+        version: ds.version().version,
+        transaction,
+        effect_ownership,
+    }))
 }
 
 async fn delete_sidecar_by_operation_id(
@@ -1960,9 +7995,22 @@ async fn delete_sidecar_by_operation_id(
     storage.delete(&sidecar_uri(root_uri, operation_id)).await
 }
 
-/// Convenience: build a [`RecoverySidecar`] with auto-generated
-/// `operation_id` and `started_at`. The caller fills in the other fields.
-pub(crate) fn new_sidecar(
+/// Arm the identity-aware Optimize protocol. Optimize has no writer-specific
+/// payload: its complete physical set is the table-pin vector itself.
+pub(crate) fn new_optimize_sidecar_v9(tables: Vec<SidecarTablePin>) -> Result<RecoverySidecar> {
+    let sidecar = new_unvalidated_sidecar(
+        IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION,
+        SidecarKind::Optimize,
+        None,
+        None,
+        tables,
+    );
+    validate_sidecar_shape("<new-optimize-sidecar-v9>", &sidecar)?;
+    Ok(sidecar)
+}
+
+fn new_unvalidated_sidecar(
+    schema_version: u32,
     writer_kind: SidecarKind,
     branch: Option<String>,
     actor_id: Option<String>,
@@ -1975,7 +8023,7 @@ pub(crate) fn new_sidecar(
         Err(_) => "0".to_string(),
     };
     RecoverySidecar {
-        schema_version: SIDECAR_SCHEMA_VERSION,
+        schema_version,
         operation_id,
         started_at,
         branch,
@@ -1985,17 +8033,982 @@ pub(crate) fn new_sidecar(
         merge_source_commit_id: None,
         additional_registrations: Vec::new(),
         tombstones: Vec::new(),
+        schema_apply_manifest_published: false,
+        schema_apply_target_schema_ir_hash: None,
+        protocol_v3: None,
+        protocol_v4: None,
+        protocol_v7: None,
+        protocol_v8: None,
+        ensure_indices_rollback_v6: None,
     }
+}
+
+/// Arm the narrow schema-v6 EnsureIndices recovery bridge. Index effects still
+/// use the legacy loose classifier, but compensation gets a stable lineage id
+/// so a crash after rollback publish cannot be misread as roll-forward.
+#[cfg(test)]
+pub(crate) fn new_ensure_indices_sidecar_v6(
+    branch: Option<String>,
+    tables: Vec<SidecarTablePin>,
+) -> Result<RecoverySidecar> {
+    let mut sidecar = new_unvalidated_sidecar(
+        ENSURE_INDICES_ROLLBACK_SCHEMA_VERSION,
+        SidecarKind::EnsureIndices,
+        branch,
+        None,
+        tables,
+    );
+    sidecar.ensure_indices_rollback_v6 = Some(RecoveryEnsureIndicesRollbackV6 {
+        rollback_graph_commit_id: ulid::Ulid::new().to_string(),
+        rollback_audit_outcomes: None,
+    });
+    validate_sidecar_shape("<new-ensure-indices-sidecar>", &sidecar)?;
+    Ok(sidecar)
+}
+
+/// Arm an exact schema-v9 EnsureIndices intent. The caller pre-mints one Lance
+/// transaction per table and identifies only those named-branch targets whose
+/// native ref must be created after this sidecar becomes durable.
+pub(crate) fn new_ensure_indices_sidecar_v9(
+    branch: Option<String>,
+    actor_id: Option<String>,
+    tables: Vec<SidecarTablePin>,
+    authority: RecoveryAuthorityToken,
+    lineage: RecoveryLineageIntent,
+    planned_transactions: HashMap<TableIdentity, StagedTransactionIdentity>,
+    first_touch_source_versions: HashMap<TableIdentity, u64>,
+) -> Result<RecoverySidecar> {
+    let pin_ids: HashSet<TableIdentity> = tables.iter().map(|pin| pin.identity).collect();
+    if tables.is_empty()
+        || pin_ids.len() != tables.len()
+        || planned_transactions.len() != tables.len()
+        || !tables
+            .iter()
+            .all(|pin| planned_transactions.contains_key(&pin.identity))
+        || !first_touch_source_versions
+            .keys()
+            .all(|identity| pin_ids.contains(identity))
+    {
+        return Err(OmniError::manifest_internal(
+            "new_ensure_indices_sidecar_v9 requires one planned transaction per unique table pin and first-touch keys drawn from those pins",
+        ));
+    }
+
+    let operation_id = ulid::Ulid::new().to_string();
+    let started_at = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => duration.as_micros().to_string(),
+        Err(_) => "0".to_string(),
+    };
+    let effects = tables
+        .iter()
+        .map(|pin| RecoveryEnsureIndicesEffect {
+            identity: pin.identity,
+            table_key: pin.table_key.clone(),
+            planned_transaction: planned_transactions
+                .get(&pin.identity)
+                .expect("planned key set checked above")
+                .clone(),
+            source_fork_version: first_touch_source_versions.get(&pin.identity).copied(),
+            confirmed_transaction: None,
+            confirmed_branch_identifier: None,
+        })
+        .collect();
+    let intended_delta = RecoveryManifestDelta {
+        table_updates: tables
+            .iter()
+            .map(|pin| RecoveryTableUpdateSlot {
+                identity: pin.identity,
+                table_key: pin.table_key.clone(),
+                expected_version: pin.expected_version,
+                table_branch: pin.table_branch.clone(),
+                confirmed: None,
+            })
+            .collect(),
+        registrations: Vec::new(),
+        renames: Vec::new(),
+        tombstones: Vec::new(),
+    };
+    let sidecar = RecoverySidecar {
+        schema_version: IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION,
+        operation_id,
+        started_at,
+        branch,
+        actor_id,
+        writer_kind: SidecarKind::EnsureIndices,
+        tables,
+        merge_source_commit_id: None,
+        additional_registrations: Vec::new(),
+        tombstones: Vec::new(),
+        schema_apply_manifest_published: false,
+        schema_apply_target_schema_ir_hash: None,
+        protocol_v3: None,
+        protocol_v4: None,
+        protocol_v7: None,
+        protocol_v8: Some(RecoveryProtocolV8 {
+            authority,
+            lineage,
+            rollback_graph_commit_id: ulid::Ulid::new().to_string(),
+            rollback_audit_outcomes: None,
+            effect_phase: RecoveryEffectPhase::Armed,
+            effects,
+            intended_delta,
+        }),
+        ensure_indices_rollback_v6: None,
+    };
+    validate_sidecar_shape("<new-ensure-indices-v9-sidecar>", &sidecar)?;
+    Ok(sidecar)
+}
+
+/// Bind every exact schema-v9 index output and durably transition the sidecar
+/// from `Armed` to `EffectsConfirmed`. Validation completes on a clone so any
+/// mismatch leaves the durable intent rollback-only.
+pub(crate) async fn confirm_ensure_indices_sidecar_v9(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    sidecar: &mut RecoverySidecar,
+    updates: &[SubTableUpdate],
+    committed_transactions: &HashMap<TableIdentity, StagedTransactionIdentity>,
+    confirmed_ref_identifiers: &HashMap<TableIdentity, lance::dataset::refs::BranchIdentifier>,
+) -> Result<()> {
+    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_SIDECAR_CONFIRM)?;
+    let uri = sidecar_uri(root_uri, &sidecar.operation_id);
+    validate_sidecar_shape(&uri, sidecar)?;
+    let protocol = sidecar.protocol_v8.as_ref().ok_or_else(|| {
+        OmniError::manifest_internal(
+            "confirm_ensure_indices_sidecar_v9 requires a schema-v9 EnsureIndices sidecar",
+        )
+    })?;
+    if protocol.effect_phase != RecoveryEffectPhase::Armed {
+        return Err(OmniError::manifest_internal(format!(
+            "EnsureIndices sidecar '{}' is already EffectsConfirmed",
+            sidecar.operation_id
+        )));
+    }
+    let planned_ids: HashSet<TableIdentity> = protocol
+        .effects
+        .iter()
+        .map(|effect| effect.identity)
+        .collect();
+    let update_ids: HashSet<TableIdentity> = updates.iter().map(|update| update.identity).collect();
+    let first_touch_ids: HashSet<TableIdentity> = protocol
+        .effects
+        .iter()
+        .filter(|effect| effect.is_first_touch())
+        .map(|effect| effect.identity)
+        .collect();
+    let ref_ids: HashSet<TableIdentity> = confirmed_ref_identifiers.keys().copied().collect();
+    if update_ids.len() != updates.len()
+        || update_ids != planned_ids
+        || committed_transactions.len() != planned_ids.len()
+        || !planned_ids
+            .iter()
+            .all(|identity| committed_transactions.contains_key(identity))
+        || ref_ids != first_touch_ids
+    {
+        return Err(OmniError::manifest_internal(format!(
+            "EnsureIndices sidecar '{}' confirmation key set differs from its exact plan",
+            sidecar.operation_id
+        )));
+    }
+
+    for effect in &protocol.effects {
+        let pin = sidecar
+            .tables
+            .iter()
+            .find(|pin| pin.identity == effect.identity)
+            .expect("validated schema-v8 key sets");
+        let update = updates
+            .iter()
+            .find(|update| update.identity == effect.identity)
+            .expect("confirmation key sets checked above");
+        let committed = committed_transactions
+            .get(&effect.identity)
+            .expect("confirmation key sets checked above");
+        if pin.table_key != effect.table_key
+            || update.table_key != effect.table_key
+            || committed != &effect.planned_transaction
+            || update.table_version != pin.post_commit_pin
+            || update.table_branch != pin.table_branch
+        {
+            return Err(OmniError::manifest_internal(format!(
+                "EnsureIndices sidecar '{}' table '{}' achieved transaction/version/branch outside its exact plan; leaving recovery Armed",
+                sidecar.operation_id, effect.table_key
+            )));
+        }
+        let observed = observe_branch_merge_target_ref(pin).await?.ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "EnsureIndices sidecar '{}' cannot confirm missing target ref for table '{}'",
+                sidecar.operation_id, effect.table_key
+            ))
+        })?;
+        if observed.version != update.table_version
+            || !prove_ensure_indices_create_index_operation(
+                &observed.dataset,
+                &effect.planned_transaction,
+            )
+            .await?
+        {
+            return Err(OmniError::manifest_internal(format!(
+                "EnsureIndices sidecar '{}' table '{}' does not have its exact CreateIndex operation at the achieved HEAD; leaving recovery Armed",
+                sidecar.operation_id, effect.table_key
+            )));
+        }
+        if let Some(source_fork_version) = effect.source_fork_version {
+            let expected_identifier = confirmed_ref_identifiers
+                .get(&effect.identity)
+                .expect("first-touch key sets checked above");
+            if observed.parent_version != Some(source_fork_version)
+                || observed.version != update.table_version
+                || &observed.branch_identifier != expected_identifier
+            {
+                return Err(OmniError::manifest_internal(format!(
+                    "EnsureIndices sidecar '{}' table '{}' target ref differs from its exact first-touch result; leaving recovery Armed",
+                    sidecar.operation_id, effect.table_key
+                )));
+            }
+        }
+    }
+
+    let mut confirmed = sidecar.clone();
+    let confirmed_protocol = confirmed
+        .protocol_v8
+        .as_mut()
+        .expect("validated schema-v8 protocol");
+    for effect in &mut confirmed_protocol.effects {
+        effect.confirmed_transaction = Some(
+            committed_transactions
+                .get(&effect.identity)
+                .expect("confirmation key sets checked above")
+                .clone(),
+        );
+        effect.confirmed_branch_identifier =
+            confirmed_ref_identifiers.get(&effect.identity).cloned();
+    }
+    for slot in &mut confirmed_protocol.intended_delta.table_updates {
+        let update = updates
+            .iter()
+            .find(|update| update.identity == slot.identity)
+            .expect("confirmation key sets checked above");
+        slot.confirmed = Some(RecoveryConfirmedTableUpdate {
+            table_version: update.table_version,
+            table_branch: update.table_branch.clone(),
+            row_count: update.row_count,
+            version_metadata: update.version_metadata.clone(),
+        });
+    }
+    for pin in &mut confirmed.tables {
+        let update = updates
+            .iter()
+            .find(|update| update.identity == pin.identity)
+            .expect("confirmation key sets checked above");
+        pin.confirmed_version = Some(update.table_version);
+    }
+    confirmed_protocol.effect_phase = RecoveryEffectPhase::EffectsConfirmed;
+    validate_sidecar_shape(&uri, &confirmed)?;
+    let json = serde_json::to_string_pretty(&confirmed).map_err(|error| {
+        OmniError::manifest_internal(format!(
+            "failed to serialize confirmed EnsureIndices recovery sidecar: {error}"
+        ))
+    })?;
+    storage.write_text(&uri, &json).await?;
+    *sidecar = confirmed;
+    Ok(())
+}
+
+/// Arm an RFC-022 mutation/load recovery sidecar.
+///
+/// The returned v3 sidecar is still purely an intent (`Armed`): every staged
+/// transaction identity and manifest output slot is durable, but no achieved
+/// version is recorded. The caller must persist it with [`write_sidecar`]
+/// before the first table HEAD advance and later call
+/// [`confirm_occ_sidecar_v9`] after every exact effect completes.
+pub(crate) fn new_occ_sidecar_v9(
+    writer_kind: SidecarKind,
+    branch: Option<String>,
+    actor_id: Option<String>,
+    tables: Vec<SidecarTablePin>,
+    authority: RecoveryAuthorityToken,
+    lineage: RecoveryLineageIntent,
+    planned_transactions: HashMap<TableIdentity, StagedTransactionIdentity>,
+) -> Result<RecoverySidecar> {
+    if !matches!(writer_kind, SidecarKind::Mutation | SidecarKind::Load) {
+        return Err(OmniError::manifest_internal(format!(
+            "new_occ_sidecar_v9 only supports Mutation/Load, found {:?}",
+            writer_kind
+        )));
+    }
+    let pin_ids: HashSet<TableIdentity> = tables.iter().map(|pin| pin.identity).collect();
+    if tables.is_empty()
+        || pin_ids.len() != tables.len()
+        || planned_transactions.len() != tables.len()
+        || !tables
+            .iter()
+            .all(|pin| planned_transactions.contains_key(&pin.identity))
+    {
+        return Err(OmniError::manifest_internal(
+            "new_occ_sidecar_v9 requires at least one pin and exactly one planned transaction per unique table identity",
+        ));
+    }
+
+    let operation_id = ulid::Ulid::new().to_string();
+    let started_at = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => duration.as_micros().to_string(),
+        Err(_) => "0".to_string(),
+    };
+    let effects = tables
+        .iter()
+        .map(|pin| RecoveryTableEffect {
+            identity: pin.identity,
+            table_key: pin.table_key.clone(),
+            planned_transaction: planned_transactions
+                .get(&pin.identity)
+                .expect("planned key set checked above")
+                .clone(),
+            confirmed_transaction: None,
+        })
+        .collect();
+    let table_updates = tables
+        .iter()
+        .map(|pin| RecoveryTableUpdateSlot {
+            identity: pin.identity,
+            table_key: pin.table_key.clone(),
+            expected_version: pin.expected_version,
+            table_branch: pin.table_branch.clone(),
+            confirmed: None,
+        })
+        .collect();
+    let sidecar = RecoverySidecar {
+        schema_version: IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION,
+        operation_id,
+        started_at,
+        branch,
+        actor_id,
+        writer_kind,
+        tables,
+        merge_source_commit_id: None,
+        additional_registrations: Vec::new(),
+        tombstones: Vec::new(),
+        schema_apply_manifest_published: false,
+        schema_apply_target_schema_ir_hash: None,
+        protocol_v3: Some(RecoveryProtocolV3 {
+            authority,
+            lineage,
+            rollback_graph_commit_id: ulid::Ulid::new().to_string(),
+            rollback_audit_outcomes: None,
+            effect_phase: RecoveryEffectPhase::Armed,
+            effects,
+            intended_delta: RecoveryManifestDelta {
+                table_updates,
+                registrations: Vec::new(),
+                renames: Vec::new(),
+                tombstones: Vec::new(),
+            },
+        }),
+        protocol_v4: None,
+        protocol_v7: None,
+        protocol_v8: None,
+        ensure_indices_rollback_v6: None,
+    };
+    validate_sidecar_shape("<new-occ-sidecar>", &sidecar)?;
+    Ok(sidecar)
+}
+
+/// Bind every physical output slot of an RFC-022 sidecar and durably transition
+/// it from `Armed` to `EffectsConfirmed`.
+///
+/// Validation happens against a clone first. A missing table, a rebased Lance
+/// transaction, or a version/branch mismatch leaves the on-disk sidecar Armed,
+/// which recovery interprets as partial Phase B and rolls back. Only the exact
+/// planned transaction set can become eligible for roll-forward.
+pub(crate) async fn confirm_occ_sidecar_v9(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    sidecar: &mut RecoverySidecar,
+    updates: &[SubTableUpdate],
+    committed_transactions: &HashMap<TableIdentity, StagedTransactionIdentity>,
+) -> Result<()> {
+    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_SIDECAR_CONFIRM)?;
+    validate_sidecar_shape(&sidecar_uri(root_uri, &sidecar.operation_id), sidecar)?;
+
+    let protocol = sidecar.protocol_v3.as_ref().ok_or_else(|| {
+        OmniError::manifest_internal("confirm_occ_sidecar_v9 requires a schema-v9 OCC sidecar")
+    })?;
+    if protocol.effect_phase != RecoveryEffectPhase::Armed {
+        return Err(OmniError::manifest_internal(format!(
+            "OCC sidecar '{}' is already EffectsConfirmed",
+            sidecar.operation_id
+        )));
+    }
+    let update_ids: HashSet<TableIdentity> = updates.iter().map(|update| update.identity).collect();
+    let planned_ids: HashSet<TableIdentity> = protocol
+        .effects
+        .iter()
+        .map(|effect| effect.identity)
+        .collect();
+    if update_ids.len() != updates.len()
+        || committed_transactions.len() != planned_ids.len()
+        || update_ids != planned_ids
+        || !planned_ids
+            .iter()
+            .all(|identity| committed_transactions.contains_key(identity))
+    {
+        return Err(OmniError::manifest_internal(format!(
+            "OCC sidecar '{}' confirmation key set differs from its planned effects",
+            sidecar.operation_id
+        )));
+    }
+
+    // Validate every effect before mutating the clone. Transaction identity is
+    // necessary but not sufficient: the version/branch check below also
+    // rejects Lance's preflight rebase, which can preserve both transaction
+    // fields while landing at a later version.
+    for effect in &protocol.effects {
+        let committed = committed_transactions
+            .get(&effect.identity)
+            .expect("confirmed key set checked above");
+        if committed != &effect.planned_transaction {
+            return Err(OmniError::manifest_internal(format!(
+                "OCC sidecar '{}' table '{}' committed transaction {:?}, planned {:?}; \
+                 leaving recovery Armed",
+                sidecar.operation_id, effect.table_key, committed, effect.planned_transaction
+            )));
+        }
+        let pin = sidecar
+            .tables
+            .iter()
+            .find(|pin| pin.identity == effect.identity)
+            .expect("sidecar key sets validated");
+        let update = updates
+            .iter()
+            .find(|update| update.identity == effect.identity)
+            .expect("confirmed key set checked above");
+        if pin.table_key != effect.table_key
+            || update.table_key != effect.table_key
+            || update.table_version != pin.post_commit_pin
+            || update.table_branch != pin.table_branch
+        {
+            return Err(OmniError::manifest_internal(format!(
+                "OCC sidecar '{}' table '{}' achieved version/branch ({}, {:?}), \
+                 planned ({}, {:?}); leaving recovery Armed",
+                sidecar.operation_id,
+                effect.table_key,
+                update.table_version,
+                update.table_branch,
+                pin.post_commit_pin,
+                pin.table_branch
+            )));
+        }
+    }
+
+    let mut confirmed = sidecar.clone();
+    let confirmed_protocol = confirmed
+        .protocol_v3
+        .as_mut()
+        .expect("validated v3 protocol");
+    for effect in &mut confirmed_protocol.effects {
+        effect.confirmed_transaction = Some(
+            committed_transactions
+                .get(&effect.identity)
+                .expect("confirmed key set checked above")
+                .clone(),
+        );
+    }
+    for slot in &mut confirmed_protocol.intended_delta.table_updates {
+        let update = updates
+            .iter()
+            .find(|update| update.identity == slot.identity)
+            .expect("confirmed key set checked above");
+        slot.confirmed = Some(RecoveryConfirmedTableUpdate {
+            table_version: update.table_version,
+            table_branch: update.table_branch.clone(),
+            row_count: update.row_count,
+            version_metadata: update.version_metadata.clone(),
+        });
+    }
+    for pin in &mut confirmed.tables {
+        let update = updates
+            .iter()
+            .find(|update| update.identity == pin.identity)
+            .expect("confirmed key set checked above");
+        pin.confirmed_version = Some(update.table_version);
+    }
+    confirmed_protocol.effect_phase = RecoveryEffectPhase::EffectsConfirmed;
+
+    let uri = sidecar_uri(root_uri, &confirmed.operation_id);
+    validate_sidecar_shape(&uri, &confirmed)?;
+    let json = serde_json::to_string_pretty(&confirmed).map_err(|error| {
+        OmniError::manifest_internal(format!(
+            "failed to serialize confirmed OCC recovery sidecar: {}",
+            error
+        ))
+    })?;
+    storage.write_text(&uri, &json).await?;
+    *sidecar = confirmed;
+    Ok(())
+}
+
+/// Arm an exact schema-v9 SchemaApply intent. `tables`/`effects` name every
+/// independently durable table operation; metadata/tombstone-only applies may
+/// deliberately carry an empty set because schema staging is confirmed by the
+/// same protocol before publication.
+pub(crate) fn new_schema_apply_sidecar_v9(
+    actor_id: Option<String>,
+    tables: Vec<SidecarTablePin>,
+    authority: RecoveryAuthorityToken,
+    lineage: RecoveryLineageIntent,
+    effects: Vec<RecoverySchemaApplyEffect>,
+    intended_delta: RecoveryManifestDelta,
+    target_schema_ir_hash: String,
+) -> Result<RecoverySidecar> {
+    let operation_id = ulid::Ulid::new().to_string();
+    let started_at = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => duration.as_micros().to_string(),
+        Err(_) => "0".to_string(),
+    };
+    let sidecar = RecoverySidecar {
+        schema_version: IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION,
+        operation_id,
+        started_at,
+        branch: None,
+        actor_id,
+        writer_kind: SidecarKind::SchemaApply,
+        tables,
+        merge_source_commit_id: None,
+        additional_registrations: Vec::new(),
+        tombstones: Vec::new(),
+        schema_apply_manifest_published: false,
+        schema_apply_target_schema_ir_hash: None,
+        protocol_v3: None,
+        protocol_v4: None,
+        protocol_v7: Some(RecoveryProtocolV7 {
+            authority,
+            lineage,
+            rollback_graph_commit_id: ulid::Ulid::new().to_string(),
+            rollback_audit_outcomes: None,
+            target_schema_ir_hash,
+            effect_phase: RecoveryEffectPhase::Armed,
+            effects,
+            intended_delta,
+        }),
+        protocol_v8: None,
+        ensure_indices_rollback_v6: None,
+    };
+    validate_sidecar_shape("<new-schema-apply-v9-sidecar>", &sidecar)?;
+    Ok(sidecar)
+}
+
+/// Bind every exact SchemaApply output after all table effects and all three
+/// schema staging files are durable. Validation completes against a clone, so
+/// any mismatch leaves the durable sidecar Armed and therefore rollback-only.
+pub(crate) async fn confirm_schema_apply_sidecar_v9(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    sidecar: &mut RecoverySidecar,
+    updates: &[SubTableUpdate],
+    committed_transactions: &HashMap<TableIdentity, StagedTransactionIdentity>,
+) -> Result<()> {
+    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_SIDECAR_CONFIRM)?;
+    validate_sidecar_shape(&sidecar_uri(root_uri, &sidecar.operation_id), sidecar)?;
+    let protocol = sidecar.protocol_v7.as_ref().ok_or_else(|| {
+        OmniError::manifest_internal("confirm_schema_apply_sidecar_v9 requires a schema-v9 sidecar")
+    })?;
+    if protocol.effect_phase != RecoveryEffectPhase::Armed {
+        return Err(OmniError::manifest_internal(format!(
+            "SchemaApply sidecar '{}' is already EffectsConfirmed",
+            sidecar.operation_id
+        )));
+    }
+    let update_ids: HashSet<TableIdentity> = updates.iter().map(|update| update.identity).collect();
+    let planned_ids: HashSet<TableIdentity> = protocol
+        .effects
+        .iter()
+        .map(|effect| effect.identity)
+        .collect();
+    if update_ids.len() != updates.len()
+        || committed_transactions.len() != planned_ids.len()
+        || update_ids != planned_ids
+        || !planned_ids
+            .iter()
+            .all(|identity| committed_transactions.contains_key(identity))
+    {
+        return Err(OmniError::manifest_internal(format!(
+            "SchemaApply sidecar '{}' confirmation key set differs from its planned effects",
+            sidecar.operation_id
+        )));
+    }
+
+    for effect in &protocol.effects {
+        let planned = effect.kind.planned_transaction();
+        let committed = committed_transactions
+            .get(&effect.identity)
+            .expect("confirmed key set checked above");
+        let pin = sidecar
+            .tables
+            .iter()
+            .find(|pin| pin.identity == effect.identity)
+            .expect("validated v7 key sets");
+        let update = updates
+            .iter()
+            .find(|update| update.identity == effect.identity)
+            .expect("confirmed key set checked above");
+        if pin.table_key != effect.table_key
+            || update.table_key != effect.table_key
+            || committed != planned
+            || update.table_version != pin.post_commit_pin
+            || update.table_branch != pin.table_branch
+        {
+            return Err(OmniError::manifest_internal(format!(
+                "SchemaApply sidecar '{}' table '{}' achieved transaction/version/branch outside its exact plan; leaving recovery Armed",
+                sidecar.operation_id, effect.table_key
+            )));
+        }
+    }
+
+    let mut confirmed = sidecar.clone();
+    let confirmed_protocol = confirmed
+        .protocol_v7
+        .as_mut()
+        .expect("validated schema-v7 protocol");
+    for effect in &mut confirmed_protocol.effects {
+        effect.kind.set_confirmed_transaction(
+            committed_transactions
+                .get(&effect.identity)
+                .expect("confirmed key set checked above")
+                .clone(),
+        );
+    }
+    for slot in &mut confirmed_protocol.intended_delta.table_updates {
+        let update = updates
+            .iter()
+            .find(|update| update.identity == slot.identity)
+            .expect("confirmed key set checked above");
+        slot.confirmed = Some(RecoveryConfirmedTableUpdate {
+            table_version: update.table_version,
+            table_branch: update.table_branch.clone(),
+            row_count: update.row_count,
+            version_metadata: update.version_metadata.clone(),
+        });
+    }
+    for pin in &mut confirmed.tables {
+        let update = updates
+            .iter()
+            .find(|update| update.identity == pin.identity)
+            .expect("confirmed key set checked above");
+        pin.confirmed_version = Some(update.table_version);
+    }
+    confirmed_protocol.effect_phase = RecoveryEffectPhase::EffectsConfirmed;
+
+    let uri = sidecar_uri(root_uri, &confirmed.operation_id);
+    validate_sidecar_shape(&uri, &confirmed)?;
+    let json = serde_json::to_string_pretty(&confirmed).map_err(|error| {
+        OmniError::manifest_internal(format!(
+            "failed to serialize confirmed SchemaApply sidecar: {error}"
+        ))
+    })?;
+    storage.write_text(&uri, &json).await?;
+    *sidecar = confirmed;
+    Ok(())
+}
+
+/// Arm the RFC-022 BranchMerge recovery protocol.
+///
+/// `tables` and `effects` describe only independently durable physical work;
+/// `intended_delta.table_updates` is deliberately allowed to be a superset so
+/// pointer-only manifest updates are recovered in the same exact graph commit.
+/// Every physical output remains unconfirmed until
+/// [`confirm_branch_merge_sidecar_v9`] atomically binds the full delta.
+pub(crate) fn new_branch_merge_sidecar_v9(
+    branch: Option<String>,
+    actor_id: Option<String>,
+    tables: Vec<SidecarTablePin>,
+    authority: RecoveryAuthorityToken,
+    lineage: RecoveryLineageIntent,
+    effects: Vec<RecoveryBranchMergeEffect>,
+    intended_delta: RecoveryManifestDelta,
+) -> Result<RecoverySidecar> {
+    let operation_id = ulid::Ulid::new().to_string();
+    let started_at = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => duration.as_micros().to_string(),
+        Err(_) => "0".to_string(),
+    };
+    let sidecar = RecoverySidecar {
+        schema_version: IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION,
+        operation_id,
+        started_at,
+        branch,
+        actor_id,
+        writer_kind: SidecarKind::BranchMerge,
+        tables,
+        merge_source_commit_id: None,
+        additional_registrations: Vec::new(),
+        tombstones: Vec::new(),
+        schema_apply_manifest_published: false,
+        schema_apply_target_schema_ir_hash: None,
+        protocol_v3: None,
+        protocol_v4: Some(RecoveryProtocolV4 {
+            authority,
+            lineage,
+            rollback_graph_commit_id: ulid::Ulid::new().to_string(),
+            rollback_audit_outcomes: None,
+            effect_phase: RecoveryEffectPhase::Armed,
+            effects,
+            intended_delta,
+        }),
+        protocol_v7: None,
+        protocol_v8: None,
+        ensure_indices_rollback_v6: None,
+    };
+    validate_sidecar_shape("<new-branch-merge-sidecar>", &sidecar)?;
+    Ok(sidecar)
+}
+
+/// Durably transition a v4 BranchMerge sidecar from Armed to
+/// EffectsConfirmed. `updates` is the complete manifest output, including
+/// pointer-only slots with no physical effect. First-touch physical effects
+/// additionally supply the exact Lance target-ref identity minted during
+/// creation; existing-ref effects must not appear in that map.
+pub(crate) async fn confirm_branch_merge_sidecar_v9(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    sidecar: &mut RecoverySidecar,
+    updates: &[SubTableUpdate],
+    confirmed_ref_identifiers: &HashMap<TableIdentity, lance::dataset::refs::BranchIdentifier>,
+) -> Result<()> {
+    crate::failpoints::maybe_fail(crate::failpoints::names::RECOVERY_SIDECAR_CONFIRM)?;
+    let uri = sidecar_uri(root_uri, &sidecar.operation_id);
+    validate_sidecar_shape(&uri, sidecar)?;
+    let protocol = sidecar.protocol_v4.as_ref().ok_or_else(|| {
+        OmniError::manifest_internal(
+            "confirm_branch_merge_sidecar_v9 requires a schema-v9 BranchMerge sidecar",
+        )
+    })?;
+    if protocol.effect_phase != RecoveryEffectPhase::Armed {
+        return Err(OmniError::manifest_internal(format!(
+            "BranchMerge sidecar '{}' is already EffectsConfirmed",
+            sidecar.operation_id
+        )));
+    }
+
+    let update_ids: HashSet<TableIdentity> = updates.iter().map(|update| update.identity).collect();
+    let delta_ids: HashSet<TableIdentity> = protocol
+        .intended_delta
+        .table_updates
+        .iter()
+        .map(|slot| slot.identity)
+        .collect();
+    if update_ids.len() != updates.len() || update_ids != delta_ids {
+        return Err(OmniError::manifest_internal(format!(
+            "BranchMerge sidecar '{}' confirmation updates differ from its complete intended delta",
+            sidecar.operation_id
+        )));
+    }
+    let first_touch_ids: HashSet<TableIdentity> = protocol
+        .effects
+        .iter()
+        .filter(|effect| effect.kind.source_fork_version().is_some())
+        .map(|effect| effect.identity)
+        .collect();
+    let confirmed_ref_ids: HashSet<TableIdentity> =
+        confirmed_ref_identifiers.keys().copied().collect();
+    if confirmed_ref_ids != first_touch_ids {
+        return Err(OmniError::manifest_internal(format!(
+            "BranchMerge sidecar '{}' confirmed target-ref set differs from its first-touch effects",
+            sidecar.operation_id
+        )));
+    }
+
+    for slot in &protocol.intended_delta.table_updates {
+        let update = updates
+            .iter()
+            .find(|update| update.identity == slot.identity)
+            .expect("update/delta key sets checked above");
+        if update.table_key != slot.table_key || update.table_branch != slot.table_branch {
+            return Err(OmniError::manifest_internal(format!(
+                "BranchMerge sidecar '{}' table '{}' achieved output branch {:?}, planned {:?}",
+                sidecar.operation_id, slot.table_key, update.table_branch, slot.table_branch
+            )));
+        }
+    }
+    for effect in &protocol.effects {
+        let pin = sidecar
+            .tables
+            .iter()
+            .find(|pin| pin.identity == effect.identity)
+            .expect("v4 shape validated effect/pin key sets");
+        let update = updates
+            .iter()
+            .find(|update| update.identity == effect.identity)
+            .expect("physical effect is a delta-slot subset");
+        if pin.table_key != effect.table_key || update.table_key != effect.table_key {
+            return Err(OmniError::manifest_internal(format!(
+                "BranchMerge sidecar '{}' identity {} has inconsistent diagnostic aliases",
+                sidecar.operation_id, effect.identity
+            )));
+        }
+        let observed = observe_branch_merge_target_ref(pin).await?.ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "BranchMerge sidecar '{}' cannot confirm missing target ref for table '{}'",
+                sidecar.operation_id, effect.table_key
+            ))
+        })?;
+        if observed.version != update.table_version {
+            return Err(OmniError::manifest_internal(format!(
+                "BranchMerge sidecar '{}' table '{}' observed HEAD {}, achieved update says {}",
+                sidecar.operation_id, effect.table_key, observed.version, update.table_version
+            )));
+        }
+        if let Some(source_fork_version) = effect.kind.source_fork_version() {
+            if observed.parent_version != Some(source_fork_version) {
+                return Err(OmniError::manifest_internal(format!(
+                    "BranchMerge sidecar '{}' table '{}' target ref parent is {:?}, exact fork version is {}",
+                    sidecar.operation_id,
+                    effect.table_key,
+                    observed.parent_version,
+                    source_fork_version
+                )));
+            }
+            let expected_identifier = confirmed_ref_identifiers
+                .get(&effect.identity)
+                .expect("confirmed first-touch ref key set checked above");
+            if &observed.branch_identifier != expected_identifier {
+                return Err(OmniError::manifest_internal(format!(
+                    "BranchMerge sidecar '{}' table '{}' target ref identity differs from the writer's achieved identity",
+                    sidecar.operation_id, effect.table_key
+                )));
+            }
+        }
+        match &effect.kind {
+            RecoveryBranchMergeEffectKind::MultiCommitHead {
+                planned_transactions,
+                ..
+            } => {
+                let planned_final_version = planned_transactions
+                    .last()
+                    .expect("v4 shape validation requires a non-empty transaction chain")
+                    .read_version
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        OmniError::manifest_internal(format!(
+                            "BranchMerge sidecar '{}' planned transaction chain for '{}' overflows its final output version",
+                            sidecar.operation_id, effect.table_key
+                        ))
+                    })?;
+                if update.table_version < planned_final_version {
+                    return Err(OmniError::manifest_internal(format!(
+                        "BranchMerge sidecar '{}' multi-commit table '{}' stopped before its complete planned transaction chain ({} < {})",
+                        sidecar.operation_id,
+                        effect.table_key,
+                        update.table_version,
+                        planned_final_version
+                    )));
+                }
+                let proof = prove_branch_merge_multi_commit_effect(
+                    &observed,
+                    planned_transactions,
+                    pin.expected_version,
+                    &effect.table_key,
+                )
+                .await?;
+                if proof.effect_ownership != EffectOwnership::OwnAtHead
+                    || !proof.full_effect_at_head
+                    || proof.unsafe_reason.is_some()
+                {
+                    return Err(OmniError::manifest_internal(format!(
+                        "BranchMerge sidecar '{}' cannot confirm unproven transaction chain for table '{}': {}",
+                        sidecar.operation_id,
+                        effect.table_key,
+                        proof
+                            .unsafe_reason
+                            .as_deref()
+                            .unwrap_or("the full exact effect is not at HEAD")
+                    )));
+                }
+            }
+            RecoveryBranchMergeEffectKind::RefOnlyFork { source_version, .. } => {
+                if update.table_version != *source_version {
+                    return Err(OmniError::manifest_internal(format!(
+                        "BranchMerge sidecar '{}' ref-only table '{}' achieved version {}, exact fork version {}",
+                        sidecar.operation_id,
+                        effect.table_key,
+                        update.table_version,
+                        source_version
+                    )));
+                }
+            }
+        }
+    }
+
+    let mut confirmed = sidecar.clone();
+    let confirmed_protocol = confirmed
+        .protocol_v4
+        .as_mut()
+        .expect("validated v4 protocol");
+    for slot in &mut confirmed_protocol.intended_delta.table_updates {
+        let update = updates
+            .iter()
+            .find(|update| update.identity == slot.identity)
+            .expect("update/delta key sets checked above");
+        slot.confirmed = Some(RecoveryConfirmedTableUpdate {
+            table_version: update.table_version,
+            table_branch: update.table_branch.clone(),
+            row_count: update.row_count,
+            version_metadata: update.version_metadata.clone(),
+        });
+    }
+    for effect in &mut confirmed_protocol.effects {
+        let update = updates
+            .iter()
+            .find(|update| update.identity == effect.identity)
+            .expect("physical effect is a delta-slot subset");
+        let ref_identifier = confirmed_ref_identifiers.get(&effect.identity).cloned();
+        match &mut effect.kind {
+            RecoveryBranchMergeEffectKind::MultiCommitHead {
+                confirmed_version,
+                confirmed_branch_identifier,
+                ..
+            } => {
+                *confirmed_version = Some(update.table_version);
+                *confirmed_branch_identifier = ref_identifier;
+            }
+            RecoveryBranchMergeEffectKind::RefOnlyFork {
+                confirmed_branch_identifier,
+                ..
+            } => {
+                *confirmed_branch_identifier = ref_identifier;
+            }
+        }
+    }
+    for pin in &mut confirmed.tables {
+        let update = updates
+            .iter()
+            .find(|update| update.identity == pin.identity)
+            .expect("effect/pin keys are delta-slot subset");
+        pin.confirmed_version = Some(update.table_version);
+    }
+    confirmed_protocol.effect_phase = RecoveryEffectPhase::EffectsConfirmed;
+
+    validate_sidecar_shape(&uri, &confirmed)?;
+    let json = serde_json::to_string_pretty(&confirmed).map_err(|error| {
+        OmniError::manifest_internal(format!(
+            "failed to serialize confirmed BranchMerge recovery sidecar: {error}"
+        ))
+    })?;
+    storage.write_text(&uri, &json).await?;
+    *sidecar = confirmed;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::storage::ObjectStorageAdapter;
-    use lance::Dataset;
+    use crate::storage_layer::IndexBuildSpec;
     use crate::table_store::TableStore;
-    use arrow_array::{Int32Array, RecordBatch, StringArray};
+    use arrow_array::{Array, Int32Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
+    #[cfg(feature = "failpoints")]
+    use futures::TryStreamExt;
+    use lance::Dataset;
     use std::sync::Arc;
 
     fn person_schema() -> Arc<Schema> {
@@ -2018,10 +9031,24 @@ mod tests {
         .unwrap()
     }
 
-    fn make_pin(table_key: &str, table_path: &str, expected: u64, post: u64) -> SidecarTablePin {
+    fn test_identity(table_key: &str) -> TableIdentity {
+        match table_key {
+            "node:Person" => TableIdentity::new(1, 11).unwrap(),
+            "node:Company" => TableIdentity::new(2, 22).unwrap(),
+            "edge:WorksAt" => TableIdentity::new(3, 33).unwrap(),
+            other => panic!("test table '{other}' has no explicit identity"),
+        }
+    }
+
+    fn make_pin(table_key: &str, _table_path: &str, expected: u64, post: u64) -> SidecarTablePin {
+        let identity = test_identity(table_key);
         SidecarTablePin {
+            identity,
             table_key: table_key.to_string(),
-            table_path: table_path.to_string(),
+            table_path: format!(
+                "memory://test-graph/{}",
+                crate::db::manifest::table_path_for_identity(table_key, identity).unwrap()
+            ),
             expected_version: expected,
             post_commit_pin: post,
             confirmed_version: None,
@@ -2029,23 +9056,802 @@ mod tests {
         }
     }
 
-    #[test]
-    fn sidecar_round_trips_through_json() {
-        let original = new_sidecar(
+    fn bind_sidecar_pins_to_root(sidecar: &mut RecoverySidecar, root: &str) {
+        for pin in &mut sidecar.tables {
+            let relative =
+                crate::db::manifest::table_path_for_identity(&pin.table_key, pin.identity).unwrap();
+            pin.table_path = format!("{}/{relative}", root.trim_end_matches('/'));
+        }
+    }
+
+    fn transaction(read_version: u64, uuid: &str) -> StagedTransactionIdentity {
+        StagedTransactionIdentity {
+            read_version,
+            uuid: uuid.to_string(),
+        }
+    }
+
+    fn occ_sidecar() -> RecoverySidecar {
+        let planned = transaction(5, "planned-transaction");
+        let identity = test_identity("node:Person");
+        new_occ_sidecar_v9(
             SidecarKind::Mutation,
-            Some("main".to_string()),
+            None,
             Some("act-alice".to_string()),
             vec![make_pin("node:Person", "file:///tmp/people.lance", 5, 6)],
-        );
+            RecoveryAuthorityToken {
+                branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
+                graph_head: Some("01H000000000000000000000AA".to_string()),
+                schema_identity_domain: "domain-a".to_string(),
+                schema_ir_hash: "schema-hash".to_string(),
+                schema_identity_version: 1,
+            },
+            RecoveryLineageIntent {
+                graph_commit_id: "01H000000000000000000000BB".to_string(),
+                branch: None,
+                actor_id: Some("act-alice".to_string()),
+                merged_parent_commit_id: None,
+                created_at: 123,
+            },
+            HashMap::from([(identity, planned)]),
+        )
+        .unwrap()
+    }
+
+    fn test_branch_identifier(
+        version: u64,
+        suffix: &str,
+    ) -> lance::dataset::refs::BranchIdentifier {
+        lance::dataset::refs::BranchIdentifier {
+            version_mapping: vec![(version, suffix.to_string())],
+        }
+    }
+
+    #[test]
+    fn sidecar_round_trips_through_json() {
+        let original = new_optimize_sidecar_v9(vec![make_pin(
+            "node:Person",
+            "file:///tmp/people.lance",
+            5,
+            6,
+        )])
+        .unwrap();
         let json = serde_json::to_string(&original).unwrap();
         let parsed = parse_sidecar("file:///tmp/__recovery/x.json", &json).unwrap();
-        assert_eq!(parsed.schema_version, SIDECAR_SCHEMA_VERSION);
+        assert_eq!(parsed.schema_version, IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION);
         assert_eq!(parsed.operation_id, original.operation_id);
-        assert_eq!(parsed.writer_kind, SidecarKind::Mutation);
-        assert_eq!(parsed.branch.as_deref(), Some("main"));
-        assert_eq!(parsed.actor_id.as_deref(), Some("act-alice"));
+        assert_eq!(parsed.writer_kind, SidecarKind::Optimize);
+        assert_eq!(parsed.branch, None);
+        assert_eq!(parsed.actor_id, None);
         assert_eq!(parsed.tables.len(), 1);
         assert_eq!(parsed.tables[0].table_key, "node:Person");
+    }
+
+    #[test]
+    fn pre_v9_sidecars_missing_identity_fail_closed() {
+        for schema_version in [MUTATION_LOAD_SIDECAR_SCHEMA_VERSION, 8] {
+            let mut value = serde_json::to_value(occ_sidecar()).unwrap();
+            value["schema_version"] = serde_json::json!(schema_version);
+            value["tables"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("identity");
+            let error = parse_sidecar(
+                &format!("memory://graph/__recovery/pre-v9-{schema_version}.json"),
+                &serde_json::to_string(&value).unwrap(),
+            )
+            .expect_err("a pre-v9 artifact without explicit identity must never be inferred");
+            assert!(
+                error.to_string().contains("missing field `identity`"),
+                "expected missing-identity refusal, got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_apply_v9_round_trips_metadata_only_rename_with_fixed_occ() {
+        let identity = test_identity("node:Person");
+        let path = crate::db::manifest::table_path_for_identity("node:Person", identity).unwrap();
+        let sidecar = new_schema_apply_sidecar_v9(
+            Some("act-schema".to_string()),
+            Vec::new(),
+            RecoveryAuthorityToken {
+                branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
+                graph_head: Some("01H000000000000000000000R0".to_string()),
+                schema_identity_domain: "domain-a".to_string(),
+                schema_ir_hash: "accepted-schema".to_string(),
+                schema_identity_version: 1,
+            },
+            RecoveryLineageIntent {
+                graph_commit_id: "01H000000000000000000000R1".to_string(),
+                branch: None,
+                actor_id: Some("act-schema".to_string()),
+                merged_parent_commit_id: None,
+                created_at: 790,
+            },
+            Vec::new(),
+            RecoveryManifestDelta {
+                table_updates: Vec::new(),
+                registrations: Vec::new(),
+                renames: vec![SidecarTableRename {
+                    identity,
+                    expected_table_key: "node:Person".to_string(),
+                    expected_version: 5,
+                    table_key: "node:Human".to_string(),
+                    table_path: path.clone(),
+                }],
+                tombstones: Vec::new(),
+            },
+            "target-schema".to_string(),
+        )
+        .unwrap();
+
+        let json = serde_json::to_string(&sidecar).unwrap();
+        let parsed = parse_sidecar("memory://graph/__recovery/rename-v9.json", &json).unwrap();
+        let rename = &parsed.protocol_v7.as_ref().unwrap().intended_delta.renames[0];
+        assert_eq!(rename.identity, identity);
+        assert_eq!(rename.expected_version, 5);
+        assert_eq!(rename.table_path, path);
+        assert!(parsed.tables.is_empty());
+
+        let mut missing_occ = sidecar;
+        missing_occ
+            .protocol_v7
+            .as_mut()
+            .unwrap()
+            .intended_delta
+            .renames[0]
+            .expected_version = 0;
+        let error = validate_sidecar_shape("<rename-without-occ>", &missing_occ)
+            .expect_err("metadata-only rename must carry fixed table-version authority");
+        assert!(error.to_string().contains("live expected version"));
+    }
+
+    #[test]
+    fn schema_apply_confirmation_fields_are_version_gated() {
+        let legacy = new_unvalidated_sidecar(
+            LEGACY_SIDECAR_SCHEMA_VERSION,
+            SidecarKind::SchemaApply,
+            None,
+            None,
+            Vec::new(),
+        );
+        let legacy_json = serde_json::to_string(&legacy).unwrap();
+        parse_sidecar("file:///tmp/__recovery/legacy-schema.json", &legacy_json)
+            .expect("plain schema-v2 SchemaApply remains readable");
+
+        let mut wrong_version = legacy.clone();
+        wrong_version.schema_apply_target_schema_ir_hash = Some("target-hash".to_string());
+        let wrong_json = serde_json::to_string(&wrong_version).unwrap();
+        let error = parse_sidecar(
+            "file:///tmp/__recovery/wrong-version-schema.json",
+            &wrong_json,
+        )
+        .expect_err("schema-v2 must not opt into schema-v5 confirmation semantics");
+        assert!(error.to_string().contains("require schema-v5"));
+
+        wrong_version.schema_version = SCHEMA_APPLY_CONFIRMATION_SCHEMA_VERSION;
+        let v5_json = serde_json::to_string(&wrong_version).unwrap();
+        parse_sidecar("file:///tmp/__recovery/schema-v5.json", &v5_json)
+            .expect("schema-v5 accepts a target identity before Phase C confirmation");
+    }
+
+    #[test]
+    fn schema_apply_v7_sidecar_round_trips_exact_first_touch_envelope() {
+        let planned = transaction(0, "schema-create-company");
+        let identity = test_identity("node:Company");
+        let sidecar = new_schema_apply_sidecar_v9(
+            Some("act-schema".to_string()),
+            vec![make_pin(
+                "node:Company",
+                "memory://graph/nodes/company",
+                0,
+                1,
+            )],
+            RecoveryAuthorityToken {
+                branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
+                graph_head: Some("01H000000000000000000000S0".to_string()),
+                schema_identity_domain: "domain-a".to_string(),
+                schema_ir_hash: "accepted-schema".to_string(),
+                schema_identity_version: 1,
+            },
+            RecoveryLineageIntent {
+                graph_commit_id: "01H000000000000000000000S1".to_string(),
+                branch: None,
+                actor_id: Some("act-schema".to_string()),
+                merged_parent_commit_id: None,
+                created_at: 789,
+            },
+            vec![RecoverySchemaApplyEffect {
+                identity,
+                table_key: "node:Company".to_string(),
+                kind: RecoverySchemaApplyEffectKind::FirstTouchDataset {
+                    planned_transaction: planned,
+                    confirmed_transaction: None,
+                },
+            }],
+            RecoveryManifestDelta {
+                table_updates: vec![RecoveryTableUpdateSlot {
+                    identity,
+                    table_key: "node:Company".to_string(),
+                    expected_version: 0,
+                    table_branch: None,
+                    confirmed: None,
+                }],
+                registrations: vec![SidecarTableRegistration {
+                    identity,
+                    table_key: "node:Company".to_string(),
+                    table_path: crate::db::manifest::table_path_for_identity(
+                        "node:Company",
+                        identity,
+                    )
+                    .unwrap(),
+                    table_branch: None,
+                }],
+                renames: Vec::new(),
+                tombstones: Vec::new(),
+            },
+            "target-schema".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            sidecar.schema_version,
+            IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION
+        );
+        assert_eq!(
+            sidecar.protocol_v7.as_ref().unwrap().effect_phase,
+            RecoveryEffectPhase::Armed
+        );
+        let json = serde_json::to_string(&sidecar).unwrap();
+        let parsed = parse_sidecar("memory://graph/__recovery/schema-v9.json", &json).unwrap();
+        assert_eq!(parsed.actor_id.as_deref(), Some("act-schema"));
+
+        let mut missing_registration = sidecar;
+        missing_registration
+            .protocol_v7
+            .as_mut()
+            .unwrap()
+            .intended_delta
+            .registrations
+            .clear();
+        let error = validate_sidecar_shape("<missing-registration>", &missing_registration)
+            .expect_err("first-touch ownership must have a matching registration");
+        assert!(error.to_string().contains("first-touch effects must match"));
+    }
+
+    #[test]
+    fn ensure_indices_fixed_rollback_is_version_gated() {
+        let pin = make_pin("node:Person", "file:///tmp/people.lance", 5, 6);
+        let legacy = new_unvalidated_sidecar(
+            LEGACY_SIDECAR_SCHEMA_VERSION,
+            SidecarKind::EnsureIndices,
+            Some("feature".to_string()),
+            None,
+            vec![pin.clone()],
+        );
+        let legacy_json = serde_json::to_string(&legacy).unwrap();
+        parse_sidecar("file:///tmp/__recovery/legacy-index.json", &legacy_json)
+            .expect("plain schema-v2 EnsureIndices remains readable");
+
+        let current =
+            new_ensure_indices_sidecar_v6(Some("feature".to_string()), vec![pin]).unwrap();
+        assert_eq!(
+            current.schema_version,
+            ENSURE_INDICES_ROLLBACK_SCHEMA_VERSION
+        );
+        assert!(current.ensure_indices_rollback_v6.is_some());
+        let current_json = serde_json::to_string(&current).unwrap();
+        parse_sidecar("file:///tmp/__recovery/index-v6.json", &current_json)
+            .expect("schema-v6 accepts the fixed rollback payload");
+
+        let mut wrong_version = current;
+        wrong_version.schema_version = LEGACY_SIDECAR_SCHEMA_VERSION;
+        let wrong_json = serde_json::to_string(&wrong_version).unwrap();
+        let error = parse_sidecar(
+            "file:///tmp/__recovery/wrong-version-index.json",
+            &wrong_json,
+        )
+        .expect_err("schema-v2 must not opt into schema-v6 rollback semantics");
+        assert!(error.to_string().contains("requires schema-v6"));
+    }
+
+    #[test]
+    fn ensure_indices_v9_round_trips_existing_and_first_touch_effects() {
+        let mut existing = make_pin("node:Person", "file:///tmp/people.lance", 5, 6);
+        existing.table_branch = Some("feature".to_string());
+        let mut first_touch = make_pin("node:Company", "file:///tmp/companies.lance", 3, 4);
+        first_touch.table_branch = Some("feature".to_string());
+        let person_identity = existing.identity;
+        let company_identity = first_touch.identity;
+        let sidecar = new_ensure_indices_sidecar_v9(
+            Some("feature".to_string()),
+            None,
+            vec![existing, first_touch],
+            RecoveryAuthorityToken {
+                branch_identifier: test_branch_identifier(8, "graph-feature"),
+                graph_head: Some("01H000000000000000000000I0".to_string()),
+                schema_identity_domain: "domain-a".to_string(),
+                schema_ir_hash: "schema-hash".to_string(),
+                schema_identity_version: 1,
+            },
+            RecoveryLineageIntent {
+                graph_commit_id: "01H000000000000000000000I1".to_string(),
+                branch: Some("feature".to_string()),
+                actor_id: None,
+                merged_parent_commit_id: None,
+                created_at: 456,
+            },
+            HashMap::from([
+                (person_identity, transaction(5, "index-person")),
+                (company_identity, transaction(3, "index-company")),
+            ]),
+            HashMap::from([(company_identity, 3)]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            sidecar.schema_version,
+            IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION
+        );
+        assert!(sidecar.ensure_indices_rollback_v6.is_none());
+        let protocol = sidecar.protocol_v8.as_ref().unwrap();
+        assert_eq!(protocol.effect_phase, RecoveryEffectPhase::Armed);
+        assert!(
+            protocol
+                .effects
+                .iter()
+                .find(|effect| effect.table_key == "node:Person")
+                .unwrap()
+                .source_fork_version
+                .is_none(),
+            "an existing branch-owned ref must not be reinterpreted as first-touch"
+        );
+        assert_eq!(
+            protocol
+                .effects
+                .iter()
+                .find(|effect| effect.table_key == "node:Company")
+                .unwrap()
+                .source_fork_version,
+            Some(3)
+        );
+        let json = serde_json::to_string(&sidecar).unwrap();
+        parse_sidecar("file:///tmp/__recovery/index-v9.json", &json)
+            .expect("schema-v9 exact EnsureIndices sidecar round-trips");
+
+        let mut wrong_fork = sidecar;
+        wrong_fork
+            .protocol_v8
+            .as_mut()
+            .unwrap()
+            .effects
+            .iter_mut()
+            .find(|effect| effect.table_key == "node:Company")
+            .unwrap()
+            .source_fork_version = Some(2);
+        let error = validate_sidecar_shape("<wrong-index-fork>", &wrong_fork)
+            .expect_err("first-touch source must equal the exact manifest pin");
+        assert!(error.to_string().contains("first-touch fork identity"));
+    }
+
+    #[test]
+    fn occ_sidecar_round_trips_armed_with_stable_ids_and_exact_effect() {
+        let original = occ_sidecar();
+        assert_eq!(
+            original.schema_version,
+            IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION
+        );
+        let protocol = original.protocol_v3.as_ref().unwrap();
+        assert_eq!(protocol.effect_phase, RecoveryEffectPhase::Armed);
+        assert_eq!(protocol.effects.len(), 1);
+        assert_eq!(
+            protocol.effects[0].planned_transaction,
+            transaction(5, "planned-transaction")
+        );
+        assert!(!protocol.rollback_graph_commit_id.is_empty());
+        assert_eq!(
+            protocol.lineage.graph_commit_id,
+            "01H000000000000000000000BB"
+        );
+
+        let json = serde_json::to_string(&original).unwrap();
+        let parsed = parse_sidecar("memory://graph/__recovery/op.json", &json).unwrap();
+        assert_eq!(
+            parsed.protocol_v3.as_ref().unwrap().authority,
+            protocol.authority
+        );
+
+        let pin = &parsed.tables[0];
+        assert_eq!(
+            classify_table_observation(
+                pin,
+                6,
+                Some(&transaction(5, "planned-transaction")),
+                5,
+                SidecarKind::Mutation,
+                SIDECAR_SCHEMA_VERSION,
+                parsed.protocol_v3.as_ref(),
+            ),
+            TableClassification::IncompletePhaseB,
+            "an Armed sidecar must roll back even when its planned transaction is at HEAD"
+        );
+    }
+
+    #[tokio::test]
+    async fn branch_merge_v9_arms_multi_commit_ref_only_and_pointer_slots() {
+        let root = "test-graph";
+        let storage = ObjectStorageAdapter::in_memory();
+        let target_identifier = test_branch_identifier(3, "target-incarnation");
+        let lineage = RecoveryLineageIntent {
+            graph_commit_id: "01H000000000000000000000M1".to_string(),
+            branch: Some("target".to_string()),
+            actor_id: Some("act-merge".to_string()),
+            merged_parent_commit_id: Some("01H000000000000000000000S1".to_string()),
+            created_at: 456,
+        };
+        let mut multi_pin = make_pin("node:Person", "memory://person", 5, 6);
+        multi_pin.table_branch = Some("target".to_string());
+        let mut ref_pin = make_pin("node:Company", "memory://company", 4, 8);
+        ref_pin.table_branch = Some("target".to_string());
+        let person_identity = multi_pin.identity;
+        let company_identity = ref_pin.identity;
+        let works_at_identity = test_identity("edge:WorksAt");
+        let effects = vec![
+            RecoveryBranchMergeEffect {
+                identity: person_identity,
+                table_key: "node:Person".to_string(),
+                kind: RecoveryBranchMergeEffectKind::MultiCommitHead {
+                    source_fork_version: Some(5),
+                    planned_transactions: vec![
+                        transaction(5, "merge-person-append"),
+                        transaction(6, "merge-person-delete"),
+                    ],
+                    confirmed_version: None,
+                    confirmed_branch_identifier: None,
+                },
+            },
+            RecoveryBranchMergeEffect {
+                identity: company_identity,
+                table_key: "node:Company".to_string(),
+                kind: RecoveryBranchMergeEffectKind::RefOnlyFork {
+                    // Deliberately differs from the target manifest CAS pin (4):
+                    // ref cleanup must use this exact SOURCE fork point.
+                    source_version: 8,
+                    confirmed_branch_identifier: None,
+                },
+            },
+        ];
+        let intended_delta = RecoveryManifestDelta {
+            table_updates: vec![
+                RecoveryTableUpdateSlot {
+                    identity: person_identity,
+                    table_key: "node:Person".to_string(),
+                    expected_version: 5,
+                    table_branch: Some("target".to_string()),
+                    confirmed: None,
+                },
+                RecoveryTableUpdateSlot {
+                    identity: company_identity,
+                    table_key: "node:Company".to_string(),
+                    expected_version: 4,
+                    table_branch: Some("target".to_string()),
+                    confirmed: None,
+                },
+                // No physical effect/pin: recovery must still publish this
+                // pointer-only output in the same fixed merge commit.
+                RecoveryTableUpdateSlot {
+                    identity: works_at_identity,
+                    table_key: "edge:WorksAt".to_string(),
+                    expected_version: 2,
+                    table_branch: None,
+                    confirmed: None,
+                },
+            ],
+            registrations: Vec::new(),
+            renames: Vec::new(),
+            tombstones: Vec::new(),
+        };
+        let mut sidecar = new_branch_merge_sidecar_v9(
+            Some("target".to_string()),
+            Some("act-merge".to_string()),
+            vec![multi_pin, ref_pin],
+            RecoveryAuthorityToken {
+                branch_identifier: target_identifier,
+                graph_head: Some("01H000000000000000000000T1".to_string()),
+                schema_identity_domain: "domain-a".to_string(),
+                schema_ir_hash: "schema-hash".to_string(),
+                schema_identity_version: 1,
+            },
+            lineage,
+            effects,
+            intended_delta,
+        )
+        .unwrap();
+        bind_sidecar_pins_to_root(&mut sidecar, root);
+        assert_eq!(
+            sidecar.schema_version,
+            IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION
+        );
+        assert!(sidecar.protocol_v3.is_none());
+        assert_eq!(
+            sidecar.protocol_v4.as_ref().unwrap().effect_phase,
+            RecoveryEffectPhase::Armed
+        );
+
+        let mut non_sequential = sidecar.clone();
+        let RecoveryBranchMergeEffectKind::MultiCommitHead {
+            planned_transactions,
+            ..
+        } = &mut non_sequential.protocol_v4.as_mut().unwrap().effects[0].kind
+        else {
+            panic!("first effect must be multi-commit")
+        };
+        planned_transactions[1].read_version = 9;
+        let error = validate_sidecar_shape("<non-sequential>", &non_sequential).unwrap_err();
+        assert!(error.to_string().contains("expected 6"));
+
+        let mut oversized = sidecar.clone();
+        let RecoveryBranchMergeEffectKind::MultiCommitHead {
+            planned_transactions,
+            ..
+        } = &mut oversized.protocol_v4.as_mut().unwrap().effects[0].kind
+        else {
+            panic!("first effect must be multi-commit")
+        };
+        *planned_transactions = (0..=MAX_BRANCH_MERGE_DATA_TRANSACTIONS)
+            .map(|offset| transaction(5 + offset, &format!("merge-person-{offset}")))
+            .collect();
+        let error = validate_sidecar_shape("<oversized-chain>", &oversized).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("exceeding the recovery-safe limit of 1024"),
+            "unexpected oversized-chain error: {error}"
+        );
+
+        let mut mismatched_slot = sidecar.clone();
+        mismatched_slot
+            .protocol_v4
+            .as_mut()
+            .unwrap()
+            .intended_delta
+            .table_updates[0]
+            .expected_version = 4;
+        let error = validate_sidecar_shape("<mismatched-slot>", &mismatched_slot).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not match its physical table pin")
+        );
+
+        write_sidecar(root, &storage, &sidecar).await.unwrap();
+
+        let listed = list_sidecars(root, &storage).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].schema_version,
+            IDENTITY_AWARE_SIDECAR_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn parse_sidecar_refuses_v3_without_protocol_payload() {
+        let mut value = serde_json::to_value(occ_sidecar()).unwrap();
+        value.as_object_mut().unwrap().remove("protocol_v3");
+        let error = parse_sidecar(
+            "memory://graph/__recovery/op.json",
+            &serde_json::to_string(&value).unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("missing required protocol_v3"));
+    }
+
+    #[test]
+    fn parse_sidecar_refuses_mutation_with_multiple_writer_protocols() {
+        let mut sidecar = occ_sidecar();
+        let protocol_v3 = sidecar.protocol_v3.as_ref().unwrap();
+        sidecar.protocol_v7 = Some(RecoveryProtocolV7 {
+            authority: protocol_v3.authority.clone(),
+            lineage: protocol_v3.lineage.clone(),
+            rollback_graph_commit_id: "01H000000000000000000000BC".to_string(),
+            rollback_audit_outcomes: None,
+            target_schema_ir_hash: "foreign-schema-payload".to_string(),
+            effect_phase: RecoveryEffectPhase::Armed,
+            effects: Vec::new(),
+            intended_delta: RecoveryManifestDelta {
+                table_updates: Vec::new(),
+                registrations: Vec::new(),
+                renames: Vec::new(),
+                tombstones: Vec::new(),
+            },
+        });
+
+        let error = parse_sidecar(
+            "memory://graph/__recovery/multi-protocol.json",
+            &serde_json::to_string(&sidecar).unwrap(),
+        )
+        .expect_err("a v9 Mutation must not dispatch through a foreign payload");
+        assert!(
+            error
+                .to_string()
+                .contains("must carry only the protocol_v3 writer payload"),
+            "unexpected malformed-sidecar error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn identity_aware_sidecar_refuses_foreign_graph_root() {
+        let root = "own-graph";
+        let storage = ObjectStorageAdapter::in_memory();
+        let sidecar = occ_sidecar();
+        let uri = sidecar_uri(root, &sidecar.operation_id);
+        storage
+            .write_text(&uri, &serde_json::to_string(&sidecar).unwrap())
+            .await
+            .unwrap();
+
+        let error = list_sidecars(root, &storage)
+            .await
+            .expect_err("v9 recovery must never accept another graph's canonical table URI");
+        assert!(
+            error.to_string().contains("foreign or non-canonical URI"),
+            "unexpected foreign-root error: {error}"
+        );
+
+        storage.delete(&uri).await.unwrap();
+        let legacy = new_unvalidated_sidecar(
+            LEGACY_SIDECAR_SCHEMA_VERSION,
+            SidecarKind::Optimize,
+            None,
+            None,
+            vec![make_pin("node:Person", "memory://foreign", 5, 6)],
+        );
+        let legacy_uri = sidecar_uri(root, &legacy.operation_id);
+        storage
+            .write_text(&legacy_uri, &serde_json::to_string(&legacy).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            list_sidecars(root, &storage).await.unwrap().len(),
+            1,
+            "legacy sidecars retain their historical path interpretation"
+        );
+    }
+
+    #[test]
+    fn rollback_audit_plan_is_an_explicit_unique_subset_of_pins() {
+        let mut empty = occ_sidecar();
+        empty.protocol_v3.as_mut().unwrap().rollback_audit_outcomes = Some(Vec::new());
+        let json = serde_json::to_string(&empty).unwrap();
+        assert!(
+            json.contains("rollback_audit_outcomes"),
+            "Some(empty) must remain distinguishable from an unprepared None plan"
+        );
+        parse_sidecar("memory://graph/__recovery/empty.json", &json).unwrap();
+
+        let mut duplicate = occ_sidecar();
+        duplicate
+            .protocol_v3
+            .as_mut()
+            .unwrap()
+            .rollback_audit_outcomes = Some(vec![
+            TableOutcome {
+                table_key: "node:Person".to_string(),
+                from_version: 6,
+                to_version: 5,
+            },
+            TableOutcome {
+                table_key: "node:Person".to_string(),
+                from_version: 7,
+                to_version: 5,
+            },
+        ]);
+        let duplicate_error = parse_sidecar(
+            "memory://graph/__recovery/duplicate.json",
+            &serde_json::to_string(&duplicate).unwrap(),
+        )
+        .unwrap_err();
+        assert!(duplicate_error.to_string().contains("unique subset"));
+
+        let mut foreign = occ_sidecar();
+        foreign
+            .protocol_v3
+            .as_mut()
+            .unwrap()
+            .rollback_audit_outcomes = Some(vec![TableOutcome {
+            table_key: "node:Foreign".to_string(),
+            from_version: 2,
+            to_version: 1,
+        }]);
+        let foreign_error = parse_sidecar(
+            "memory://graph/__recovery/foreign.json",
+            &serde_json::to_string(&foreign).unwrap(),
+        )
+        .unwrap_err();
+        assert!(foreign_error.to_string().contains("unique subset"));
+    }
+
+    #[tokio::test]
+    async fn occ_confirmation_binds_exact_delta_and_rejects_foreign_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let storage = ObjectStorageAdapter::local();
+        let mut sidecar = occ_sidecar();
+        bind_sidecar_pins_to_root(&mut sidecar, root);
+        write_sidecar(root, &storage, &sidecar).await.unwrap();
+
+        let version_metadata: crate::db::manifest::TableVersionMetadata =
+            serde_json::from_value(serde_json::json!({
+                "manifest_path": "nodes/person/_versions/6.manifest",
+                "manifest_size": 42,
+                "e_tag": "etag-6",
+                "naming_scheme": "V2"
+            }))
+            .unwrap();
+        let updates = vec![SubTableUpdate {
+            identity: test_identity("node:Person"),
+            table_key: "node:Person".to_string(),
+            table_version: 6,
+            table_branch: None,
+            row_count: 7,
+            version_metadata,
+        }];
+        let committed = HashMap::from([(
+            test_identity("node:Person"),
+            transaction(5, "planned-transaction"),
+        )]);
+        let rebased = HashMap::from([(
+            test_identity("node:Person"),
+            transaction(6, "planned-transaction"),
+        )]);
+        let error = confirm_occ_sidecar_v9(root, &storage, &mut sidecar, &updates, &rebased)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("leaving recovery Armed"));
+        assert_eq!(
+            sidecar.protocol_v3.as_ref().unwrap().effect_phase,
+            RecoveryEffectPhase::Armed
+        );
+        confirm_occ_sidecar_v9(root, &storage, &mut sidecar, &updates, &committed)
+            .await
+            .unwrap();
+
+        let protocol = sidecar.protocol_v3.as_ref().unwrap();
+        assert_eq!(protocol.effect_phase, RecoveryEffectPhase::EffectsConfirmed);
+        assert_eq!(
+            protocol.intended_delta.table_updates[0]
+                .confirmed
+                .as_ref()
+                .unwrap()
+                .row_count,
+            7
+        );
+        let pin = &sidecar.tables[0];
+        assert_eq!(
+            classify_table_observation(
+                pin,
+                6,
+                Some(&transaction(5, "planned-transaction")),
+                5,
+                SidecarKind::Mutation,
+                SIDECAR_SCHEMA_VERSION,
+                Some(protocol),
+            ),
+            TableClassification::RolledPastExpected
+        );
+        assert_eq!(
+            classify_table_observation(
+                pin,
+                6,
+                Some(&transaction(5, "foreign-transaction")),
+                5,
+                SidecarKind::Mutation,
+                SIDECAR_SCHEMA_VERSION,
+                Some(protocol),
+            ),
+            TableClassification::UnexpectedEffectIdentity
+        );
     }
 
     #[test]
@@ -2081,7 +9887,13 @@ mod tests {
     fn classify_no_movement_when_head_equals_pinned() {
         let pin = make_pin("node:Person", "irrelevant", 5, 6);
         assert_eq!(
-            classify_table(&pin, 5, 5, SidecarKind::Mutation, SIDECAR_SCHEMA_VERSION),
+            classify_table(
+                &pin,
+                5,
+                5,
+                SidecarKind::Mutation,
+                LEGACY_SIDECAR_SCHEMA_VERSION,
+            ),
             TableClassification::NoMovement,
         );
     }
@@ -2090,7 +9902,13 @@ mod tests {
     fn classify_rolled_past_expected_when_sidecar_matches_strict() {
         let pin = make_pin("node:Person", "irrelevant", 5, 6);
         assert_eq!(
-            classify_table(&pin, 6, 5, SidecarKind::Mutation, SIDECAR_SCHEMA_VERSION),
+            classify_table(
+                &pin,
+                6,
+                5,
+                SidecarKind::Mutation,
+                LEGACY_SIDECAR_SCHEMA_VERSION,
+            ),
             TableClassification::RolledPastExpected,
         );
     }
@@ -2100,7 +9918,13 @@ mod tests {
         // Same +1 drift but post_commit_pin says it should be 7, not 6.
         let pin = make_pin("node:Person", "irrelevant", 5, 7);
         assert_eq!(
-            classify_table(&pin, 6, 5, SidecarKind::Mutation, SIDECAR_SCHEMA_VERSION),
+            classify_table(
+                &pin,
+                6,
+                5,
+                SidecarKind::Mutation,
+                LEGACY_SIDECAR_SCHEMA_VERSION,
+            ),
             TableClassification::UnexpectedAtP1,
         );
     }
@@ -2109,7 +9933,13 @@ mod tests {
     fn classify_unexpected_multistep_when_head_jumped_more_than_one_strict() {
         let pin = make_pin("node:Person", "irrelevant", 5, 6);
         assert_eq!(
-            classify_table(&pin, 8, 5, SidecarKind::Mutation, SIDECAR_SCHEMA_VERSION),
+            classify_table(
+                &pin,
+                8,
+                5,
+                SidecarKind::Mutation,
+                LEGACY_SIDECAR_SCHEMA_VERSION,
+            ),
             TableClassification::UnexpectedMultistep,
         );
     }
@@ -2118,12 +9948,18 @@ mod tests {
     fn classify_invariant_violation_when_head_below_pinned() {
         let pin = make_pin("node:Person", "irrelevant", 5, 6);
         assert_eq!(
-            classify_table(&pin, 3, 5, SidecarKind::Mutation, SIDECAR_SCHEMA_VERSION),
+            classify_table(
+                &pin,
+                3,
+                5,
+                SidecarKind::Mutation,
+                LEGACY_SIDECAR_SCHEMA_VERSION,
+            ),
             TableClassification::InvariantViolation { observed: 3 },
         );
     }
 
-    // Loose-match writers (SchemaApply, EnsureIndices) accept any
+    // Loose-match legacy writers (schema-v5 SchemaApply, EnsureIndices) accept any
     // lance_head > expected_version as RolledPastExpected when the
     // expected version still matches the manifest pin. The exact
     // post_commit_pin is allowed to be a lower bound.
@@ -2134,7 +9970,13 @@ mod tests {
         // built two indices). Strict would say UnexpectedMultistep; loose
         // accepts it as RolledPastExpected.
         assert_eq!(
-            classify_table(&pin, 8, 5, SidecarKind::SchemaApply, SIDECAR_SCHEMA_VERSION),
+            classify_table(
+                &pin,
+                8,
+                5,
+                SidecarKind::SchemaApply,
+                SCHEMA_APPLY_CONFIRMATION_SCHEMA_VERSION,
+            ),
             TableClassification::RolledPastExpected,
         );
     }
@@ -2143,7 +9985,13 @@ mod tests {
     fn classify_loose_match_accepts_multi_commit_drift_for_ensure_indices() {
         let pin = make_pin("node:Person", "irrelevant", 5, 6);
         assert_eq!(
-            classify_table(&pin, 9, 5, SidecarKind::EnsureIndices, SIDECAR_SCHEMA_VERSION),
+            classify_table(
+                &pin,
+                9,
+                5,
+                SidecarKind::EnsureIndices,
+                ENSURE_INDICES_ROLLBACK_SCHEMA_VERSION,
+            ),
             TableClassification::RolledPastExpected,
         );
     }
@@ -2152,7 +10000,13 @@ mod tests {
     fn classify_loose_match_no_movement_unchanged() {
         let pin = make_pin("node:Person", "irrelevant", 5, 6);
         assert_eq!(
-            classify_table(&pin, 5, 5, SidecarKind::SchemaApply, SIDECAR_SCHEMA_VERSION),
+            classify_table(
+                &pin,
+                5,
+                5,
+                SidecarKind::SchemaApply,
+                SCHEMA_APPLY_CONFIRMATION_SCHEMA_VERSION,
+            ),
             TableClassification::NoMovement,
         );
     }
@@ -2161,7 +10015,13 @@ mod tests {
     fn classify_loose_match_invariant_violation_unchanged() {
         let pin = make_pin("node:Person", "irrelevant", 5, 6);
         assert_eq!(
-            classify_table(&pin, 3, 5, SidecarKind::SchemaApply, SIDECAR_SCHEMA_VERSION),
+            classify_table(
+                &pin,
+                3,
+                5,
+                SidecarKind::SchemaApply,
+                SCHEMA_APPLY_CONFIRMATION_SCHEMA_VERSION,
+            ),
             TableClassification::InvariantViolation { observed: 3 },
         );
     }
@@ -2183,7 +10043,13 @@ mod tests {
         // partial Phase B → roll back.
         let unconfirmed = make_pin("node:Person", "irrelevant", 5, 6);
         assert_eq!(
-            classify_table(&unconfirmed, 8, 5, SidecarKind::BranchMerge, SIDECAR_SCHEMA_VERSION),
+            classify_table(
+                &unconfirmed,
+                8,
+                5,
+                SidecarKind::BranchMerge,
+                SIDECAR_SCHEMA_VERSION
+            ),
             TableClassification::IncompletePhaseB,
         );
         // Backward-compat: the SAME unconfirmed pin in a PRE-confirmation (v1)
@@ -2205,12 +10071,24 @@ mod tests {
             ..make_pin("node:Person", "irrelevant", 5, 6)
         };
         assert_eq!(
-            classify_table(&confirmed, 8, 5, SidecarKind::BranchMerge, SIDECAR_SCHEMA_VERSION),
+            classify_table(
+                &confirmed,
+                8,
+                5,
+                SidecarKind::BranchMerge,
+                SIDECAR_SCHEMA_VERSION
+            ),
             TableClassification::RolledPastExpected,
         );
         // Confirmed, but HEAD drifted past it (foreign writer) → roll back.
         assert_eq!(
-            classify_table(&confirmed, 9, 5, SidecarKind::BranchMerge, SIDECAR_SCHEMA_VERSION),
+            classify_table(
+                &confirmed,
+                9,
+                5,
+                SidecarKind::BranchMerge,
+                SIDECAR_SCHEMA_VERSION
+            ),
             TableClassification::UnexpectedMultistep,
         );
     }
@@ -2353,6 +10231,741 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exact_effect_observation_recognizes_interrupted_rollback_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+        let store = TableStore::new(
+            dir.path().to_str().unwrap(),
+            Arc::new(lance::session::Session::default()),
+        );
+        let ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
+            .await
+            .unwrap();
+        let staged = store
+            .stage_append(&ds, person_batch(&[("bob", Some(25))]), &[])
+            .await
+            .unwrap();
+        let planned = staged.transaction_identity();
+        let (committed, observed) = store
+            .commit_staged_exact(Arc::new(ds), staged)
+            .await
+            .unwrap();
+        assert_eq!(observed, planned);
+        assert_eq!(committed.version().version, 2);
+
+        // Model Full recovery crashing after Dataset::restore but before the
+        // restored HEAD is published to __manifest.
+        restore_table_to_version(&uri, None, 1).await.unwrap();
+        let observation = open_lance_head(&uri, None, Some((2, &planned, 1)))
+            .await
+            .unwrap();
+        assert_eq!(observation.version, 3);
+        assert_eq!(
+            observation.effect_ownership,
+            EffectOwnership::OwnCompensatedAtHead
+        );
+
+        // A later/foreign Restore is not proof that recovery compensated to
+        // the manifest pin. Exact target identity matters: with manifest still
+        // pinned to v1, a HEAD Restore(v2) must remain interleaved rather than
+        // being promoted to resumable compensation.
+        restore_table_to_version(&uri, None, 2).await.unwrap();
+        let foreign_restore = open_lance_head(&uri, None, Some((2, &planned, 1)))
+            .await
+            .unwrap();
+        assert_eq!(foreign_restore.version, 4);
+        assert_eq!(
+            foreign_restore.effect_ownership,
+            EffectOwnership::OwnBeforeHead
+        );
+    }
+
+    #[tokio::test]
+    async fn branch_merge_v4_proves_exact_chain_and_interrupted_compensation() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+        let store = TableStore::new(
+            dir.path().to_str().unwrap(),
+            Arc::new(lance::session::Session::default()),
+        );
+        let ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
+            .await
+            .unwrap();
+
+        let first_staged = store
+            .stage_append(&ds, person_batch(&[("bob", Some(25))]), &[])
+            .await
+            .unwrap();
+        let first_planned = first_staged.transaction_identity();
+        let (after_first, first_committed) = store
+            .commit_staged_exact(Arc::new(ds), first_staged)
+            .await
+            .unwrap();
+        assert_eq!(first_committed, first_planned);
+
+        let second_staged = store
+            .stage_append(&after_first, person_batch(&[("carol", Some(40))]), &[])
+            .await
+            .unwrap();
+        let second_planned = second_staged.transaction_identity();
+        let (after_second, second_committed) = store
+            .commit_staged_exact(Arc::new(after_first), second_staged)
+            .await
+            .unwrap();
+        assert_eq!(second_committed, second_planned);
+        assert_eq!(after_second.version().version, 3);
+
+        let observation = BranchMergeRefObservation {
+            dataset: after_second.clone(),
+            version: after_second.version().version,
+            branch_identifier: after_second.branch_identifier().await.unwrap(),
+            parent_version: None,
+        };
+        let planned = vec![first_planned.clone(), second_planned.clone()];
+        let proof =
+            prove_branch_merge_multi_commit_effect(&observation, &planned, 1, "node:Person")
+                .await
+                .unwrap();
+        assert_eq!(proof.effect_ownership, EffectOwnership::OwnAtHead);
+        assert!(proof.full_effect_at_head);
+        assert!(proof.unsafe_reason.is_none());
+        drop(observation);
+        drop(after_second);
+
+        // Model Full recovery crashing after it appended Restore(v1), before
+        // it could publish that compensated HEAD through the manifest.
+        restore_table_to_version(&uri, None, 1).await.unwrap();
+        let compensated = Dataset::open(&uri).await.unwrap();
+        let observation = BranchMergeRefObservation {
+            version: compensated.version().version,
+            branch_identifier: compensated.branch_identifier().await.unwrap(),
+            parent_version: None,
+            dataset: compensated,
+        };
+        let proof =
+            prove_branch_merge_multi_commit_effect(&observation, &planned, 1, "node:Person")
+                .await
+                .unwrap();
+        assert_eq!(
+            proof.effect_ownership,
+            EffectOwnership::OwnCompensatedAtHead
+        );
+        assert!(!proof.full_effect_at_head);
+        assert!(proof.unsafe_reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn branch_merge_v4_refuses_unplanned_head_movement() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+        let store = TableStore::new(
+            dir.path().to_str().unwrap(),
+            Arc::new(lance::session::Session::default()),
+        );
+        let mut ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
+            .await
+            .unwrap();
+        store
+            .append_batch(&uri, &mut ds, person_batch(&[("foreign", Some(99))]))
+            .await
+            .unwrap();
+        let observation = BranchMergeRefObservation {
+            version: ds.version().version,
+            branch_identifier: ds.branch_identifier().await.unwrap(),
+            parent_version: None,
+            dataset: ds,
+        };
+
+        let proof = prove_branch_merge_multi_commit_effect(
+            &observation,
+            &[transaction(1, "planned-but-not-committed")],
+            1,
+            "node:Person",
+        )
+        .await
+        .unwrap();
+        assert_eq!(proof.effect_ownership, EffectOwnership::Unverifiable);
+        assert!(!proof.full_effect_at_head);
+        assert!(proof.unsafe_reason.is_some());
+    }
+
+    #[tokio::test]
+    async fn branch_merge_v4_accepts_only_one_derived_index_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+        let store = TableStore::new(
+            dir.path().to_str().unwrap(),
+            Arc::new(lance::session::Session::default()),
+        );
+        let ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
+            .await
+            .unwrap();
+        let staged = store
+            .stage_append(&ds, person_batch(&[("bob", Some(25))]), &[])
+            .await
+            .unwrap();
+        let planned = staged.transaction_identity();
+        let (after_data, committed) = store
+            .commit_staged_exact(Arc::new(ds), staged)
+            .await
+            .unwrap();
+        assert_eq!(committed, planned);
+
+        let index = store
+            .stage_create_indices(
+                &after_data,
+                &[IndexBuildSpec::BTree {
+                    column: "id".to_string(),
+                    name: None,
+                }],
+            )
+            .await
+            .unwrap();
+        let (after_one_index, _) = store
+            .commit_staged_exact(Arc::new(after_data), index)
+            .await
+            .unwrap();
+        let observation = BranchMergeRefObservation {
+            version: after_one_index.version().version,
+            branch_identifier: after_one_index.branch_identifier().await.unwrap(),
+            parent_version: None,
+            dataset: after_one_index.clone(),
+        };
+        let proof = prove_branch_merge_multi_commit_effect(
+            &observation,
+            std::slice::from_ref(&planned),
+            1,
+            "node:Person",
+        )
+        .await
+        .unwrap();
+        assert_eq!(proof.effect_ownership, EffectOwnership::OwnAtHead);
+        assert!(proof.full_effect_at_head);
+        drop(observation);
+
+        let second_index = store
+            .stage_create_indices(
+                &after_one_index,
+                &[IndexBuildSpec::BTree {
+                    column: "age".to_string(),
+                    name: None,
+                }],
+            )
+            .await
+            .unwrap();
+        let (after_two_indices, _) = store
+            .commit_staged_exact(Arc::new(after_one_index), second_index)
+            .await
+            .unwrap();
+        let observation = BranchMergeRefObservation {
+            version: after_two_indices.version().version,
+            branch_identifier: after_two_indices.branch_identifier().await.unwrap(),
+            parent_version: None,
+            dataset: after_two_indices,
+        };
+        let proof =
+            prove_branch_merge_multi_commit_effect(&observation, &[planned], 1, "node:Person")
+                .await
+                .unwrap();
+        assert_eq!(proof.effect_ownership, EffectOwnership::Unverifiable);
+        assert!(!proof.full_effect_at_head);
+        assert!(proof.unsafe_reason.is_some());
+    }
+
+    #[tokio::test]
+    async fn exact_preflight_rebase_recovery_preserves_published_winner() {
+        // Lance may preflight-rebase an Append even when CommitBuilder's retry
+        // budget is zero. Reproduce the exact availability hazard:
+        //
+        //   v1  prepared attempt's expected version
+        //   v2  a competing writer commits and publishes
+        //   v3  the stale prepared transaction lands at HEAD with its own UUID
+        //
+        // Full recovery must compensate v3 back to the CURRENT manifest pin
+        // (v2), not reject the sidecar merely because v2 != its original v1
+        // expectation and not restore all the way to v1 (which loses winner).
+        const SCHEMA: &str = r#"
+node Person {
+    age: I32?
+}
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let db = crate::db::Omnigraph::init(root, SCHEMA).await.unwrap();
+
+        let txn = db.open_write_txn(None).await.unwrap();
+        let lineage = db.new_lineage_intent_for_branch(None, None).await.unwrap();
+        let entry = txn.base.entry("node:Person").unwrap().clone();
+        let table_uri = format!("{}/{}", root.trim_end_matches('/'), entry.table_path);
+        let stale_dataset = txn.base.open_dataset("node:Person").await.unwrap();
+        let store = TableStore::new(root, Arc::new(lance::session::Session::default()));
+        let staged = store
+            .stage_append(
+                &stale_dataset,
+                person_batch(&[("stale-attempt", Some(99))]),
+                &[],
+            )
+            .await
+            .unwrap();
+        let planned = staged.transaction_identity();
+        assert_eq!(planned.read_version, entry.table_version);
+
+        db.load(
+            "main",
+            r#"{"type":"Person","data":{"id":"winner","age":22}}"#,
+            crate::loader::LoadMode::Append,
+        )
+        .await
+        .unwrap();
+        let winner_snapshot = db.snapshot_of("main").await.unwrap();
+        let winner_version = winner_snapshot.entry("node:Person").unwrap().table_version;
+        assert_eq!(winner_version, planned.read_version + 1);
+
+        let authority = RecoveryAuthorityToken {
+            branch_identifier: txn.authority.branch_identifier.clone(),
+            graph_head: txn.authority.graph_head.clone(),
+            schema_identity_domain: txn.authority.schema_identity_domain.clone(),
+            schema_ir_hash: txn.authority.schema_ir_hash.clone(),
+            schema_identity_version: txn.authority.schema_identity_version,
+        };
+        let recovery_lineage = RecoveryLineageIntent {
+            graph_commit_id: lineage.graph_commit_id,
+            branch: lineage.branch,
+            actor_id: lineage.actor_id,
+            merged_parent_commit_id: lineage.merged_parent_commit_id,
+            created_at: lineage.created_at,
+        };
+        let sidecar = new_occ_sidecar_v9(
+            SidecarKind::Mutation,
+            None,
+            None,
+            vec![SidecarTablePin {
+                identity: entry.identity,
+                table_key: "node:Person".to_string(),
+                table_path: table_uri.clone(),
+                expected_version: planned.read_version,
+                post_commit_pin: planned.read_version + 1,
+                confirmed_version: None,
+                table_branch: entry.table_branch,
+            }],
+            authority,
+            recovery_lineage,
+            HashMap::from([(entry.identity, planned.clone())]),
+        )
+        .unwrap();
+        write_sidecar(root, db.storage_adapter(), &sidecar)
+            .await
+            .unwrap();
+
+        let (rebased, observed) = store
+            .commit_staged_exact(Arc::new(stale_dataset), staged)
+            .await
+            .unwrap();
+        assert_eq!(observed, planned);
+        assert_eq!(
+            rebased.version().version,
+            winner_version + 1,
+            "the stale transaction must reproduce Lance's expected+2 preflight rebase"
+        );
+        drop(rebased);
+
+        // Model a first Full recovery pass that correctly compensates the
+        // stale v3 effect to the CURRENT manifest pin v2, then crashes before
+        // publishing the Restore commit. HEAD is now v4 / Restore(v2), while
+        // __manifest still selects the winner at v2 and the sidecar remains.
+        // Reopen must recognize that exact compensation and publish v4 instead
+        // of treating the owned v3 effect as buried beneath a foreign write.
+        restore_table_to_version(&table_uri, None, winner_version)
+            .await
+            .unwrap();
+        let compensated = open_lance_head(
+            &table_uri,
+            None,
+            Some((planned.read_version + 1, &planned, winner_version)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(compensated.version, winner_version + 2);
+        assert_eq!(
+            compensated.effect_ownership,
+            EffectOwnership::OwnCompensatedAtHead
+        );
+
+        drop(txn);
+        drop(db);
+
+        let recovered = crate::db::Omnigraph::open(root).await.unwrap();
+        let snapshot = recovered.snapshot_of("main").await.unwrap();
+        let visible = snapshot.open("node:Person").await.unwrap();
+        let batches: Vec<RecordBatch> =
+            futures::TryStreamExt::try_collect(visible.scan().try_into_stream().await.unwrap())
+                .await
+                .unwrap();
+        let ids: Vec<String> = batches
+            .iter()
+            .flat_map(|batch| {
+                let ids = batch
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                (0..ids.len())
+                    .map(|row| ids.value(row).to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["winner"],
+            "recovery must preserve the published winner while removing only the stale effect"
+        );
+
+        let recovered_entry = snapshot.entry("node:Person").unwrap();
+        let lance_head = Dataset::open(&table_uri).await.unwrap().version().version;
+        assert_eq!(
+            recovered_entry.table_version, lance_head,
+            "recovery must publish its compensation so manifest and Lance HEAD converge"
+        );
+        assert!(
+            list_sidecars(root, recovered.storage_adapter())
+                .await
+                .unwrap()
+                .is_empty(),
+            "the converged sidecar must be removed"
+        );
+    }
+
+    #[cfg(feature = "failpoints")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn fixed_rollback_replays_partial_multi_table_audit_plan_after_crash() {
+        const SCHEMA: &str = r#"
+node Person { age: I32? }
+node Company { age: I32? }
+"#;
+        let _scenario = fail::FailScenario::setup();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let db = crate::db::Omnigraph::init(root, SCHEMA).await.unwrap();
+        let txn = db.open_write_txn(None).await.unwrap();
+        let lineage = db.new_lineage_intent_for_branch(None, None).await.unwrap();
+        let store = TableStore::new(root, Arc::new(lance::session::Session::default()));
+
+        let person_entry = txn.base.entry("node:Person").unwrap().clone();
+        let company_entry = txn.base.entry("node:Company").unwrap().clone();
+        let person_uri = format!("{}/{}", root.trim_end_matches('/'), person_entry.table_path);
+        let company_uri = format!(
+            "{}/{}",
+            root.trim_end_matches('/'),
+            company_entry.table_path
+        );
+        let person_ds = txn.base.open_dataset("node:Person").await.unwrap();
+        let company_ds = txn.base.open_dataset("node:Company").await.unwrap();
+        let person_staged = store
+            .stage_append(&person_ds, person_batch(&[("partial", Some(10))]), &[])
+            .await
+            .unwrap();
+        let company_staged = store
+            .stage_append(&company_ds, person_batch(&[("untouched", Some(20))]), &[])
+            .await
+            .unwrap();
+        let person_planned = person_staged.transaction_identity();
+        let company_planned = company_staged.transaction_identity();
+
+        let authority = RecoveryAuthorityToken {
+            branch_identifier: txn.authority.branch_identifier.clone(),
+            graph_head: txn.authority.graph_head.clone(),
+            schema_identity_domain: txn.authority.schema_identity_domain.clone(),
+            schema_ir_hash: txn.authority.schema_ir_hash.clone(),
+            schema_identity_version: txn.authority.schema_identity_version,
+        };
+        let recovery_lineage = RecoveryLineageIntent {
+            graph_commit_id: lineage.graph_commit_id,
+            branch: lineage.branch,
+            actor_id: lineage.actor_id,
+            merged_parent_commit_id: lineage.merged_parent_commit_id,
+            created_at: lineage.created_at,
+        };
+        let sidecar = new_occ_sidecar_v9(
+            SidecarKind::Mutation,
+            None,
+            None,
+            vec![
+                SidecarTablePin {
+                    identity: person_entry.identity,
+                    table_key: "node:Person".to_string(),
+                    table_path: person_uri,
+                    expected_version: person_entry.table_version,
+                    post_commit_pin: person_entry.table_version + 1,
+                    confirmed_version: None,
+                    table_branch: person_entry.table_branch,
+                },
+                SidecarTablePin {
+                    identity: company_entry.identity,
+                    table_key: "node:Company".to_string(),
+                    table_path: company_uri,
+                    expected_version: company_entry.table_version,
+                    post_commit_pin: company_entry.table_version + 1,
+                    confirmed_version: None,
+                    table_branch: company_entry.table_branch,
+                },
+            ],
+            authority,
+            recovery_lineage,
+            HashMap::from([
+                (person_entry.identity, person_planned.clone()),
+                (company_entry.identity, company_planned),
+            ]),
+        )
+        .unwrap();
+        let operation_id = sidecar.operation_id.clone();
+        write_sidecar(root, db.storage_adapter(), &sidecar)
+            .await
+            .unwrap();
+
+        let (person_committed, observed) = store
+            .commit_staged_exact(Arc::new(person_ds), person_staged)
+            .await
+            .unwrap();
+        assert_eq!(observed, person_planned);
+        let person_effect_version = person_committed.version().version;
+        assert_eq!(person_effect_version, person_entry.table_version + 1);
+        drop(person_committed);
+        drop(company_staged);
+        drop(txn);
+        drop(db);
+
+        let failpoint = crate::failpoints::ScopedFailPoint::new(
+            crate::failpoints::names::RECOVERY_POST_ROLLBACK_PUBLISH_PRE_AUDIT,
+            "return",
+        );
+        let error = crate::db::Omnigraph::open(root)
+            .await
+            .err()
+            .expect("post-rollback failpoint must fail the first open");
+        assert!(
+            error
+                .to_string()
+                .contains("recovery.post_rollback_publish_pre_audit")
+        );
+        drop(failpoint);
+
+        let persisted = list_sidecars(root, &ObjectStorageAdapter::local())
+            .await
+            .unwrap();
+        assert_eq!(persisted.len(), 1);
+        let planned_outcomes = persisted[0]
+            .protocol_v3
+            .as_ref()
+            .unwrap()
+            .rollback_audit_outcomes
+            .as_ref()
+            .expect("rollback audit plan must be durable before the publish");
+        assert_eq!(
+            planned_outcomes,
+            &[TableOutcome {
+                table_key: "node:Person".to_string(),
+                from_version: person_effect_version,
+                to_version: person_entry.table_version,
+            }],
+            "the untouched Company pin must not be fabricated into the audit plan"
+        );
+
+        let recovered = crate::db::Omnigraph::open(root).await.unwrap();
+        let audit = RecoveryAudit::open(root).await.unwrap();
+        let records = audit.list().await.unwrap();
+        let record = records
+            .iter()
+            .find(|record| record.operation_id == operation_id)
+            .expect("fixed rollback retry must append its audit row");
+        assert_eq!(record.recovery_kind, RecoveryKind::RolledBack);
+        assert_eq!(record.per_table_outcomes, planned_outcomes.clone());
+        assert_eq!(
+            recovered
+                .snapshot_of("main")
+                .await
+                .unwrap()
+                .open("node:Person")
+                .await
+                .unwrap()
+                .count_rows(None)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(
+            list_sidecars(root, recovered.storage_adapter())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[cfg(feature = "failpoints")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn fixed_rollback_replays_preflight_rebase_audit_plan_after_crash() {
+        const SCHEMA: &str = r#"
+node Person { age: I32? }
+"#;
+        let _scenario = fail::FailScenario::setup();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let db = crate::db::Omnigraph::init(root, SCHEMA).await.unwrap();
+
+        let txn = db.open_write_txn(None).await.unwrap();
+        let lineage = db.new_lineage_intent_for_branch(None, None).await.unwrap();
+        let entry = txn.base.entry("node:Person").unwrap().clone();
+        let table_uri = format!("{}/{}", root.trim_end_matches('/'), entry.table_path);
+        let stale_dataset = txn.base.open_dataset("node:Person").await.unwrap();
+        let store = TableStore::new(root, Arc::new(lance::session::Session::default()));
+        let staged = store
+            .stage_append(
+                &stale_dataset,
+                person_batch(&[("stale-attempt", Some(99))]),
+                &[],
+            )
+            .await
+            .unwrap();
+        let planned = staged.transaction_identity();
+
+        db.load(
+            "main",
+            r#"{"type":"Person","data":{"id":"winner","age":22}}"#,
+            crate::loader::LoadMode::Append,
+        )
+        .await
+        .unwrap();
+        let winner_version = db
+            .snapshot_of("main")
+            .await
+            .unwrap()
+            .entry("node:Person")
+            .unwrap()
+            .table_version;
+        assert_eq!(winner_version, planned.read_version + 1);
+
+        let sidecar = new_occ_sidecar_v9(
+            SidecarKind::Mutation,
+            None,
+            None,
+            vec![SidecarTablePin {
+                identity: entry.identity,
+                table_key: "node:Person".to_string(),
+                table_path: table_uri.clone(),
+                expected_version: planned.read_version,
+                post_commit_pin: planned.read_version + 1,
+                confirmed_version: None,
+                table_branch: entry.table_branch,
+            }],
+            RecoveryAuthorityToken {
+                branch_identifier: txn.authority.branch_identifier.clone(),
+                graph_head: txn.authority.graph_head.clone(),
+                schema_identity_domain: txn.authority.schema_identity_domain.clone(),
+                schema_ir_hash: txn.authority.schema_ir_hash.clone(),
+                schema_identity_version: txn.authority.schema_identity_version,
+            },
+            RecoveryLineageIntent {
+                graph_commit_id: lineage.graph_commit_id,
+                branch: lineage.branch,
+                actor_id: lineage.actor_id,
+                merged_parent_commit_id: lineage.merged_parent_commit_id,
+                created_at: lineage.created_at,
+            },
+            HashMap::from([(entry.identity, planned.clone())]),
+        )
+        .unwrap();
+        let operation_id = sidecar.operation_id.clone();
+        write_sidecar(root, db.storage_adapter(), &sidecar)
+            .await
+            .unwrap();
+
+        let (rebased, observed) = store
+            .commit_staged_exact(Arc::new(stale_dataset), staged)
+            .await
+            .unwrap();
+        assert_eq!(observed, planned);
+        let own_head = rebased.version().version;
+        assert_eq!(own_head, winner_version + 1);
+        drop(rebased);
+        drop(txn);
+        drop(db);
+
+        let failpoint = crate::failpoints::ScopedFailPoint::new(
+            crate::failpoints::names::RECOVERY_POST_ROLLBACK_PUBLISH_PRE_AUDIT,
+            "return",
+        );
+        let error = crate::db::Omnigraph::open(root)
+            .await
+            .err()
+            .expect("post-rollback failpoint must fail the first open");
+        assert!(
+            error
+                .to_string()
+                .contains("recovery.post_rollback_publish_pre_audit")
+        );
+        drop(failpoint);
+
+        let persisted = list_sidecars(root, &ObjectStorageAdapter::local())
+            .await
+            .unwrap();
+        assert_eq!(persisted.len(), 1);
+        let planned_outcomes = persisted[0]
+            .protocol_v3
+            .as_ref()
+            .unwrap()
+            .rollback_audit_outcomes
+            .clone()
+            .expect("preflight compensation must persist its exact audit plan");
+        assert_eq!(
+            planned_outcomes,
+            vec![TableOutcome {
+                table_key: "node:Person".to_string(),
+                from_version: own_head,
+                to_version: winner_version,
+            }],
+            "audit must report the actual v3 -> v2 compensation, never infer v2 -> v1 from pins"
+        );
+
+        let recovered = crate::db::Omnigraph::open(root).await.unwrap();
+        let snapshot = recovered.snapshot_of("main").await.unwrap();
+        let visible = snapshot.open("node:Person").await.unwrap();
+        let batches: Vec<RecordBatch> = visible
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let ids = batches
+            .iter()
+            .flat_map(|batch| {
+                let ids = batch
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                (0..ids.len())
+                    .map(|row| ids.value(row).to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["winner"]);
+
+        let audit = RecoveryAudit::open(root).await.unwrap();
+        let records = audit.list().await.unwrap();
+        let record = records
+            .iter()
+            .find(|record| record.operation_id == operation_id)
+            .expect("fixed rollback retry must append its audit row");
+        assert_eq!(record.recovery_kind, RecoveryKind::RolledBack);
+        assert_eq!(record.per_table_outcomes, planned_outcomes);
+    }
+
+    #[tokio::test]
     async fn list_sidecars_returns_empty_when_dir_missing() {
         let dir = tempfile::tempdir().unwrap();
         let storage = ObjectStorageAdapter::local();
@@ -2371,12 +10984,10 @@ mod tests {
         let storage = ObjectStorageAdapter::local();
         let root = dir.path().to_str().unwrap();
 
-        let sidecar = new_sidecar(
-            SidecarKind::Mutation,
-            Some("main".to_string()),
-            Some("act-alice".to_string()),
-            vec![make_pin("node:Person", "file:///tmp/x.lance", 5, 6)],
-        );
+        let mut sidecar =
+            new_optimize_sidecar_v9(vec![make_pin("node:Person", "file:///tmp/x.lance", 5, 6)])
+                .unwrap();
+        bind_sidecar_pins_to_root(&mut sidecar, root);
         let handle = write_sidecar(root, &storage, &sidecar).await.unwrap();
         assert_eq!(handle.operation_id, sidecar.operation_id);
 
@@ -2398,15 +11009,12 @@ mod tests {
         // invariant against a future divergence between the two filters.
         let dir = tempfile::tempdir().unwrap();
         let storage = ObjectStorageAdapter::local();
-        let mut sidecar = new_sidecar(
-            SidecarKind::BranchMerge,
-            Some("main".to_string()),
-            None,
-            vec![make_pin("node:Person", "file:///tmp/x.lance", 5, 6)],
-        );
+        let mut sidecar =
+            new_optimize_sidecar_v9(vec![make_pin("node:Person", "file:///tmp/x.lance", 5, 6)])
+                .unwrap();
         // The confirmed-versions map does NOT cover the pinned table.
-        let confirmed: HashMap<String, u64> = HashMap::new();
-        let err = confirm_sidecar_phase_b(
+        let confirmed: HashMap<TableIdentity, u64> = HashMap::new();
+        let err = confirm_sidecar_phase_b_v9(
             dir.path().to_str().unwrap(),
             &storage,
             &mut sidecar,
@@ -2415,7 +11023,8 @@ mod tests {
         .await
         .expect_err("a pinned table with no achieved version must be a loud error");
         assert!(
-            err.to_string().contains("pins and publish updates diverged"),
+            err.to_string()
+                .contains("pins and publish updates diverged"),
             "expected a pin/updates divergence error, got: {err}",
         );
     }
@@ -2458,15 +11067,13 @@ mod tests {
             "01H000000000000000000000AA",
         ];
         for id in &ids {
-            let sc = new_sidecar(
-                SidecarKind::Mutation,
-                None,
-                None,
-                vec![make_pin("node:Person", "/dev/null/x.lance", 1, 2)],
-            );
+            let sc =
+                new_optimize_sidecar_v9(vec![make_pin("node:Person", "/dev/null/x.lance", 1, 2)])
+                    .unwrap();
             // Override operation_id to use our deterministic ID.
             let mut sc = sc;
             sc.operation_id = id.to_string();
+            bind_sidecar_pins_to_root(&mut sc, root);
             write_sidecar(root, &storage, &sc).await.unwrap();
         }
 

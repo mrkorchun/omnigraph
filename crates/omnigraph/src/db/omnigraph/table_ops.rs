@@ -1,15 +1,7 @@
 use super::*;
 
 pub(super) async fn graph_index(db: &Omnigraph) -> Result<Arc<crate::graph_index::GraphIndex>> {
-    db.ensure_schema_state_valid().await?;
-    let coord = db.coordinator.read().await;
-    let resolved = coord
-        .resolve_target(&ReadTarget::Branch(
-            coord.current_branch().unwrap_or("main").to_string(),
-        ))
-        .await?;
-    drop(coord);
-    let catalog = db.catalog();
+    let (resolved, catalog) = db.capture_current_read_view().await?;
     // Whole-graph entry point: cover every edge type. Query execution scopes to
     // the edges it actually traverses (see `referenced_edge_types`).
     let edge_types: std::collections::HashMap<String, (String, String)> = catalog
@@ -62,14 +54,21 @@ pub(super) async fn failpoint_publish_table_head_without_index_rebuild_for_test(
         .await?;
     let state = db.storage().table_state(&full_path, &ds).await?;
     let update = crate::db::SubTableUpdate {
+        identity: entry.identity,
         table_key: table_key.to_string(),
         table_version: state.version,
         table_branch: table_branch.map(str::to_string),
         row_count: state.row_count,
         version_metadata: state.version_metadata,
     };
-    let mut expected = std::collections::HashMap::new();
-    expected.insert(table_key.to_string(), entry.table_version);
+    let mut expected = crate::db::manifest::ExpectedTableVersions::new();
+    expected.insert(
+        entry.identity,
+        crate::db::manifest::TableVersionExpectation {
+            table_key: table_key.to_string(),
+            table_version: entry.table_version,
+        },
+    );
     commit_prepared_updates_on_branch_with_expected(
         db,
         branch.as_deref(),
@@ -84,25 +83,40 @@ pub(super) async fn ensure_indices_for_branch(
     db: &Omnigraph,
     branch: Option<&str>,
 ) -> Result<Vec<PendingIndex>> {
-    db.ensure_schema_state_valid().await?;
+    // RFC-022 entry recovery barrier: recovery may advance the manifest, so
+    // resolve or refuse every relevant intent before capturing the index
+    // plan's base.
+    // The final under-gate relist below remains necessary to close the race
+    // between this entry barrier and the first table-HEAD effect.
+    db.heal_pending_recovery_sidecars_for_write(&[branch])
+        .await?;
     db.ensure_schema_apply_idle("ensure_indices").await?;
-    let resolved = db.resolved_branch_target(branch).await?;
-    let snapshot = resolved.snapshot;
-    let mut updates = Vec::new();
-    let mut pending = Vec::new();
-    let active_branch = resolved.branch;
-    let catalog = db.catalog();
+    let txn = db.open_write_txn(branch).await?;
+    let snapshot = txn.base.clone();
+    let mut pending_by_table = HashMap::<String, Vec<PendingIndex>>::new();
+    let active_branch = txn.branch.clone();
+    let catalog = Arc::clone(&txn.catalog);
 
-    // Recovery sidecar: protect the per-table commit_staged loop in
-    // build_indices_on_dataset (one commit per index built). Only pins
-    // tables that ACTUALLY need index work — the classifier
-    // loose-matches for SidecarKind::EnsureIndices (the actual N
-    // depends on which indices are missing), but if a table needs zero
-    // commits and gets pinned, the all-or-nothing decision rule
-    // classifies it as `NoMovement` and rolls back legitimately-
-    // committed work on sibling tables. Steady-state runs (everything
-    // already indexed) skip the sidecar entirely.
     let mut recovery_pins: Vec<crate::db::manifest::SidecarTablePin> = Vec::new();
+    let mut work_by_table = HashMap::<String, PlannedIndexWork>::new();
+    let mut existing_targets =
+        std::collections::HashMap::<String, crate::storage_layer::SnapshotHandle>::new();
+    let mut existing_staged =
+        std::collections::HashMap::<String, crate::storage_layer::StagedHandle>::new();
+    let mut first_touch_sources =
+        std::collections::HashMap::<String, crate::storage_layer::SnapshotHandle>::new();
+    let mut planned_transactions = std::collections::HashMap::<
+        crate::db::manifest::TableIdentity,
+        crate::table_store::StagedTransactionIdentity,
+    >::new();
+    let mut first_touch_source_versions =
+        std::collections::HashMap::<crate::db::manifest::TableIdentity, u64>::new();
+
+    // Plan and build uncommitted artifacts before taking writer gates. Existing
+    // target refs have a stable branch-local `_indices` root, so their complete
+    // BTREE/FTS/vector batch can be staged here and abandoned safely if final
+    // authority revalidation loses. A first-touch named ref does not have that
+    // root yet; its artifacts must be staged after sidecar -> ref creation.
     for type_name in catalog.node_types.keys() {
         let table_key = format!("node:{}", type_name);
         let Some(entry) = snapshot.entry(&table_key) else {
@@ -118,24 +132,58 @@ pub(super) async fn ensure_indices_for_branch(
             continue;
         }
         let full_path = format!("{}/{}", db.root_uri, entry.table_path);
-        if needs_index_work_node(db, type_name, &full_path, entry.table_branch.as_deref()).await?
-        {
+        let first_touch =
+            active_branch.is_some() && entry.table_branch.as_deref() != active_branch.as_deref();
+        let ds = if first_touch {
+            // The inherited owner's HEAD may advance independently after this
+            // graph branch was cut. Plan from the exact inherited snapshot, not
+            // from that owner's current HEAD.
+            db.storage().open_snapshot_at_entry(entry).await?
+        } else {
+            db.storage()
+                .open_dataset_head(&full_path, active_branch.as_deref())
+                .await?
+        };
+        let work = plan_index_work_node(db, &catalog, type_name, &table_key, &ds).await?;
+        if !work.pending.is_empty() {
+            pending_by_table.insert(table_key.clone(), work.pending.clone());
+        }
+        if work.needs_commit() {
             recovery_pins.push(crate::db::manifest::SidecarTablePin {
-                table_key,
+                identity: entry.identity,
+                table_key: table_key.clone(),
                 table_path: full_path,
                 expected_version: entry.table_version,
                 post_commit_pin: entry.table_version + 1,
-                // EnsureIndices uses the loose match (index coverage is derived
-                // state), not BranchMerge's Phase-B confirmation — left None.
                 confirmed_version: None,
-                // Use active_branch (where commits actually land), NOT
-                // entry.table_branch (where the table currently lives).
-                // open_owned_dataset_for_branch_write forks a feature
-                // branch from a main-branch table on first write — the
-                // resulting commit lands on active_branch. Recovery's
-                // open_lance_head must check the same branch.
                 table_branch: active_branch.clone(),
             });
+            if !first_touch {
+                let staged = db
+                    .storage()
+                    .stage_create_indices(&ds, &work.specs)
+                    .await
+                    .map_err(|error| {
+                        OmniError::Lance(format!(
+                            "stage index batch on {} ({:?}): {}",
+                            table_key, work.specs, error
+                        ))
+                    })?;
+                crate::failpoints::maybe_fail(
+                    crate::failpoints::names::ENSURE_INDICES_POST_STAGE_PRE_COMMIT_BTREE,
+                )?;
+                planned_transactions.insert(entry.identity, staged.transaction_identity());
+                existing_staged.insert(table_key.clone(), staged);
+                existing_targets.insert(table_key.clone(), ds);
+            } else {
+                planned_transactions.insert(
+                    entry.identity,
+                    pre_minted_index_transaction(entry.table_version),
+                );
+                first_touch_source_versions.insert(entry.identity, entry.table_version);
+                first_touch_sources.insert(table_key.clone(), ds);
+            }
+            work_by_table.insert(table_key, work);
         }
     }
     for edge_name in catalog.edge_types.keys() {
@@ -147,176 +195,371 @@ pub(super) async fn ensure_indices_for_branch(
             continue;
         }
         let full_path = format!("{}/{}", db.root_uri, entry.table_path);
-        if needs_index_work_edge(db, &full_path, entry.table_branch.as_deref()).await? {
+        let first_touch =
+            active_branch.is_some() && entry.table_branch.as_deref() != active_branch.as_deref();
+        let ds = if first_touch {
+            db.storage().open_snapshot_at_entry(entry).await?
+        } else {
+            db.storage()
+                .open_dataset_head(&full_path, active_branch.as_deref())
+                .await?
+        };
+        let work = plan_index_work_edge_on_dataset(db, &ds).await?;
+        if work.needs_commit() {
             recovery_pins.push(crate::db::manifest::SidecarTablePin {
-                table_key,
+                identity: entry.identity,
+                table_key: table_key.clone(),
                 table_path: full_path,
                 expected_version: entry.table_version,
                 post_commit_pin: entry.table_version + 1,
-                // EnsureIndices uses the loose match (index coverage is derived
-                // state), not BranchMerge's Phase-B confirmation — left None.
                 confirmed_version: None,
-                // Use active_branch (where commits actually land), NOT
-                // entry.table_branch (where the table currently lives).
-                // open_owned_dataset_for_branch_write forks a feature
-                // branch from a main-branch table on first write — the
-                // resulting commit lands on active_branch. Recovery's
-                // open_lance_head must check the same branch.
                 table_branch: active_branch.clone(),
             });
+            if !first_touch {
+                let staged = db
+                    .storage()
+                    .stage_create_indices(&ds, &work.specs)
+                    .await
+                    .map_err(|error| {
+                        OmniError::Lance(format!(
+                            "stage index batch on {} ({:?}): {}",
+                            table_key, work.specs, error
+                        ))
+                    })?;
+                crate::failpoints::maybe_fail(
+                    crate::failpoints::names::ENSURE_INDICES_POST_STAGE_PRE_COMMIT_BTREE,
+                )?;
+                planned_transactions.insert(entry.identity, staged.transaction_identity());
+                existing_staged.insert(table_key.clone(), staged);
+                existing_targets.insert(table_key.clone(), ds);
+            } else {
+                planned_transactions.insert(
+                    entry.identity,
+                    pre_minted_index_transaction(entry.table_version),
+                );
+                first_touch_source_versions.insert(entry.identity, entry.table_version);
+                first_touch_sources.insert(table_key.clone(), ds);
+            }
+            work_by_table.insert(table_key, work);
         }
     }
-    // Acquire per-(table_key, active_branch) queues for every table
-    // that needs index work. Held across the per-table commit loop and
-    // the manifest publish at the end of this function. Sorted-order
-    // acquisition prevents lock-order inversion against concurrent
-    // multi-table writers (mutation finalize, branch_merge, the fork
-    // path, recovery).
+
     let queue_keys: Vec<(String, Option<String>)> = recovery_pins
         .iter()
         .map(|pin| (pin.table_key.clone(), pin.table_branch.clone()))
         .collect();
+    let _schema_guard = db
+        .write_queue()
+        .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
+        .await;
+    let _branch_guard = db
+        .write_queue()
+        .acquire_branch(active_branch.as_deref())
+        .await;
     let _queue_guards = db.write_queue().acquire_many(&queue_keys).await;
 
-    let recovery_handle = if recovery_pins.is_empty() {
-        None
+    db.ensure_no_pending_recovery_sidecars_under_gates(
+        &[active_branch.as_deref()],
+        "ensure_indices",
+    )
+    .await?;
+    let live_snapshot = db.revalidate_write_txn(&txn).await?;
+
+    for pin in &recovery_pins {
+        let prepared_entry = snapshot.entry(&pin.table_key).ok_or_else(|| {
+            OmniError::manifest_conflict(format!(
+                "table '{}' disappeared from the prepared index plan",
+                pin.table_key,
+            ))
+        })?;
+        let live_entry = live_snapshot.entry(&pin.table_key).ok_or_else(|| {
+            OmniError::manifest_read_set_changed(
+                format!("table_head:{}", pin.table_key),
+                Some(pin.expected_version.to_string()),
+                None,
+            )
+        })?;
+        if live_entry.table_version != pin.expected_version
+            || live_entry.identity != pin.identity
+            || live_entry.table_path != prepared_entry.table_path
+            || live_entry.table_branch != prepared_entry.table_branch
+        {
+            return Err(OmniError::manifest_read_set_changed(
+                format!("table_head:{}", pin.table_key),
+                Some(format!(
+                    "{}:{}:{}",
+                    prepared_entry.table_path,
+                    prepared_entry.table_branch.as_deref().unwrap_or("main"),
+                    pin.expected_version,
+                )),
+                Some(format!(
+                    "{}:{}:{}",
+                    live_entry.table_path,
+                    live_entry.table_branch.as_deref().unwrap_or("main"),
+                    live_entry.table_version,
+                )),
+            ));
+        }
+
+        if let Some(ds) = existing_targets.get(&pin.table_key) {
+            db.ensure_existing_effect_baseline(
+                &pin.table_key,
+                pin.table_branch.as_deref(),
+                pin.expected_version,
+                ds,
+            )
+            .await?;
+        } else if let Some(source) = first_touch_sources.get(&pin.table_key) {
+            let target_branch = active_branch.as_deref().ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "first-touch index target '{}' has no active named branch",
+                    pin.table_key,
+                ))
+            })?;
+            let branches = source
+                .dataset()
+                .list_branches()
+                .await
+                .map_err(|error| OmniError::Lance(error.to_string()))?;
+            if branches.contains_key(target_branch) {
+                return Err(OmniError::manifest_conflict(format!(
+                    "index target ref '{}:{}' already exists while the graph manifest still \
+                     inherits the table from another branch; refusing to claim unowned \
+                     physical state — inspect and remove the orphaned ref before retrying",
+                    pin.table_key, target_branch,
+                )));
+            }
+        }
+    }
+
+    if recovery_pins.is_empty() {
+        // Preserve the no-work failpoint contract without manufacturing durable
+        // recovery state or graph lineage.
+        crate::failpoints::maybe_fail(
+            crate::failpoints::names::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+        )?;
     } else {
-        let sidecar = crate::db::manifest::new_sidecar(
-            crate::db::manifest::SidecarKind::EnsureIndices,
+        let expected_versions = recovery_pins
+            .iter()
+            .map(|pin| {
+                (
+                    pin.identity,
+                    crate::db::manifest::TableVersionExpectation {
+                        table_key: pin.table_key.clone(),
+                        table_version: pin.expected_version,
+                    },
+                )
+            })
+            .collect::<crate::db::manifest::ExpectedTableVersions>();
+        let lineage = db
+            .new_lineage_intent_for_branch(active_branch.as_deref(), None)
+            .await?;
+        let authority = crate::db::manifest::RecoveryAuthorityToken {
+            branch_identifier: txn.authority.branch_identifier.clone(),
+            graph_head: txn.authority.graph_head.clone(),
+            schema_identity_domain: txn.authority.schema_identity_domain.clone(),
+            schema_ir_hash: txn.authority.schema_ir_hash.clone(),
+            schema_identity_version: txn.authority.schema_identity_version,
+        };
+        let recovery_lineage = crate::db::manifest::RecoveryLineageIntent {
+            graph_commit_id: lineage.graph_commit_id.clone(),
+            branch: lineage.branch.clone(),
+            actor_id: lineage.actor_id.clone(),
+            merged_parent_commit_id: lineage.merged_parent_commit_id.clone(),
+            created_at: lineage.created_at,
+        };
+        let mut sidecar = crate::db::manifest::new_ensure_indices_sidecar_v9(
             active_branch.clone(),
-            // `ensure_indices` doesn't currently take an actor; system-attributed.
-            // Future: add `ensure_indices_as` to thread actor context.
             None,
-            recovery_pins,
-        );
-        Some(
+            recovery_pins.clone(),
+            authority,
+            recovery_lineage,
+            planned_transactions.clone(),
+            first_touch_source_versions.clone(),
+        )?;
+        let recovery_handle =
             crate::db::manifest::write_sidecar(db.root_uri(), db.storage_adapter(), &sidecar)
-                .await?,
-        )
-    };
+                .await?;
+        let recovery_operation_id = recovery_handle.operation_id.clone();
 
-    for type_name in catalog.node_types.keys() {
-        let table_key = format!("node:{}", type_name);
-        let Some(entry) = snapshot.entry(&table_key) else {
-            continue;
-        };
-        let full_path = format!("{}/{}", db.root_uri, entry.table_path);
-        let (mut ds, resolved_branch) = match active_branch.as_deref() {
-            Some(active_branch) => match entry.table_branch.as_deref() {
-                None => continue,
-                _ => {
-                    open_owned_dataset_for_branch_write(
-                        db,
-                        &table_key,
-                        &full_path,
-                        entry.table_branch.as_deref(),
-                        entry.table_version,
-                        active_branch,
-                        crate::db::MutationOpKind::SchemaRewrite,
-                    )
-                    .await?
+        let post_arm_result = async {
+            if !first_touch_sources.is_empty() {
+                crate::failpoints::maybe_fail(
+                    crate::failpoints::names::ENSURE_INDICES_POST_SIDECAR_PRE_FORK,
+                )?;
+            }
+
+            let mut updates = Vec::with_capacity(recovery_pins.len());
+            let mut committed_transactions = HashMap::new();
+            let mut confirmed_ref_identifiers = HashMap::new();
+            for pin in &recovery_pins {
+                let table_key = pin.table_key.clone();
+                let entry = snapshot.entry(&table_key).ok_or_else(|| {
+                    OmniError::manifest(format!("no manifest entry for {}", table_key))
+                })?;
+                let full_path = pin.table_path.clone();
+                let first_touch = first_touch_source_versions.contains_key(&pin.identity);
+                let (ds, resolved_branch) = match active_branch.as_deref() {
+                    Some(active_branch) => {
+                        if let Some(ds) = existing_targets.remove(&table_key) {
+                            (ds, Some(active_branch.to_string()))
+                        } else {
+                            first_touch_sources.remove(&table_key).ok_or_else(|| {
+                                OmniError::manifest_internal(format!(
+                                    "missing first-touch source for index table '{}'",
+                                    table_key
+                                ))
+                            })?;
+                            open_owned_dataset_for_branch_write(
+                                db,
+                                &table_key,
+                                pin.identity,
+                                &full_path,
+                                entry.table_branch.as_deref(),
+                                entry.table_version,
+                                active_branch,
+                                crate::db::MutationOpKind::SchemaRewrite,
+                                true,
+                            )
+                            .await?
+                        }
+                    }
+                    None => (
+                        existing_targets.remove(&table_key).ok_or_else(|| {
+                            OmniError::manifest_internal(format!(
+                                "missing verified existing target for main table '{}'",
+                                table_key,
+                            ))
+                        })?,
+                        None,
+                    ),
+                };
+
+                let mut staged = if let Some(staged) = existing_staged.remove(&table_key) {
+                    staged
+                } else {
+                    let work = work_by_table.get(&table_key).ok_or_else(|| {
+                        OmniError::manifest_internal(format!(
+                            "missing exact index work for first-touch table '{}'",
+                            table_key
+                        ))
+                    })?;
+                    let staged = db
+                        .storage()
+                        .stage_create_indices(&ds, &work.specs)
+                        .await
+                        .map_err(|error| {
+                            OmniError::Lance(format!(
+                                "stage first-touch index batch on {} ({:?}): {}",
+                                table_key, work.specs, error
+                            ))
+                        })?;
+                    crate::failpoints::maybe_fail(
+                        crate::failpoints::names::ENSURE_INDICES_POST_STAGE_PRE_COMMIT_BTREE,
+                    )?;
+                    staged
+                };
+                let planned = planned_transactions.get(&pin.identity).ok_or_else(|| {
+                    OmniError::manifest_internal(format!(
+                        "missing planned index transaction for '{}'",
+                        table_key
+                    ))
+                })?;
+                staged.bind_transaction_identity(planned)?;
+                let outcome = db.storage().commit_staged_exact(ds, staged).await?;
+                if !outcome.is_exact() {
+                    return Err(OmniError::manifest_read_set_changed(
+                        format!("ensure_indices_lance_transaction:{table_key}"),
+                        Some(format!("{:?}", outcome.planned_transaction())),
+                        Some(format!("{:?}", outcome.committed_transaction())),
+                    ));
                 }
-            },
-            None => (
-                db.storage()
-                    .open_dataset_head(&full_path, None)
-                    .await?,
-                None,
-            ),
-        };
-        let row_count = db.storage().count_rows(&ds, None).await.unwrap_or(0);
-        if row_count > 0 {
-            pending.extend(build_indices_on_dataset(db, &table_key, &mut ds).await?);
-        }
-
-        let state = db.storage().table_state(&full_path, &ds).await?;
-        if state.version != entry.table_version
-            || resolved_branch.as_deref() != entry.table_branch.as_deref()
-        {
-            updates.push(crate::db::SubTableUpdate {
-                table_key,
-                table_version: state.version,
-                table_branch: resolved_branch,
-                row_count: state.row_count,
-                version_metadata: state.version_metadata,
-            });
-        }
-    }
-
-    for edge_name in catalog.edge_types.keys() {
-        let table_key = format!("edge:{}", edge_name);
-        let Some(entry) = snapshot.entry(&table_key) else {
-            continue;
-        };
-        let full_path = format!("{}/{}", db.root_uri, entry.table_path);
-        let (mut ds, resolved_branch) = match active_branch.as_deref() {
-            Some(active_branch) => match entry.table_branch.as_deref() {
-                None => continue,
-                _ => {
-                    open_owned_dataset_for_branch_write(
-                        db,
-                        &table_key,
-                        &full_path,
-                        entry.table_branch.as_deref(),
-                        entry.table_version,
-                        active_branch,
-                        crate::db::MutationOpKind::SchemaRewrite,
-                    )
-                    .await?
+                committed_transactions
+                    .insert(pin.identity, outcome.committed_transaction().clone());
+                let ds = outcome.into_snapshot();
+                if first_touch {
+                    confirmed_ref_identifiers
+                        .insert(pin.identity, db.storage().branch_identifier(&ds).await?);
                 }
-            },
-            None => (
-                db.storage()
-                    .open_dataset_head(&full_path, None)
-                    .await?,
+                let state = db.storage().table_state(&full_path, &ds).await?;
+                updates.push(crate::db::SubTableUpdate {
+                    identity: pin.identity,
+                    table_key,
+                    table_version: state.version,
+                    table_branch: resolved_branch,
+                    row_count: state.row_count,
+                    version_metadata: state.version_metadata,
+                });
+                crate::failpoints::maybe_fail(
+                    crate::failpoints::names::ENSURE_INDICES_POST_TABLE_EFFECT,
+                )?;
+            }
+
+            crate::failpoints::maybe_fail(
+                crate::failpoints::names::ENSURE_INDICES_POST_EFFECTS_PRE_CONFIRM,
+            )?;
+            crate::db::manifest::confirm_ensure_indices_sidecar_v9(
+                db.root_uri(),
+                db.storage_adapter(),
+                &mut sidecar,
+                &updates,
+                &committed_transactions,
+                &confirmed_ref_identifiers,
+            )
+            .await?;
+            crate::failpoints::maybe_fail(
+                crate::failpoints::names::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+            )?;
+            commit_updates_on_branch_with_expected(
+                db,
+                active_branch.as_deref(),
+                &updates,
+                &expected_versions,
                 None,
-            ),
-        };
-        let row_count = db.storage().count_rows(&ds, None).await.unwrap_or(0);
-        if row_count > 0 {
-            pending.extend(build_indices_on_dataset(db, &table_key, &mut ds).await?);
+                &txn,
+                lineage,
+            )
+            .await?;
+            Ok::<(), OmniError>(())
+        }
+        .await;
+
+        if let Err(error) = post_arm_result {
+            return Err(OmniError::recovery_required(
+                recovery_operation_id,
+                error.to_string(),
+            ));
         }
 
-        let state = db.storage().table_state(&full_path, &ds).await?;
-        if state.version != entry.table_version
-            || resolved_branch.as_deref() != entry.table_branch.as_deref()
+        if let Err(err) =
+            crate::db::manifest::delete_sidecar(&recovery_handle, db.storage_adapter()).await
         {
-            updates.push(crate::db::SubTableUpdate {
-                table_key,
-                table_version: state.version,
-                table_branch: resolved_branch,
-                row_count: state.row_count,
-                version_metadata: state.version_metadata,
-            });
-        }
-    }
-
-    // Failpoint: pin the per-writer Phase B → Phase C residual for
-    // ensure_indices. Lance HEAD has advanced on every touched table
-    // (one commit_staged per index built) but the manifest publish below
-    // hasn't run. Used by
-    // `tests/failpoints.rs::ensure_indices_phase_b_failure_recovered_on_next_open`.
-    crate::failpoints::maybe_fail(crate::failpoints::names::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT)?;
-
-    if !updates.is_empty() {
-        commit_prepared_updates_on_branch(db, branch, &updates, None).await?;
-    }
-
-    // Recovery sidecar lifecycle: delete after the manifest publish (or
-    // no-op when there were no updates — the sidecar covered the
-    // per-table commit window regardless). Best-effort cleanup; failing
-    // the user here would error a call that already succeeded.
-    if let Some(handle) = recovery_handle {
-        if let Err(err) = crate::db::manifest::delete_sidecar(&handle, db.storage_adapter()).await {
             tracing::warn!(
                 error = %err,
-                operation_id = handle.operation_id.as_str(),
+                operation_id = recovery_handle.operation_id.as_str(),
                 "recovery sidecar cleanup failed; the next open's recovery sweep will resolve it"
             );
         }
     }
 
+    // Preserve the historical, observable catalog order even though planning
+    // and physical effects now happen in separate phases.
+    let mut pending = Vec::new();
+    for type_name in catalog.node_types.keys() {
+        if let Some(mut table_pending) = pending_by_table.remove(&format!("node:{type_name}")) {
+            pending.append(&mut table_pending);
+        }
+    }
     Ok(pending)
+}
+
+fn pre_minted_index_transaction(
+    read_version: u64,
+) -> crate::table_store::StagedTransactionIdentity {
+    crate::table_store::StagedTransactionIdentity {
+        read_version,
+        uuid: format!("omnigraph-index-{}", ulid::Ulid::new()),
+    }
 }
 
 /// The single scalar/vector index a node property receives from a one-column
@@ -324,7 +567,7 @@ pub(super) async fn ensure_indices_for_branch(
 /// indexable here (a list column or `Blob`).
 ///
 /// Shared by `build_indices_on_dataset_for_catalog` (which builds the index)
-/// and `needs_index_work_node` (which checks coverage to decide recovery-
+/// and `index_work_status_on_dataset_for_catalog` (which decides recovery-
 /// sidecar pinning) so the two cannot drift: an enum or orderable scalar the
 /// builder gives a BTREE must also be reported as "needs work" until that
 /// BTREE exists, or the HEAD-advancing build would run without sidecar cover.
@@ -363,11 +606,11 @@ fn node_prop_index_kind(prop_type: &PropType) -> Option<NodePropIndexKind> {
 
 /// Whether a vector column currently has at least one non-null vector — the
 /// minimum for Lance IVF k-means to train (the `ivf_flat(1)` index we build
-/// needs >=1 vector). Used identically by `needs_index_work_node` (so an
+/// needs >=1 vector). Used identically by index-work status planning (so an
 /// untrainable column is not pinned for recovery — avoiding a zero-commit pin
 /// that would roll back a sibling's index work) and by the vector build arm (so
-/// `create_vector_index` is only attempted when it can succeed, keeping its
-/// genuine errors fatal instead of swallowed as pending). If index params
+/// vector staging is only attempted when it can succeed, keeping genuine
+/// build errors fatal instead of swallowed as pending). If index params
 /// become size-aware (dev-graph iss-687), this threshold moves with them.
 async fn vector_column_trainable(
     db: &Omnigraph,
@@ -381,9 +624,19 @@ async fn vector_column_trainable(
         > 0)
 }
 
-/// Returns true if the node table is missing at least one declared
-/// scalar/vector index that `build_indices_on_dataset_for_catalog` would
-/// build AND has at least one row (the ensure_indices loop has
+/// Describes the index work visible from one already-selected dataset snapshot.
+/// `needs_commit` excludes pending-only work (today an untrainable vector
+/// column), which is load-bearing for multi-table recovery: a table that cannot
+/// advance HEAD must not become a zero-movement pin beside productive siblings.
+pub(super) struct IndexWorkStatus {
+    pub(super) needs_commit: bool,
+    pub(super) pending: Vec<PendingIndex>,
+}
+
+/// Returns the declared scalar/vector index work that
+/// `build_indices_on_dataset_for_catalog` would build, plus pending-only work,
+/// for one operation-local accepted catalog and one selected dataset snapshot.
+/// The table must have at least one row (the ensure_indices loop has
 /// `if row_count > 0 { build_indices(...) }`, so empty tables produce
 /// zero commits and must NOT be pinned in the sidecar — pinning them
 /// would force `NoMovement` classification on recovery and trigger the
@@ -392,35 +645,55 @@ async fn vector_column_trainable(
 /// Per `build_indices_on_dataset_for_catalog`, nodes get BTree (id) plus, for
 /// each one-column `@index`/`@key` property, the index `node_prop_index_kind`
 /// assigns: a scalar BTREE for enums and orderable scalars
-/// (DateTime/Date/numeric/Bool), FTS for free-text Strings, or a Vector index.
-/// Edges get BTree only (id, src, dst). This helper and the builder share
-/// `node_prop_index_kind` so they cannot drift — see its doc comment.
-pub(super) async fn needs_index_work_node(
+/// (DateTime/Date/numeric/Bool), FTS for free-text Strings, or a Vector
+/// index. Edges get BTree only (id, src, dst). This helper and the builder
+/// share `node_prop_index_kind` so they cannot drift — see its doc comment.
+#[derive(Default)]
+struct PlannedIndexWork {
+    specs: Vec<crate::storage_layer::IndexBuildSpec>,
+    pending: Vec<PendingIndex>,
+}
+
+impl PlannedIndexWork {
+    fn needs_commit(&self) -> bool {
+        !self.specs.is_empty()
+    }
+
+    /// A property can reach the catalog's index-intent list through more than
+    /// one annotation (for example `@key` plus an explicit `@index`). The old
+    /// per-index commit loop observed the first committed index before visiting
+    /// the duplicate intent; a one-snapshot batch must deduplicate explicitly.
+    fn push_spec(&mut self, spec: crate::storage_layer::IndexBuildSpec) {
+        if !self.specs.contains(&spec) {
+            self.specs.push(spec);
+        }
+    }
+}
+
+/// Classify index work against one already-selected dataset snapshot and one
+/// operation-local accepted catalog. Keeping the opener outside this helper is
+/// load-bearing for named-branch first touch: an inherited graph entry must be
+/// checked at its exact pinned version, not at the inherited owner's newer HEAD.
+async fn plan_index_work_node(
     db: &Omnigraph,
+    catalog: &Catalog,
     type_name: &str,
-    full_path: &str,
-    table_branch: Option<&str>,
-) -> Result<bool> {
-    let ds = db
-        .storage()
-        .open_dataset_head(full_path, table_branch)
-        .await?;
-    // Empty tables are skipped by the ensure_indices loop, so they must
-    // not be pinned in the sidecar — pinning a table that produces zero
-    // commits classifies as NoMovement on recovery and forces all-or-
-    // nothing rollback of sibling tables' legitimate index work.
-    // Errors from count_rows are propagated: silently treating them as
-    // "0 rows" risks skipping a table that is actually about to be
-    // modified.
-    if db.storage().count_rows(&ds, None).await? == 0 {
-        return Ok(false);
+    table_key: &str,
+    ds: &SnapshotHandle,
+) -> Result<PlannedIndexWork> {
+    if db.storage().count_rows(ds, None).await? == 0 {
+        return Ok(PlannedIndexWork::default());
     }
-    if !db.storage().has_btree_index(&ds, "id").await? {
-        return Ok(true);
+
+    let mut work = PlannedIndexWork::default();
+    if !db.storage().has_btree_index(ds, "id").await? {
+        work.push_spec(crate::storage_layer::IndexBuildSpec::BTree {
+            column: "id".to_string(),
+            name: None,
+        });
     }
-    let catalog = db.catalog();
     let Some(node_type) = catalog.node_types.get(type_name) else {
-        return Ok(false);
+        return Ok(work);
     };
     for index_cols in &node_type.indices {
         if index_cols.len() != 1 {
@@ -432,58 +705,93 @@ pub(super) async fn needs_index_work_node(
         };
         match node_prop_index_kind(prop_type) {
             Some(NodePropIndexKind::Fts) => {
-                if !db.storage().has_fts_index(&ds, prop_name).await? {
-                    return Ok(true);
+                if !db.storage().has_fts_index(ds, prop_name).await? {
+                    work.push_spec(crate::storage_layer::IndexBuildSpec::FullText {
+                        column: prop_name.clone(),
+                    });
                 }
+                // DEFERRED: a companion BTREE here would index-accelerate
+                // equality and `starts_with` on free-text Strings (Lance
+                // never consults an inverted index for either), and the
+                // staged machinery supports it (`IndexBuildSpec::BTree`
+                // explicit names; the same-column batch test). It is held
+                // back because Lance's second-generation shallow clones
+                // cannot read parent index files at all — every indexed read
+                // through a branch-of-a-branch fork hard-errors
+                // (lance-format/lance#7840), and the companion would widen
+                // that exposure to every `@key` equality lookup. Re-land when
+                // `lance_surface_guards::second_generation_branch_index_reads_fail_upstream`
+                // turns red (its panic message carries the checklist).
             }
             Some(NodePropIndexKind::Vector) => {
-                // Only count a missing vector index as buildable *work* when the
-                // column is trainable (>=1 non-null vector). An untrainable
-                // column would defer in the build and commit nothing; pinning it
-                // for recovery would be a zero-commit pin that classifies
-                // NoMovement and rolls back a sibling table's index work.
-                if !db.storage().has_vector_index(&ds, prop_name).await?
-                    && vector_column_trainable(db, &ds, prop_name).await?
-                {
-                    return Ok(true);
+                if !db.storage().has_vector_index(ds, prop_name).await? {
+                    if vector_column_trainable(db, ds, prop_name).await? {
+                        work.push_spec(crate::storage_layer::IndexBuildSpec::Vector {
+                            column: prop_name.clone(),
+                        });
+                    } else {
+                        work.pending.push(PendingIndex {
+                            table_key: table_key.to_string(),
+                            column: prop_name.clone(),
+                            reason: "column has no non-null vectors to train on yet".to_string(),
+                        });
+                    }
                 }
             }
-            Some(NodePropIndexKind::Btree) => {
-                if !db.storage().has_btree_index(&ds, prop_name).await? {
-                    return Ok(true);
-                }
+            Some(NodePropIndexKind::Btree)
+                if !db.storage().has_btree_index(ds, prop_name).await? =>
+            {
+                work.push_spec(crate::storage_layer::IndexBuildSpec::BTree {
+                    column: prop_name.clone(),
+                    name: None,
+                });
             }
-            None => {}
+            Some(NodePropIndexKind::Btree) | None => {}
         }
     }
-    Ok(false)
+    Ok(work)
 }
 
-/// Companion to `needs_index_work_node` for edge tables.
-///
-/// **Intentional asymmetry with the node helper**: edges only need
-/// BTree indices (id, src, dst) per `build_indices_on_dataset_for_catalog`
-/// at the edge branch (this file, lines 474-485). FTS / vector indices
-/// on edge properties are not built today; if they ever are, this
-/// helper plus the build function must be updated together.
-///
-/// Empty edge tables are skipped by the ensure_indices loop the same
-/// way node tables are; see `needs_index_work_node`.
-pub(super) async fn needs_index_work_edge(
+pub(super) async fn index_work_status_on_dataset_for_catalog(
     db: &Omnigraph,
-    full_path: &str,
-    table_branch: Option<&str>,
-) -> Result<bool> {
-    let ds = db
-        .storage()
-        .open_dataset_head(full_path, table_branch)
-        .await?;
-    if db.storage().count_rows(&ds, None).await? == 0 {
-        return Ok(false);
+    catalog: &Catalog,
+    table_key: &str,
+    ds: &SnapshotHandle,
+) -> Result<IndexWorkStatus> {
+    let work = if let Some(type_name) = table_key.strip_prefix("node:") {
+        plan_index_work_node(db, catalog, type_name, table_key, ds).await?
+    } else if table_key.starts_with("edge:") {
+        // Intentional asymmetry: edges only receive the id/src/dst BTREEs.
+        plan_index_work_edge_on_dataset(db, ds).await?
+    } else {
+        return Err(OmniError::manifest(format!(
+            "invalid table key '{}'",
+            table_key
+        )));
+    };
+    Ok(IndexWorkStatus {
+        needs_commit: work.needs_commit(),
+        pending: work.pending,
+    })
+}
+
+async fn plan_index_work_edge_on_dataset(
+    db: &Omnigraph,
+    ds: &SnapshotHandle,
+) -> Result<PlannedIndexWork> {
+    if db.storage().count_rows(ds, None).await? == 0 {
+        return Ok(PlannedIndexWork::default());
     }
-    Ok(!db.storage().has_btree_index(&ds, "id").await?
-        || !db.storage().has_btree_index(&ds, "src").await?
-        || !db.storage().has_btree_index(&ds, "dst").await?)
+    let mut work = PlannedIndexWork::default();
+    for column in ["id", "src", "dst"] {
+        if !db.storage().has_btree_index(ds, column).await? {
+            work.push_spec(crate::storage_layer::IndexBuildSpec::BTree {
+                column: column.to_string(),
+                name: None,
+            });
+        }
+    }
+    Ok(work)
 }
 
 /// Result of opening a sub-table for mutation. `handle` is `None` only when a
@@ -493,6 +801,10 @@ pub(super) async fn needs_index_work_edge(
 /// every no-`txn` caller (branch merge), which use [`Self::require_handle`].
 #[derive(Debug)]
 pub(crate) struct OpenedForMutation {
+    /// Immutable logical table lifetime captured from the same manifest entry
+    /// as `expected_version`. Writers carry this through recovery and publish;
+    /// the mutable alias is never used as OCC identity.
+    pub(crate) identity: crate::db::manifest::TableIdentity,
     /// The opened dataset, or `None` on the non-strict-txn open-skip path.
     pub(crate) handle: Option<SnapshotHandle>,
     /// The publisher's CAS fence: the opened handle's version, or — when the open
@@ -500,6 +812,17 @@ pub(crate) struct OpenedForMutation {
     pub(crate) expected_version: u64,
     pub(crate) full_path: String,
     pub(crate) table_branch: Option<String>,
+    /// RFC-022 first-touch named-branch writes stage against the inherited
+    /// source snapshot and defer the durable Lance ref creation until after
+    /// their v9 recovery intent (`protocol_v3` payload) is armed in
+    /// `StagedMutation::commit_all`.
+    pub(crate) deferred_fork: Option<DeferredTableFork>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DeferredTableFork {
+    pub(crate) source_entry: crate::db::SubTableEntry,
+    pub(crate) target_branch: String,
 }
 
 impl OpenedForMutation {
@@ -586,19 +909,23 @@ pub(super) async fn open_for_mutation_on_branch(
             // Non-strict, table already on the active branch → no open, no fork.
             Some(active_branch) if entry.table_branch.as_deref() == Some(active_branch) => {
                 return Ok(OpenedForMutation {
+                    identity: entry.identity,
                     handle: None,
                     expected_version: entry.table_version,
                     full_path,
                     table_branch: Some(active_branch.to_string()),
+                    deferred_fork: None,
                 });
             }
             // Main branch, non-strict → no open. (Main never forks.)
             None => {
                 return Ok(OpenedForMutation {
+                    identity: entry.identity,
                     handle: None,
                     expected_version: entry.table_version,
                     full_path,
                     table_branch: None,
+                    deferred_fork: None,
                 });
             }
             // Non-strict but the table isn't on the active branch yet — falls
@@ -609,39 +936,70 @@ pub(super) async fn open_for_mutation_on_branch(
 
     match resolved_branch.as_deref() {
         None => {
-            let ds = db
-                .storage()
-                .open_dataset_head(&full_path, None)
-                .await?;
+            let ds = db.storage().open_dataset_head(&full_path, None).await?;
             if op_kind.strict_pre_stage_version_check() {
-                db.storage()
-                    .ensure_expected_version(&ds, table_key, entry.table_version)?;
+                if txn.is_some() && ds.version() != entry.table_version {
+                    return Err(OmniError::manifest_read_set_changed(
+                        format!("table_head:{table_key}"),
+                        Some(entry.table_version.to_string()),
+                        Some(ds.version().to_string()),
+                    ));
+                }
+                if txn.is_none() {
+                    db.storage()
+                        .ensure_expected_version(&ds, table_key, entry.table_version)?;
+                }
             }
             let version = ds.version();
             Ok(OpenedForMutation {
+                identity: entry.identity,
                 handle: Some(ds),
                 expected_version: version,
                 full_path,
                 table_branch: None,
+                deferred_fork: None,
             })
         }
         Some(active_branch) => {
+            // RFC-022-enrolled mutation/load adapters must arm durable intent
+            // before creating a per-table Lance branch ref. Read and stage from
+            // the inherited source entry now; `commit_all` creates the target
+            // ref after its v9 sidecar is durable, then commits this transaction
+            // onto the new ref. Legacy writers retain the eager fork path below.
+            if txn.is_some() && entry.table_branch.as_deref() != Some(active_branch) {
+                let ds = db.storage().open_snapshot_at_entry(entry).await?;
+                return Ok(OpenedForMutation {
+                    identity: entry.identity,
+                    handle: Some(ds),
+                    expected_version: entry.table_version,
+                    full_path,
+                    table_branch: Some(active_branch.to_string()),
+                    deferred_fork: Some(DeferredTableFork {
+                        source_entry: entry.clone(),
+                        target_branch: active_branch.to_string(),
+                    }),
+                });
+            }
             let (ds, table_branch) = open_owned_dataset_for_branch_write(
                 db,
                 table_key,
+                entry.identity,
                 &full_path,
                 entry.table_branch.as_deref(),
                 entry.table_version,
                 active_branch,
                 op_kind,
+                txn.is_some(),
             )
             .await?;
             let version = ds.version();
             Ok(OpenedForMutation {
+                identity: entry.identity,
                 handle: Some(ds),
                 expected_version: version,
                 full_path,
                 table_branch,
+                deferred_fork: None,
             })
         }
     }
@@ -650,11 +1008,13 @@ pub(super) async fn open_for_mutation_on_branch(
 pub(super) async fn open_owned_dataset_for_branch_write(
     db: &Omnigraph,
     table_key: &str,
+    identity: crate::db::manifest::TableIdentity,
     full_path: &str,
     entry_branch: Option<&str>,
     entry_version: u64,
     active_branch: &str,
     op_kind: crate::db::MutationOpKind,
+    occ_enrolled: bool,
 ) -> Result<(SnapshotHandle, Option<String>)> {
     match entry_branch {
         Some(branch) if branch == active_branch => {
@@ -663,8 +1023,17 @@ pub(super) async fn open_owned_dataset_for_branch_write(
                 .open_dataset_head(full_path, Some(active_branch))
                 .await?;
             if op_kind.strict_pre_stage_version_check() {
-                db.storage()
-                    .ensure_expected_version(&ds, table_key, entry_version)?;
+                if occ_enrolled && ds.version() != entry_version {
+                    return Err(OmniError::manifest_read_set_changed(
+                        format!("table_head:{table_key}"),
+                        Some(entry_version.to_string()),
+                        Some(ds.version().to_string()),
+                    ));
+                }
+                if !occ_enrolled {
+                    db.storage()
+                        .ensure_expected_version(&ds, table_key, entry_version)?;
+                }
             }
             Ok((ds, Some(active_branch.to_string())))
         }
@@ -678,11 +1047,19 @@ pub(super) async fn open_owned_dataset_for_branch_write(
             let live = db.snapshot_for_branch(Some(active_branch)).await?;
             if let Some(entry) = live.entry(table_key) {
                 if entry.table_branch.as_deref() == Some(active_branch) {
-                    return Err(OmniError::manifest_expected_version_mismatch(
-                        table_key,
-                        entry_version,
-                        entry.table_version,
-                    ));
+                    return if occ_enrolled {
+                        Err(OmniError::manifest_read_set_changed(
+                            format!("table_head:{table_key}"),
+                            Some(entry_version.to_string()),
+                            Some(entry.table_version.to_string()),
+                        ))
+                    } else {
+                        Err(OmniError::manifest_expected_version_mismatch(
+                            table_key,
+                            entry_version,
+                            entry.table_version,
+                        ))
+                    };
                 }
             }
             // The fork advances Lance state before the manifest publish. The
@@ -694,6 +1071,7 @@ pub(super) async fn open_owned_dataset_for_branch_write(
             // `Omnigraph::fork_dataset_from_entry_state`.
             db.fork_dataset_from_entry_state(
                 table_key,
+                identity,
                 full_path,
                 source_branch,
                 entry_version,
@@ -758,9 +1136,36 @@ pub(crate) enum ForkRefStatus {
 /// destroy-only-on-`Orphan` rule is enforced here, once.
 pub(crate) async fn classify_fork_ref(
     db: &Omnigraph,
-    table_key: &str,
+    _table_key: &str,
+    identity: crate::db::manifest::TableIdentity,
     branch: &str,
+    excluding_operation_id: Option<&str>,
 ) -> ForkRefStatus {
+    // Deferred mutation/load forks are created only after their v9 sidecar is
+    // durable. Until the manifest publish places this table on `branch`, that
+    // sidecar is the only durable ownership record for the ref. Treat a
+    // matching pending intent as indeterminate rather than an orphan so neither
+    // destructive caller can steal a live writer's fork. The writer that owns
+    // the intent may exclude itself while reclaiming a genuinely stale ref it
+    // collided with; every other sidecar remains a hard stop. A list failure is
+    // likewise indeterminate -- cleanup must never turn missing authority into
+    // permission to delete.
+    let sidecars =
+        match crate::db::manifest::list_sidecars(db.root_uri(), db.storage_adapter()).await {
+            Ok(sidecars) => sidecars,
+            Err(_) => return ForkRefStatus::Indeterminate,
+        };
+    if sidecars.iter().any(|sidecar| {
+        Some(sidecar.operation_id.as_str()) != excluding_operation_id
+            && sidecar.branch.as_deref() == Some(branch)
+            && sidecar
+                .tables
+                .iter()
+                .any(|pin| pin.identity == identity && pin.table_branch.as_deref() == Some(branch))
+    }) {
+        return ForkRefStatus::Indeterminate;
+    }
+
     // `classify.fresh_read` failpoint: simulate a transient failure of the
     // fresh-authority read (no-op without the `failpoints` feature). Lets a
     // test exercise the Indeterminate path — a read failure on a live branch
@@ -772,7 +1177,8 @@ pub(crate) async fn classify_fork_ref(
     match fresh {
         Ok(snap) => {
             let placed = snap
-                .entry(table_key)
+                .entries()
+                .find(|entry| entry.identity == identity)
                 .map(|e| e.table_branch.as_deref() == Some(branch))
                 .unwrap_or(false);
             if placed {
@@ -815,25 +1221,72 @@ pub(crate) async fn classify_fork_ref(
 pub(super) async fn reclaim_orphaned_fork_and_refork(
     db: &Omnigraph,
     table_key: &str,
+    identity: crate::db::manifest::TableIdentity,
     full_path: &str,
     source_branch: Option<&str>,
     source_version: u64,
     active_branch: &str,
+    current_operation_id: Option<&str>,
 ) -> Result<SnapshotHandle> {
+    // The immutable identity and physical target are one authority fact. Keep
+    // them coupled here as a final destructive-operation guard: an old
+    // incarnation must never authorize deleting a ref on a replacement table's
+    // path, even if both lifetimes reused the same public alias.
+    let canonical_path = crate::db::manifest::table_path_for_identity(table_key, identity)?;
+    let canonical_full_path = db.storage().dataset_uri(&canonical_path);
+    if full_path != canonical_full_path {
+        return Err(OmniError::manifest_read_set_changed(
+            format!("fork_target_path:{identity}"),
+            Some(canonical_full_path),
+            Some(full_path.to_string()),
+        ));
+    }
+
+    // A v9 mutation/load sidecar (`protocol_v3` payload) is written before its deferred fork. A
+    // manifest-unreferenced ref claimed by another pending operation is live,
+    // not an orphan: never force-delete it. Excluding our own operation lets a
+    // writer reclaim a genuinely stale pre-existing ref after its own intent is
+    // durable. A sidecar-list failure is indeterminate and therefore loud.
+    let sidecars = crate::db::manifest::list_sidecars(db.root_uri(), db.storage_adapter()).await?;
+    if let Some(owner) = sidecars.iter().find(|sidecar| {
+        Some(sidecar.operation_id.as_str()) != current_operation_id
+            && sidecar.branch.as_deref() == Some(active_branch)
+            && sidecar.tables.iter().any(|pin| {
+                pin.identity == identity && pin.table_branch.as_deref() == Some(active_branch)
+            })
+    }) {
+        return Err(OmniError::manifest_read_set_changed(
+            format!("fork_intent:{active_branch}:{table_key}"),
+            None,
+            Some(owner.operation_id.clone()),
+        ));
+    }
+
     // Self-validate against FRESH authority before destroying anything. Only an
     // Orphan is reclaimable; a Legitimate status (a concurrent writer published
     // a real fork despite the caller's possibly-cached proof) or an
     // Indeterminate one (transient read) surfaces a retryable conflict rather
     // than stranding the manifest at a version the recreated ref won't have.
-    match classify_fork_ref(db, table_key, active_branch).await {
+    match classify_fork_ref(db, table_key, identity, active_branch, current_operation_id).await {
         ForkRefStatus::Orphan => {}
         ForkRefStatus::Legitimate => {
             let actual = db
                 .fresh_snapshot_for_branch(Some(active_branch))
                 .await
                 .ok()
-                .and_then(|s| s.entry(table_key).map(|e| e.table_version))
+                .and_then(|s| {
+                    s.entries()
+                        .find(|entry| entry.identity == identity)
+                        .map(|entry| entry.table_version)
+                })
                 .unwrap_or(source_version);
+            if current_operation_id.is_some() {
+                return Err(OmniError::manifest_read_set_changed(
+                    format!("table_head:{table_key}"),
+                    Some(source_version.to_string()),
+                    Some(actual.to_string()),
+                ));
+            }
             return Err(OmniError::manifest_expected_version_mismatch(
                 table_key,
                 source_version,
@@ -886,8 +1339,9 @@ pub(super) async fn reclaim_orphaned_fork_and_refork(
         crate::storage_layer::ForkOutcome::RefAlreadyExists => {
             let live = db.fresh_snapshot_for_branch(Some(active_branch)).await?;
             let actual = live
-                .entry(table_key)
-                .map(|e| e.table_version)
+                .entries()
+                .find(|entry| entry.identity == identity)
+                .map(|entry| entry.table_version)
                 .unwrap_or(source_version);
             Err(OmniError::manifest_expected_version_mismatch(
                 table_key,
@@ -956,196 +1410,50 @@ pub(super) async fn build_indices_on_dataset_for_catalog(
     table_key: &str,
     ds: &mut SnapshotHandle,
 ) -> Result<Vec<PendingIndex>> {
-    if let Some(type_name) = table_key.strip_prefix("node:") {
-        let mut pending = Vec::new();
-        if !db.storage().has_btree_index(ds, "id").await? {
-            stage_and_commit_btree(db, table_key, ds, &["id"]).await?;
-        }
+    let work = if let Some(type_name) = table_key.strip_prefix("node:") {
+        plan_index_work_node(db, catalog, type_name, table_key, ds).await?
+    } else if table_key.starts_with("edge:") {
+        plan_index_work_edge_on_dataset(db, ds).await?
+    } else {
+        return Err(OmniError::manifest(format!(
+            "invalid table key '{}'",
+            table_key
+        )));
+    };
 
-        if let Some(node_type) = catalog.node_types.get(type_name) {
-            // Stage scalar indices first (BTree, Inverted), then call
-            // `create_vector_index` inline. The inline-commit on a vector
-            // index advances HEAD, which would invalidate any uncommitted
-            // scalar index transactions if we stacked them. Today the
-            // per-stage shape commits each scalar index immediately so
-            // the order constraint is implicit, but if we ever batch
-            // scalar stages we must ensure they all land before the
-            // vector inline-commit.
-            for index_cols in &node_type.indices {
-                if index_cols.len() != 1 {
-                    continue;
-                }
-                let prop_name = &index_cols[0];
-                if let Some(prop_type) = node_type.properties.get(prop_name) {
-                    match node_prop_index_kind(prop_type) {
-                        Some(NodePropIndexKind::Fts) => {
-                            if !db.storage().has_fts_index(ds, prop_name).await? {
-                                stage_and_commit_inverted(db, table_key, ds, prop_name.as_str())
-                                    .await?;
-                            }
-                        }
-                        Some(NodePropIndexKind::Vector) => {
-                            if !db.storage().has_vector_index(ds, prop_name).await? {
-                                // A vector (IVF) index trains k-means over the column,
-                                // so it needs >=1 non-null vector (KMeans errors
-                                // "cannot train N centroids with 0 vectors"). Precheck
-                                // trainability: a column with no vectors yet (e.g. rows
-                                // loaded before `embed`) is recorded as a *pending*
-                                // index and skipped — deferred, not failed. The SAME
-                                // predicate gates `needs_index_work_node`, so an
-                                // untrainable column is never pinned for recovery (no
-                                // zero-commit pin that would roll back a sibling
-                                // table's index work). This function is the chokepoint
-                                // every write path funnels through (load/mutate, schema
-                                // apply, ensure_indices, optimize, merge), realizing
-                                // the governing principle — physical index state never
-                                // fails a logical operation. Only when trainable do we
-                                // attempt the build, and then we PROPAGATE any error: a
-                                // genuine I/O/manifest/Lance failure must stay fatal,
-                                // not be hidden as pending. (Vector creation is an
-                                // inline-commit residual until lance#6666; iss-951.)
-                                if vector_column_trainable(db, ds, prop_name).await? {
-                                    let new_snap = db
-                                        .storage_inline_residual()
-                                        .create_vector_index(ds.clone(), prop_name.as_str())
-                                        .await
-                                        .map_err(|e| {
-                                            OmniError::Lance(format!(
-                                                "create Vector index on {}({}): {}",
-                                                table_key, prop_name, e
-                                            ))
-                                        })?;
-                                    *ds = new_snap;
-                                } else {
-                                    tracing::info!(
-                                        target: "omnigraph::index",
-                                        table = %table_key,
-                                        column = %prop_name,
-                                        "deferring Vector index: column has no \
-                                         trainable vectors yet",
-                                    );
-                                    pending.push(PendingIndex {
-                                        table_key: table_key.to_string(),
-                                        column: prop_name.clone(),
-                                        reason: "column has no non-null vectors to \
-                                                 train on yet"
-                                            .to_string(),
-                                    });
-                                }
-                            }
-                        }
-                        // Enum + orderable scalars (DateTime/Date/numeric/Bool)
-                        // get a BTREE so `=`, range, IN, and IS NULL are index-
-                        // accelerated instead of degrading to a full scan.
-                        Some(NodePropIndexKind::Btree) => {
-                            if !db.storage().has_btree_index(ds, prop_name).await? {
-                                stage_and_commit_btree(db, table_key, ds, &[prop_name.as_str()])
-                                    .await?;
-                            }
-                        }
-                        // List or Blob column: not indexable as a scalar here.
-                        None => {}
-                    }
-                }
-            }
-        }
-        return Ok(pending);
+    if work.specs.is_empty() {
+        return Ok(work.pending);
     }
 
-    if table_key.starts_with("edge:") {
-        if !db.storage().has_btree_index(ds, "id").await? {
-            stage_and_commit_btree(db, table_key, ds, &["id"]).await?;
-        }
-        if !db.storage().has_btree_index(ds, "src").await? {
-            stage_and_commit_btree(db, table_key, ds, &["src"]).await?;
-        }
-        if !db.storage().has_btree_index(ds, "dst").await? {
-            stage_and_commit_btree(db, table_key, ds, &["dst"]).await?;
-        }
-        // Edge tables only get BTree (id/src/dst), which build at any
-        // cardinality; no pending state is possible here.
-        return Ok(Vec::new());
-    }
-
-    Err(OmniError::manifest(format!(
-        "invalid table key '{}'",
-        table_key
-    )))
-}
-
-/// Stage a BTREE index transaction and commit it, advancing the in-memory
-/// `*ds` to the new HEAD. The staged primitive + immediate `commit_staged`
-/// pair replaced the earlier inline-commit `create_btree_index(ds)` call.
-/// Per-call behavior is unchanged (HEAD advances once per index), but
-/// the bytes-on-disk and HEAD-advance are now decoupled at the
-/// `TableStore` API surface — a caller that needs end-of-batch atomicity
-/// can stage many transactions and commit them in one pass (the eventual
-/// index reconciler relies on this).
-async fn stage_and_commit_btree(
-    db: &Omnigraph,
-    table_key: &str,
-    ds: &mut SnapshotHandle,
-    columns: &[&str],
-) -> Result<()> {
     let staged = db
         .storage()
-        .stage_create_btree_index(ds, columns)
+        .stage_create_indices(ds, &work.specs)
         .await
-        .map_err(|e| {
+        .map_err(|error| {
             OmniError::Lance(format!(
-                "stage_create_btree_index on {}({:?}): {}",
-                table_key, columns, e
+                "stage index batch on {} ({:?}): {}",
+                table_key, work.specs, error
             ))
         })?;
-    // Failpoint between stage and commit. Used by `tests/failpoints.rs`
-    // to demonstrate that a stage-step failure in the staged-index
-    // path (`stage_create_btree_index` succeeded; `commit_staged` not
-    // yet called) leaves no Lance-HEAD drift on the touched table.
-    crate::failpoints::maybe_fail(crate::failpoints::names::ENSURE_INDICES_POST_STAGE_PRE_COMMIT_BTREE)?;
+    // Retain the established test seam at the now-batched stage/commit
+    // boundary. EnsureIndices itself stages existing targets before its gates;
+    // legacy callers of this shared helper still exercise the same no-HEAD-
+    // movement guarantee.
+    crate::failpoints::maybe_fail(
+        crate::failpoints::names::ENSURE_INDICES_POST_STAGE_PRE_COMMIT_BTREE,
+    )?;
     let new_ds = db
         .storage()
         .commit_staged(ds.clone(), staged)
         .await
-        .map_err(|e| {
+        .map_err(|error| {
             OmniError::Lance(format!(
-                "commit BTree index on {}({:?}): {}",
-                table_key, columns, e
+                "commit index batch on {} ({:?}): {}",
+                table_key, work.specs, error
             ))
         })?;
     *ds = new_ds;
-    Ok(())
-}
-
-/// Stage an INVERTED (FTS) index transaction and commit it. See
-/// `stage_and_commit_btree` for the rationale.
-async fn stage_and_commit_inverted(
-    db: &Omnigraph,
-    table_key: &str,
-    ds: &mut SnapshotHandle,
-    column: &str,
-) -> Result<()> {
-    let staged = db
-        .storage()
-        .stage_create_inverted_index(ds, column)
-        .await
-        .map_err(|e| {
-            OmniError::Lance(format!(
-                "stage_create_inverted_index on {}({}): {}",
-                table_key, column, e
-            ))
-        })?;
-    let new_ds = db
-        .storage()
-        .commit_staged(ds.clone(), staged)
-        .await
-        .map_err(|e| {
-            OmniError::Lance(format!(
-                "commit Inverted index on {}({}): {}",
-                table_key, column, e
-            ))
-        })?;
-    *ds = new_ds;
-    Ok(())
+    Ok(work.pending)
 }
 
 async fn prepare_updates_for_commit(
@@ -1153,30 +1461,27 @@ async fn prepare_updates_for_commit(
     branch: Option<&str>,
     updates: &[crate::db::SubTableUpdate],
     txn: Option<&crate::db::WriteTxn>,
-    // Post-`commit_staged` handles handed out by `StagedMutation::commit_all`
-    // (RFC-013 step 3b, collapse #4): table_key → the handle already open at
-    // its just-committed version. When a table's handle is present, the index
-    // build below reuses it and SKIPS the `reopen_for_mutation` open. Absent
-    // entries (other writers — schema apply, merge, ensure_indices, tests —
-    // pass `HashMap::new()`) keep the byte-identical `reopen_for_mutation`
-    // path. Delete tables ARE staged now (MR-A), so their handle is present
-    // like any other staged write.
-    mut committed_handles: std::collections::HashMap<String, SnapshotHandle>,
 ) -> Result<Vec<crate::db::SubTableUpdate>> {
     if updates.is_empty() {
         return Ok(Vec::new());
     }
 
-    // With a `WriteTxn` the schema contract was validated once at capture, so
-    // reuse the pinned base entries (same per-branch manifest snapshot) instead
-    // of `snapshot_for_branch` (which re-runs `ensure_schema_state_valid`). Only
-    // the `entry(table_key).table_path` is read out of it here, identical to the
-    // no-txn path; the post-`commit_staged` index build below still reopens the
-    // dataset at its just-committed version. Without a txn, byte-identical.
-    let snapshot = match txn {
-        Some(txn) => txn.base.clone(),
-        None => db.snapshot_for_branch(branch).await?,
-    };
+    // RFC-022 mutation/load adapter: the physical effect envelope must be
+    // closed before its recovery sidecar is armed. Building missing indexes
+    // here can add one extra staged CreateIndex commit per table, which is not
+    // the exact logical-data transaction promised by that sidecar. Indexes are derived
+    // state: enrolled mutation/load writes publish the exact data-table result
+    // and leave declared-index materialization to the existing
+    // ensure_indices/optimize reconciler. Legacy test/merge callers retain the
+    // shared rebuild tail below.
+    if txn.is_some() {
+        return Ok(updates.to_vec());
+    }
+
+    // Enrolled mutation/load returned above: derived-index work is deliberately
+    // outside their exact physical effect envelope. Legacy callers retain the
+    // historical reopen/build path.
+    let snapshot = db.snapshot_for_branch(branch).await?;
     let mut prepared = Vec::with_capacity(updates.len());
 
     for update in updates {
@@ -1190,38 +1495,26 @@ async fn prepare_updates_for_commit(
         let mut prepared_update = update.clone();
         if prepared_update.row_count > 0 {
             let full_path = format!("{}/{}", db.root_uri, entry.table_path);
-            // Reuse the post-`commit_staged` handle when the caller handed one
-            // out (collapse #4): it is already open at exactly
-            // `prepared_update.table_version`, so the defense-in-depth strict
-            // re-check `reopen_for_mutation` would run is trivially satisfied
-            // and the open is redundant. When no handle is present (other
-            // writers, or any non-staged table), fall back to the byte-identical
-            // `reopen_for_mutation` path.
-            //
-            // Strict version check is correct on the fallback: this runs INSIDE
+            // Strict version check is correct here: this runs INSIDE
             // the publisher commit path, after `commit_staged` already
             // advanced Lance HEAD to `prepared_update.table_version`.
             // The check is a defense-in-depth assertion that the
             // dataset state matches what we just committed; not the
             // pre-stage race the op-kind policy targets.
-            let mut ds = match committed_handles.remove(&prepared_update.table_key) {
-                Some(ds) => ds,
-                None => {
-                    reopen_for_mutation(
-                        db,
-                        &prepared_update.table_key,
-                        &full_path,
-                        prepared_update.table_branch.as_deref(),
-                        prepared_update.table_version,
-                        crate::db::MutationOpKind::SchemaRewrite,
-                    )
-                    .await?
-                }
-            };
+            let mut ds = reopen_for_mutation(
+                db,
+                &prepared_update.table_key,
+                &full_path,
+                prepared_update.table_branch.as_deref(),
+                prepared_update.table_version,
+                crate::db::MutationOpKind::SchemaRewrite,
+            )
+            .await?;
             // Any column not yet buildable (e.g. a vector column whose rows
             // have null embeddings) is deferred and logged inside
             // build_indices; a later ensure_indices/optimize materializes it.
-            // The load/mutate/merge commit must not fail on it.
+            // Legacy merge/test callers must not fail on it; enrolled
+            // mutation/load callers returned before this block.
             let _pending =
                 build_indices_on_dataset(db, &prepared_update.table_key, &mut ds).await?;
             let state = db.storage().table_state(&full_path, &ds).await?;
@@ -1236,14 +1529,14 @@ async fn prepare_updates_for_commit(
     Ok(prepared)
 }
 
+#[cfg(test)]
 async fn commit_prepared_updates(
     db: &Omnigraph,
     updates: &[crate::db::SubTableUpdate],
     actor_id: Option<&str>,
 ) -> Result<u64> {
     let PublishedSnapshot {
-        manifest_version,
-        _snapshot_id: _,
+        manifest_version, ..
     } = db
         .coordinator
         .write()
@@ -1253,15 +1546,15 @@ async fn commit_prepared_updates(
     Ok(manifest_version)
 }
 
+#[cfg(feature = "failpoints")]
 async fn commit_prepared_updates_with_expected(
     db: &Omnigraph,
     updates: &[crate::db::SubTableUpdate],
-    expected_table_versions: &std::collections::HashMap<String, u64>,
+    expected_table_versions: &crate::db::manifest::ExpectedTableVersions,
     actor_id: Option<&str>,
 ) -> Result<u64> {
     let PublishedSnapshot {
-        manifest_version,
-        _snapshot_id: _,
+        manifest_version, ..
     } = db
         .coordinator
         .write()
@@ -1271,43 +1564,12 @@ async fn commit_prepared_updates_with_expected(
     Ok(manifest_version)
 }
 
-pub(super) async fn commit_prepared_updates_on_branch(
-    db: &Omnigraph,
-    branch: Option<&str>,
-    updates: &[crate::db::SubTableUpdate],
-    actor_id: Option<&str>,
-) -> Result<u64> {
-    let current_branch = db
-        .coordinator
-        .read()
-        .await
-        .current_branch()
-        .map(str::to_string);
-    let requested_branch = branch.map(str::to_string);
-    if requested_branch == current_branch {
-        return commit_prepared_updates(db, updates, actor_id).await;
-    }
-
-    let mut coordinator = match requested_branch.as_deref() {
-        Some(branch) => {
-            GraphCoordinator::open_branch(db.uri(), branch, Arc::clone(&db.storage)).await?
-        }
-        None => GraphCoordinator::open(db.uri(), Arc::clone(&db.storage)).await?,
-    };
-    let PublishedSnapshot {
-        manifest_version,
-        _snapshot_id: _,
-    } = coordinator
-        .commit_updates_with_actor(updates, actor_id)
-        .await?;
-    Ok(manifest_version)
-}
-
+#[cfg(feature = "failpoints")]
 pub(super) async fn commit_prepared_updates_on_branch_with_expected(
     db: &Omnigraph,
     branch: Option<&str>,
     updates: &[crate::db::SubTableUpdate],
-    expected_table_versions: &std::collections::HashMap<String, u64>,
+    expected_table_versions: &crate::db::manifest::ExpectedTableVersions,
     actor_id: Option<&str>,
 ) -> Result<u64> {
     let current_branch = db
@@ -1329,13 +1591,25 @@ pub(super) async fn commit_prepared_updates_on_branch_with_expected(
 
     let mut coordinator = match requested_branch.as_deref() {
         Some(branch) => {
-            GraphCoordinator::open_branch(db.uri(), branch, Arc::clone(&db.storage)).await?
+            GraphCoordinator::open_branch_with_session(
+                db.uri(),
+                branch,
+                Arc::clone(&db.storage),
+                &db.control_session(),
+            )
+            .await?
         }
-        None => GraphCoordinator::open(db.uri(), Arc::clone(&db.storage)).await?,
+        None => {
+            GraphCoordinator::open_with_session(
+                db.uri(),
+                Arc::clone(&db.storage),
+                &db.control_session(),
+            )
+            .await?
+        }
     };
     let PublishedSnapshot {
-        manifest_version,
-        _snapshot_id: _,
+        manifest_version, ..
     } = coordinator
         .commit_updates_with_actor_with_expected(updates, expected_table_versions, actor_id)
         .await?;
@@ -1356,29 +1630,8 @@ pub(super) async fn commit_updates(
         .await
         .current_branch()
         .map(str::to_string);
-    let prepared = prepare_updates_for_commit(
-        db,
-        current_branch.as_deref(),
-        updates,
-        None,
-        std::collections::HashMap::new(),
-    )
-    .await?;
+    let prepared = prepare_updates_for_commit(db, current_branch.as_deref(), updates, None).await?;
     commit_prepared_updates(db, &prepared, None).await
-}
-
-pub(super) async fn commit_merge_with_actor(
-    db: &Omnigraph,
-    updates: &[crate::db::SubTableUpdate],
-    merged_parent_commit_id: &str,
-    actor_id: Option<&str>,
-) -> Result<String> {
-    db.coordinator
-        .write()
-        .await
-        .commit_merge_with_actor(updates, merged_parent_commit_id, actor_id)
-        .await
-        .map(|snapshot_id| snapshot_id.as_str().to_string())
 }
 
 /// Commit updates with a publisher-level OCC fence. The
@@ -1388,22 +1641,75 @@ pub(super) async fn commit_updates_on_branch_with_expected(
     db: &Omnigraph,
     branch: Option<&str>,
     updates: &[crate::db::SubTableUpdate],
-    expected_table_versions: &std::collections::HashMap<String, u64>,
+    expected_table_versions: &crate::db::manifest::ExpectedTableVersions,
     actor_id: Option<&str>,
-    txn: Option<&crate::db::WriteTxn>,
-    committed_handles: std::collections::HashMap<String, SnapshotHandle>,
-) -> Result<u64> {
+    txn: &crate::db::WriteTxn,
+    lineage_intent: crate::db::manifest::LineageIntent,
+) -> Result<crate::db::GraphCommit> {
     db.ensure_schema_apply_not_locked("write commit").await?;
-    let prepared =
-        prepare_updates_for_commit(db, branch, updates, txn, committed_handles).await?;
-    commit_prepared_updates_on_branch_with_expected(
-        db,
+    let prepared = prepare_updates_for_commit(db, branch, updates, Some(txn)).await?;
+
+    debug_assert_eq!(lineage_intent.actor_id.as_deref(), actor_id);
+    let changes = prepared
+        .iter()
+        .cloned()
+        .map(ManifestChange::Update)
+        .collect::<Vec<_>>();
+    let expectation = crate::db::manifest::GraphHeadExpectation::new(
         branch,
-        &prepared,
-        expected_table_versions,
-        actor_id,
-    )
-    .await
+        txn.authority.branch_identifier.clone(),
+        txn.authority.graph_head.clone(),
+    );
+    let precondition = crate::db::manifest::PublishPrecondition::ExactGraphHead(expectation);
+
+    let current_branch = db
+        .coordinator
+        .read()
+        .await
+        .current_branch()
+        .map(str::to_string);
+    let requested_branch = branch.map(str::to_string);
+    let published = if requested_branch == current_branch {
+        db.coordinator
+            .write()
+            .await
+            .commit_changes_with_intent_and_expected(
+                &changes,
+                expected_table_versions,
+                lineage_intent,
+                &precondition,
+            )
+            .await?
+    } else {
+        let mut coordinator = match requested_branch.as_deref() {
+            Some(branch) => {
+                GraphCoordinator::open_branch_with_session(
+                    db.uri(),
+                    branch,
+                    Arc::clone(&db.storage),
+                    &db.control_session(),
+                )
+                .await?
+            }
+            None => {
+                GraphCoordinator::open_with_session(
+                    db.uri(),
+                    Arc::clone(&db.storage),
+                    &db.control_session(),
+                )
+                .await?
+            }
+        };
+        coordinator
+            .commit_changes_with_intent_and_expected(
+                &changes,
+                expected_table_versions,
+                lineage_intent,
+                &precondition,
+            )
+            .await?
+    };
+    Ok(published.commit)
 }
 
 pub(super) async fn invalidate_graph_index(db: &Omnigraph) {
@@ -1451,8 +1757,11 @@ mod classify_fork_ref_tests {
         )
         .await
         .unwrap();
+        let feature_snapshot = db.snapshot_for_branch(Some("feature")).await.unwrap();
+        let company_identity = feature_snapshot.entry("node:Company").unwrap().identity;
+        let person_identity = feature_snapshot.entry("node:Person").unwrap().identity;
         assert_eq!(
-            classify_fork_ref(&db, "node:Company", "feature").await,
+            classify_fork_ref(&db, "node:Company", company_identity, "feature", None,).await,
             ForkRefStatus::Legitimate,
             "a manifest-placed fork must classify as Legitimate (never destroyed)"
         );
@@ -1467,7 +1776,7 @@ mod classify_fork_ref_tests {
             ds.create_branch("feature", v, None).await.unwrap();
         }
         assert_eq!(
-            classify_fork_ref(&db, "node:Person", "feature").await,
+            classify_fork_ref(&db, "node:Person", person_identity, "feature", None).await,
             ForkRefStatus::Orphan,
             "a ref the manifest does not place on the branch must classify as Orphan"
         );
@@ -1480,9 +1789,74 @@ mod classify_fork_ref_tests {
             ds.create_branch("ghost", v, None).await.unwrap();
         }
         assert_eq!(
-            classify_fork_ref(&db, "node:Person", "ghost").await,
+            classify_fork_ref(&db, "node:Person", person_identity, "ghost", None).await,
             ForkRefStatus::Orphan,
             "a ref for a branch absent from the manifest must classify as Orphan"
         );
+    }
+
+    #[tokio::test]
+    async fn classify_does_not_adopt_a_reused_alias_across_incarnations() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
+            .await
+            .unwrap();
+        let old_identity = db.snapshot().await.entry("node:Person").unwrap().identity;
+
+        db.apply_schema("node Company { name: String @key }\n")
+            .await
+            .unwrap();
+        db.apply_schema(SCHEMA).await.unwrap();
+        let new_entry = db.snapshot().await.entry("node:Person").unwrap().clone();
+        let new_identity = new_entry.identity;
+        assert_ne!(old_identity, new_identity);
+
+        db.branch_create("feature").await.unwrap();
+        db.load_as(
+            "feature",
+            None,
+            r#"{"type":"Person","data":{"name":"Ada"}}"#,
+            LoadMode::Merge,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            classify_fork_ref(&db, "node:Person", new_identity, "feature", None).await,
+            ForkRefStatus::Legitimate
+        );
+        assert_eq!(
+            classify_fork_ref(&db, "node:Person", old_identity, "feature", None).await,
+            ForkRefStatus::Orphan,
+            "a live placement under the reused alias belongs only to the new incarnation"
+        );
+
+        let full_path = db.storage().dataset_uri(&new_entry.table_path);
+        let before = db
+            .storage()
+            .open_dataset_head(&full_path, Some("feature"))
+            .await
+            .unwrap();
+        let before_identifier = db.storage().branch_identifier(&before).await.unwrap();
+        reclaim_orphaned_fork_and_refork(
+            &db,
+            "node:Person",
+            old_identity,
+            &full_path,
+            None,
+            new_entry.table_version,
+            "feature",
+            None,
+        )
+        .await
+        .expect_err("a stale identity must not authorize deletion on the replacement path");
+        let after = db
+            .storage()
+            .open_dataset_head(&full_path, Some("feature"))
+            .await
+            .unwrap();
+        let after_identifier = db.storage().branch_identifier(&after).await.unwrap();
+        assert_eq!(before_identifier, after_identifier);
     }
 }

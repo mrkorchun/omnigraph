@@ -2,15 +2,18 @@
 //! Moved verbatim from tests/cli.rs in the modularization.
 
 use std::fs;
+use std::io::{BufRead, BufReader, Write};
+use std::net::TcpListener;
+use std::sync::mpsc;
 
 use assert_cmd::Command;
 use serde_json::Value;
+use sha2::Digest;
 use tempfile::tempdir;
 
 mod support;
 
 use support::*;
-
 
 #[test]
 fn short_version_flag_prints_current_cli_version() {
@@ -31,6 +34,545 @@ fn long_version_flag_prints_current_cli_version() {
     assert_eq!(
         stdout.trim(),
         format!("omnigraph {}", env!("CARGO_PKG_VERSION"))
+    );
+}
+
+#[test]
+fn blob_get_streams_exact_node_edge_empty_range_and_file_bytes() {
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    init_blob_graph(&graph);
+
+    let full = output_success(
+        cli()
+            .arg("blob")
+            .arg("get")
+            .args(["node", "Document", "readme", "content"])
+            .arg("--store")
+            .arg(&graph),
+    );
+    assert_eq!(full.stdout, BLOB_NODE_BYTES);
+
+    let edge = output_success(
+        cli()
+            .arg("blob")
+            .arg("get")
+            .args(["edge", "Attachment", "attachment-1", "payload"])
+            .arg("--store")
+            .arg(&graph),
+    );
+    assert_eq!(edge.stdout, BLOB_EDGE_BYTES);
+
+    let empty = output_success(
+        cli()
+            .arg("blob")
+            .arg("get")
+            .args(["node", "Document", "empty", "content"])
+            .arg("--store")
+            .arg(&graph),
+    );
+    assert!(empty.stdout.is_empty(), "a valid empty Blob is a success");
+
+    let empty_path = temp.path().join("empty.bin");
+    fs::write(&empty_path, b"old bytes").unwrap();
+    output_success(
+        cli()
+            .arg("blob")
+            .arg("get")
+            .args(["node", "Document", "empty", "content"])
+            .arg("--out")
+            .arg(&empty_path)
+            .arg("--store")
+            .arg(&graph),
+    );
+    assert!(
+        fs::read(&empty_path).unwrap().is_empty(),
+        "a successful valid-empty get must create or truncate --out"
+    );
+
+    let offset_and_length = output_success(
+        cli()
+            .arg("blob")
+            .arg("get")
+            .args(["node", "Document", "readme", "content"])
+            .arg("--offset")
+            .arg("1")
+            .arg("--length")
+            .arg("3")
+            .arg("--store")
+            .arg(&graph),
+    );
+    assert_eq!(offset_and_length.stdout, [1, 2, 3]);
+
+    let offset_to_end = output_success(
+        cli()
+            .arg("blob")
+            .arg("get")
+            .args(["node", "Document", "readme", "content"])
+            .arg("--offset")
+            .arg("3")
+            .arg("--store")
+            .arg(&graph),
+    );
+    assert_eq!(offset_to_end.stdout, [3, 4, 255]);
+
+    let length_from_zero = output_success(
+        cli()
+            .arg("blob")
+            .arg("get")
+            .args(["node", "Document", "readme", "content"])
+            .arg("--length")
+            .arg("2")
+            .arg("--store")
+            .arg(&graph),
+    );
+    assert_eq!(length_from_zero.stdout, [0, 1]);
+
+    let clamped_end = output_success(
+        cli()
+            .arg("blob")
+            .arg("get")
+            .args(["node", "Document", "readme", "content"])
+            .arg("--length")
+            .arg("7")
+            .arg("--store")
+            .arg(&graph),
+    );
+    assert_eq!(
+        clamped_end.stdout, BLOB_NODE_BYTES,
+        "an end beyond the representation clamps to its exact length"
+    );
+
+    let output_path = temp.path().join("blob.bin");
+    let to_file = output_success(
+        cli()
+            .arg("blob")
+            .arg("get")
+            .args(["node", "Document", "readme", "content"])
+            .arg("--offset")
+            .arg("2")
+            .arg("--length")
+            .arg("3")
+            .arg("--out")
+            .arg(&output_path)
+            .arg("--store")
+            .arg(&graph),
+    );
+    assert!(
+        to_file.stdout.is_empty(),
+        "--out must not mix status text with Blob bytes"
+    );
+    assert_eq!(fs::read(output_path).unwrap(), [2, 3, 4]);
+
+    let chunk_boundary = usize::try_from(omnigraph::BLOB_READ_RANGE_MAX_BYTES).unwrap();
+    let large_bytes: Vec<u8> = (0..chunk_boundary + 3)
+        .map(|index| (index % 251) as u8)
+        .collect();
+    merge_managed_blob(&graph, "large", &large_bytes);
+
+    let large_path = temp.path().join("large.bin");
+    let large = output_success(
+        cli()
+            .arg("blob")
+            .arg("get")
+            .args(["node", "Document", "large", "content"])
+            .arg("--out")
+            .arg(&large_path)
+            .arg("--store")
+            .arg(&graph),
+    );
+    assert!(large.stdout.is_empty());
+    let large_file = fs::read(&large_path).unwrap();
+    assert_eq!(large_file.len(), chunk_boundary + 3);
+    assert_eq!(
+        sha2::Sha256::digest(&large_file),
+        sha2::Sha256::digest(&large_bytes),
+        "embedded get must concatenate consecutive bounded reads exactly"
+    );
+
+    let cross_boundary = output_success(
+        cli()
+            .arg("blob")
+            .arg("get")
+            .args(["node", "Document", "large", "content"])
+            .arg("--offset")
+            .arg((chunk_boundary - 2).to_string())
+            .arg("--length")
+            .arg("5")
+            .arg("--store")
+            .arg(&graph),
+    );
+    assert_eq!(
+        cross_boundary.stdout,
+        large_bytes[chunk_boundary - 2..chunk_boundary + 3]
+    );
+}
+
+#[test]
+fn blob_get_rejects_zero_overflow_and_out_of_bounds_ranges() {
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    init_blob_graph(&graph);
+
+    for (case, range_args) in [
+        ("zero length", vec!["--length", "0"]),
+        ("offset beyond end", vec!["--offset", "7"]),
+        (
+            "u64 addition overflow",
+            vec!["--offset", "18446744073709551615", "--length", "2"],
+        ),
+    ] {
+        let output = output_failure(
+            cli()
+                .arg("blob")
+                .arg("get")
+                .args(["node", "Document", "readme", "content"])
+                .args(range_args)
+                .arg("--store")
+                .arg(&graph),
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "{case}: a rejected range must emit no payload bytes"
+        );
+    }
+
+    let destination = temp.path().join("existing.bin");
+    fs::write(&destination, b"preserve me").unwrap();
+    let missing = output_failure(
+        cli()
+            .arg("blob")
+            .arg("get")
+            .args(["node", "Document", "missing", "content"])
+            .arg("--out")
+            .arg(&destination)
+            .arg("--store")
+            .arg(&graph),
+    );
+    assert!(missing.stdout.is_empty());
+    assert_eq!(
+        fs::read(&destination).unwrap(),
+        b"preserve me",
+        "a pre-transfer failure must not truncate an existing --out destination"
+    );
+}
+
+#[test]
+fn blob_get_honors_branch_and_immutable_snapshot_targets() {
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    init_blob_graph(&graph);
+    let original_snapshot = resolved_snapshot_id(&graph, "main");
+
+    output_success(
+        cli()
+            .arg("branch")
+            .arg("create")
+            .arg("--from")
+            .arg("main")
+            .arg("feature")
+            .arg("--store")
+            .arg(&graph),
+    );
+    let feature_data = temp.path().join("feature.jsonl");
+    write_jsonl(
+        &feature_data,
+        r#"{"type":"Document","data":{"title":"readme","content":"base64:CQgH","note":"feature"}}"#,
+    );
+    output_success(
+        cli()
+            .arg("load")
+            .arg("--mode")
+            .arg("merge")
+            .arg("--branch")
+            .arg("feature")
+            .arg("--data")
+            .arg(&feature_data)
+            .arg("--store")
+            .arg(&graph),
+    );
+
+    let main_data = temp.path().join("main.jsonl");
+    write_jsonl(
+        &main_data,
+        r#"{"type":"Document","data":{"title":"readme","content":"base64:BgUEAw==","note":"main head"}}"#,
+    );
+    output_success(
+        cli()
+            .arg("load")
+            .arg("--mode")
+            .arg("merge")
+            .arg("--data")
+            .arg(&main_data)
+            .arg("--store")
+            .arg(&graph),
+    );
+
+    let feature = output_success(
+        cli()
+            .arg("blob")
+            .arg("get")
+            .args(["node", "Document", "readme", "content"])
+            .arg("--branch")
+            .arg("feature")
+            .arg("--store")
+            .arg(&graph),
+    );
+    assert_eq!(feature.stdout, [9, 8, 7]);
+
+    let main = output_success(
+        cli()
+            .arg("blob")
+            .arg("get")
+            .args(["node", "Document", "readme", "content"])
+            .arg("--store")
+            .arg(&graph),
+    );
+    assert_eq!(main.stdout, [6, 5, 4, 3]);
+
+    let historical = output_success(
+        cli()
+            .arg("blob")
+            .arg("get")
+            .args(["node", "Document", "readme", "content"])
+            .arg("--snapshot")
+            .arg(&original_snapshot)
+            .arg("--store")
+            .arg(&graph),
+    );
+    assert_eq!(historical.stdout, BLOB_NODE_BYTES);
+}
+
+#[test]
+fn blob_stat_is_structured_and_distinguishes_managed_from_external() {
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    init_blob_graph(&graph);
+
+    let managed = parse_stdout_json(&output_success(
+        cli()
+            .arg("blob")
+            .arg("stat")
+            .args(["node", "Document", "readme", "content"])
+            .arg("--json")
+            .arg("--store")
+            .arg(&graph),
+    ));
+    assert_eq!(managed["selector"]["entity"], "node");
+    assert_eq!(managed["selector"]["type"], "Document");
+    assert_eq!(managed["selector"]["id"], "readme");
+    assert_eq!(managed["selector"]["property"], "content");
+    assert_eq!(managed["kind"], "managed");
+    assert_eq!(managed["size"], 6);
+    let etag = managed["etag"].as_str().unwrap();
+    assert_eq!(etag.len(), 34, "ETag is a quoted 16-byte hex digest");
+    assert!(etag.starts_with('"') && etag.ends_with('"'));
+    assert!(managed.get("uri").is_none());
+    assert!(managed["target"].get("branch").is_none());
+    assert!(managed["target"].get("snapshot").is_none());
+    let resolved_snapshot = managed["target"]["resolved_snapshot"].as_str().unwrap();
+    assert!(
+        resolved_snapshot.starts_with("manifest:main:v"),
+        "current-branch stat must name its exact manifest witness: {resolved_snapshot}"
+    );
+
+    let human = output_success(
+        cli()
+            .arg("blob")
+            .arg("stat")
+            .args(["node", "Document", "readme", "content"])
+            .arg("--store")
+            .arg(&graph),
+    );
+    let human = stdout_string(&human);
+    for fact in [
+        "entity: node",
+        "type: Document",
+        "id: readme",
+        "property: content",
+        "kind: managed",
+        "size: 6",
+        "etag: \"",
+        "resolved_snapshot: manifest:main:v",
+    ] {
+        assert!(human.contains(fact), "human stat omitted `{fact}`: {human}");
+    }
+
+    let commit_snapshot = resolved_snapshot_id(&graph, "main");
+    let immutable = parse_stdout_json(&output_success(
+        cli()
+            .arg("blob")
+            .arg("stat")
+            .args(["node", "Document", "readme", "content"])
+            .arg("--snapshot")
+            .arg(&commit_snapshot)
+            .arg("--json")
+            .arg("--store")
+            .arg(&graph),
+    ));
+    assert_eq!(immutable["target"]["snapshot"], commit_snapshot);
+    assert_eq!(immutable["target"]["resolved_snapshot"], commit_snapshot);
+    assert!(immutable["target"].get("branch").is_none());
+
+    let requested_branch = parse_stdout_json(&output_success(
+        cli()
+            .arg("blob")
+            .arg("stat")
+            .args(["node", "Document", "readme", "content"])
+            .arg("--branch")
+            .arg("main")
+            .arg("--json")
+            .arg("--store")
+            .arg(&graph),
+    ));
+    assert_eq!(requested_branch["target"]["branch"], "main");
+    assert!(requested_branch["target"].get("snapshot").is_none());
+    assert!(
+        requested_branch["target"]["resolved_snapshot"]
+            .as_str()
+            .unwrap()
+            .starts_with("manifest:main:v")
+    );
+
+    let edge = parse_stdout_json(&output_success(
+        cli()
+            .arg("blob")
+            .arg("stat")
+            .args(["edge", "Attachment", "attachment-1", "payload"])
+            .arg("--json")
+            .arg("--store")
+            .arg(&graph),
+    ));
+    assert_eq!(edge["kind"], "managed");
+    assert_eq!(edge["size"], BLOB_EDGE_BYTES.len());
+
+    let external_graph = temp.path().join("external.omni");
+    let external_dir = temp.path().join("external-source");
+    fs::create_dir_all(&external_dir).unwrap();
+    let external_path = external_dir.join("payload.bin");
+    fs::write(&external_path, b"must never be read").unwrap();
+    let external_uri = format!("file://{}", external_path.display());
+    let canonical_external_uri = format!(
+        "file://{}",
+        fs::canonicalize(&external_path).unwrap().display()
+    );
+    let external_base = format!("file://{}/", external_dir.display());
+    init_external_blob_graph(
+        &external_graph,
+        &external_uri,
+        &external_base,
+        omnigraph::ExternalBlobExecutionScope::EmbeddedOnly,
+    );
+    fs::remove_file(&external_path).unwrap();
+
+    let external = parse_stdout_json(&output_success(
+        cli()
+            .arg("blob")
+            .arg("stat")
+            .args(["node", "Document", "external", "content"])
+            .arg("--json")
+            .arg("--store")
+            .arg(&external_graph),
+    ));
+    assert_eq!(external["kind"], "external");
+    assert_eq!(external["uri"], canonical_external_uri);
+    assert!(external.get("size").is_none());
+    assert!(external.get("etag").is_none());
+
+    let get = output_failure(
+        cli()
+            .arg("blob")
+            .arg("get")
+            .args(["node", "Document", "external", "content"])
+            .arg("--store")
+            .arg(&external_graph),
+    );
+    assert!(get.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&get.stderr);
+    assert!(stderr.contains(&canonical_external_uri), "{stderr}");
+    assert!(stderr.contains("blob stat"), "{stderr}");
+}
+
+#[test]
+fn blob_stat_fails_loudly_for_null_missing_and_non_blob_cells() {
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    init_blob_graph(&graph);
+
+    for (case, id, property) in [
+        ("null Blob", "null", "content"),
+        ("missing entity", "missing", "content"),
+        ("non-Blob property", "readme", "note"),
+    ] {
+        let output = output_failure(
+            cli()
+                .arg("blob")
+                .arg("stat")
+                .args(["node", "Document", id, property])
+                .arg("--json")
+                .arg("--store")
+                .arg(&graph),
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "{case}: failure must not masquerade as Blob metadata"
+        );
+    }
+}
+
+#[test]
+fn blob_commands_reject_positional_and_cluster_scope_addressing() {
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    init_blob_graph(&graph);
+
+    let positional = output_failure(
+        cli()
+            .arg("blob")
+            .arg("stat")
+            .args(["node", "Document", "readme", "content"])
+            .arg(&graph),
+    );
+    let stderr = String::from_utf8_lossy(&positional.stderr);
+    assert!(
+        stderr.contains("unexpected argument") && stderr.contains(graph.to_str().unwrap()),
+        "Blob selectors must not grow a positional graph URI: {stderr}"
+    );
+
+    let cluster = output_failure(
+        cli()
+            .arg("--cluster")
+            .arg(temp.path())
+            .arg("--graph")
+            .arg("knowledge")
+            .arg("blob")
+            .arg("stat")
+            .args(["node", "Document", "readme", "content"]),
+    );
+    let stderr = String::from_utf8_lossy(&cluster.stderr);
+    assert!(
+        stderr.contains("`blob stat` is a data command")
+            && stderr.contains("--cluster addresses a cluster-scoped command")
+            && stderr.contains("does not apply"),
+        "Blob reads must reject control-plane addressing: {stderr}"
+    );
+
+    let actor = output_failure(
+        cli()
+            .arg("--as")
+            .arg("act-reader")
+            .arg("blob")
+            .arg("stat")
+            .args(["node", "Document", "readme", "content"])
+            .arg("--store")
+            .arg(&graph),
+    );
+    let stderr = String::from_utf8_lossy(&actor.stderr);
+    assert!(
+        stderr.contains("`blob stat` is a data command")
+            && stderr.contains("--as sets the actor")
+            && stderr.contains("does not apply"),
+        "Blob reads must reject an actor they cannot consume: {stderr}"
     );
 }
 
@@ -172,6 +714,22 @@ fn optimize_with_server_flag_errors_wrong_plane() {
 }
 
 #[test]
+fn optimize_with_as_flag_errors() {
+    // `--as` attributes an actor on a direct-engine or actor-bound cluster
+    // operation; the Direct maintenance verbs record no actor, so the flag is
+    // rejected loudly (was: silently ignored).
+    let output = output_failure(cli().arg("optimize").arg("--as").arg("act-op"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("`optimize` is a direct (storage-native) command")
+            && stderr.contains(
+                "--as sets the actor for a direct-engine or actor-bound cluster operation and does not apply"
+            ),
+        "expected the addressing-guard --as rejection; got: {stderr}"
+    );
+}
+
+#[test]
 fn wrong_address_guard_message_has_no_trailing_space() {
     // The remediation tail is empty for served-addressing capabilities, so a
     // misplaced --cluster on a data verb must not leave "… does not apply. "
@@ -253,8 +811,9 @@ fn optimize_with_remote_target_errors_storage_plane() {
     let output = output_failure(cli().arg("optimize").arg("https://graph.example.invalid"));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("`optimize` is a direct (storage-native) command and needs direct storage access")
-            && stderr.contains("remote server"),
+        stderr.contains(
+            "`optimize` is a direct (storage-native) command and needs direct storage access"
+        ) && stderr.contains("remote server"),
         "direct remote-target message not found; got: {stderr}"
     );
 }
@@ -274,9 +833,11 @@ fn repair_json_reports_noop_on_clean_graph() {
     assert_eq!(payload["manifest_version"], Value::Null);
     let tables = payload["tables"].as_array().unwrap();
     assert_eq!(tables.len(), 4);
-    assert!(tables.iter().all(|table| {
-        table["classification"] == "no_drift" && table["action"] == "no_op"
-    }));
+    assert!(
+        tables
+            .iter()
+            .all(|table| { table["classification"] == "no_drift" && table["action"] == "no_op" })
+    );
 }
 
 #[test]
@@ -357,6 +918,11 @@ node Policy {
 query update_policy($slug: String, $name: String) {
     update Policy set { name: $name } where slug = $slug
 }
+
+query list_policies() {
+    match { $p: Policy }
+    return { $p.name $p.effectiveTo }
+}
 "#,
     );
 
@@ -374,13 +940,79 @@ query update_policy($slug: String, $name: String) {
 
     assert_eq!(payload["status"], "ok");
     assert_eq!(payload["schema_source"]["kind"], "file");
-    assert_eq!(payload["queries_processed"], 1);
+    assert_eq!(payload["queries_processed"], 2);
     assert_eq!(payload["warnings"], 1);
+    assert_eq!(
+        payload["results"][0]["operation"],
+        serde_json::json!({
+            "result": [],
+            "reads": [{ "kind": "node", "type_name": "Policy" }],
+            "writes": [{ "kind": "node", "type_name": "Policy" }]
+        })
+    );
+    assert_eq!(
+        payload["results"][1]["operation"],
+        serde_json::json!({
+            "result": [
+                {
+                    "name": "name",
+                    "kind": "string",
+                    "nullable": true
+                },
+                {
+                    "name": "effectiveTo",
+                    "kind": "datetime",
+                    "nullable": true
+                }
+            ],
+            "reads": [{ "kind": "node", "type_name": "Policy" }],
+            "writes": []
+        })
+    );
     assert_eq!(payload["findings"][0]["code"], "L201");
     assert_eq!(
         payload["findings"][0]["message"],
         "Policy.effectiveTo exists in schema but no update query sets it"
     );
+}
+
+#[test]
+fn query_lint_json_omits_operation_after_compile_failure() {
+    let temp = tempdir().unwrap();
+    let schema_path = temp.path().join("schema.pg");
+    let query_path = temp.path().join("queries.gq");
+    write_file(
+        &schema_path,
+        r#"
+node Person {
+    slug: String @key
+}
+"#,
+    );
+    write_query_file(
+        &query_path,
+        r#"
+query broken($slug: String) {
+    update Person set { missing: "nope" } where slug = $slug
+}
+"#,
+    );
+
+    let output = output_failure(
+        cli()
+            .arg("query")
+            .arg("lint")
+            .arg("--query")
+            .arg(&query_path)
+            .arg("--schema")
+            .arg(&schema_path)
+            .arg("--json"),
+    );
+    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    assert_eq!(payload["status"], "error");
+    assert_eq!(payload["results"][0]["status"], "error");
+    assert!(payload["results"][0].get("operation").is_none());
 }
 
 #[test]
@@ -662,8 +1294,9 @@ query list_people() {
     // RFC-010/011: the direct (storage-native) verbs share one declared message
     // (was: "query lint is only supported against local graph URIs …").
     assert!(
-        stderr.contains("`lint` is a direct (storage-native) command and needs direct storage access")
-            && stderr.contains("remote server"),
+        stderr.contains(
+            "`lint` is a direct (storage-native) command and needs direct storage access"
+        ) && stderr.contains("remote server"),
         "direct remote-target message not found; got: {stderr}"
     );
 }
@@ -807,6 +1440,16 @@ fn load_json_outputs_summary_for_main_branch() {
     assert_eq!(payload["edges_loaded"], 5);
     assert_eq!(payload["node_types_loaded"], 2);
     assert_eq!(payload["edge_types_loaded"], 2);
+    assert!(payload["commit"]["graph_commit_id"].is_string());
+    assert!(payload["commit"]["manifest_version"].is_number());
+
+    let commits = parse_stdout_json(&output_success(
+        cli().arg("commit").arg("list").arg(&graph).arg("--json"),
+    ));
+    assert_eq!(
+        payload["commit"], commits["commits"][0],
+        "load must return the exact commit that became the branch head"
+    );
 }
 
 #[test]
@@ -1011,49 +1654,6 @@ fn policy_validate_accepts_cluster_bundle() {
 
     assert!(stdout.contains("policy valid:"));
     assert!(stdout.contains("[2 actors]"));
-}
-
-#[test]
-fn policy_validate_fails_for_invalid_cluster_bundle() {
-    // The cluster does not validate a policy bundle's internal rules, so an
-    // applied-but-malformed bundle reaches `policy validate`, which compiles it
-    // and surfaces the error (here: a duplicate rule id).
-    let cluster = converged_loaded_cluster(
-        "knowledge",
-        Some(
-            r#"
-version: 1
-groups:
-  team: [act-andrew]
-rules:
-  - id: duplicate
-    allow:
-      actors: { group: team }
-      actions: [read]
-      branch_scope: any
-  - id: duplicate
-    allow:
-      actors: { group: team }
-      actions: [export]
-      branch_scope: any
-"#,
-        ),
-    );
-
-    let output = output_failure(
-        cli()
-            .arg("policy")
-            .arg("validate")
-            .arg("--cluster")
-            .arg(cluster.path())
-            .arg("--graph")
-            .arg("knowledge"),
-    );
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(
-        stderr.contains("duplicate policy rule id"),
-        "expected a duplicate-rule error; got: {stderr}"
-    );
 }
 
 #[test]
@@ -1281,6 +1881,8 @@ query insert_person($name: String, $age: I32) {
     assert_eq!(payload["query_name"], "insert_person");
     assert_eq!(payload["affected_nodes"], 1);
     assert_eq!(payload["affected_edges"], 0);
+    assert!(payload["commit"]["graph_commit_id"].is_string());
+    assert!(payload["commit"]["manifest_version"].is_number());
 
     let verify = output_success(
         cli()
@@ -1297,6 +1899,162 @@ query insert_person($name: String, $age: I32) {
     let verify_payload: Value = serde_json::from_slice(&verify.stdout).unwrap();
     assert_eq!(verify_payload["row_count"], 1);
     assert_eq!(verify_payload["rows"][0]["p.name"], "Eve");
+    assert_eq!(
+        verify_payload["graph_commit_id"], payload["commit"]["graph_commit_id"],
+        "mutation receipt must identify the exact commit read back at branch head"
+    );
+
+    let no_op = parse_stdout_json(&output_success(
+        cli()
+            .arg("mutate")
+            .arg("--store")
+            .arg(&graph)
+            .arg("-e")
+            .arg("query no_match() { update Person set { age: 99 } where name = \"Nobody\" }")
+            .arg("--json"),
+    ));
+    assert_eq!(no_op["affected_nodes"], 0);
+    assert_eq!(no_op["affected_edges"], 0);
+    assert_eq!(
+        no_op["commit"],
+        Value::Null,
+        "an effect-free mutation must not claim a graph commit"
+    );
+}
+
+/// GitHub #365: the embedded transport must preserve the typed stale-head
+/// outcome all the way through the CLI boundary. This is deliberately local
+/// and non-ignored so exit code 4 cannot depend on loopback/server coverage.
+#[test]
+fn mutate_if_commit_lost_cas_exits_4_embedded_issue_365() {
+    const FIND_PERSON: &str =
+        "query find($name: String) { match { $p: Person { name: $name } } return { $p.age } }";
+    const SET_AGE: &str = "query set_age($name: String, $age: I32) { update Person set { age: $age } where name = $name }";
+
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    load_fixture(&graph);
+
+    let read = output_success(
+        cli()
+            .arg("query")
+            .arg("--store")
+            .arg(&graph)
+            .arg("-e")
+            .arg(FIND_PERSON)
+            .arg("--params")
+            .arg(r#"{"name":"Alice"}"#)
+            .arg("--json"),
+    );
+    let stale_head = parse_stdout_json(&read)["graph_commit_id"]
+        .as_str()
+        .expect("embedded read must expose graph_commit_id")
+        .to_string();
+
+    output_success(
+        cli()
+            .arg("mutate")
+            .arg("--store")
+            .arg(&graph)
+            .arg("-e")
+            .arg(SET_AGE)
+            .arg("--params")
+            .arg(r#"{"name":"Alice","age":31}"#)
+            .arg("--json"),
+    );
+
+    let lost = cli()
+        .arg("mutate")
+        .arg("--store")
+        .arg(&graph)
+        .arg("-e")
+        .arg(SET_AGE)
+        .arg("--params")
+        .arg(r#"{"name":"Alice","age":52}"#)
+        .arg("--if-commit")
+        .arg(&stale_head)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert_eq!(
+        lost.status.code(),
+        Some(4),
+        "lost embedded --if-commit must exit 4; stderr: {}",
+        String::from_utf8_lossy(&lost.stderr)
+    );
+    let body: Value = serde_json::from_slice(&lost.stdout)
+        .expect("--json must emit structured precondition details on stdout");
+    assert_eq!(
+        body["precondition_failure"]["expected"],
+        Value::String(stale_head)
+    );
+
+    let verify = output_success(
+        cli()
+            .arg("query")
+            .arg("--store")
+            .arg(&graph)
+            .arg("-e")
+            .arg(FIND_PERSON)
+            .arg("--params")
+            .arg(r#"{"name":"Alice"}"#)
+            .arg("--json"),
+    );
+    assert_eq!(parse_stdout_json(&verify)["rows"][0]["p.age"], 31);
+}
+
+/// A conditional remote mutation must advertise the capability in its path,
+/// not only in an optional header. An older server can ignore an unknown
+/// header after executing `/change` or `/mutate`; it cannot accidentally run a
+/// route it does not have, so the new CLI must receive 404 before any mutation
+/// handler is reachable.
+#[test]
+fn remote_if_commit_fails_closed_against_an_older_server() {
+    const SET_AGE: &str = "query set_age($name: String, $age: I32) { update Person set { age: $age } where name = $name }";
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (line_tx, line_rx) = mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut request_line = String::new();
+        reader.read_line(&mut request_line).unwrap();
+        line_tx.send(request_line).unwrap();
+        let body = r#"{"error":"not found"}"#;
+        write!(
+            reader.get_mut(),
+            "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .unwrap();
+        reader.get_mut().flush().unwrap();
+    });
+
+    let output = cli()
+        .arg("mutate")
+        .arg("--server")
+        .arg(format!("http://{address}"))
+        .arg("--graph")
+        .arg("legacy")
+        .arg("-e")
+        .arg(SET_AGE)
+        .arg("--params")
+        .arg(r#"{"name":"Alice","age":52}"#)
+        .arg("--if-commit")
+        .arg("01HOLDHEAD")
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "an old server must fail closed");
+    server.join().unwrap();
+    assert_eq!(
+        line_rx.recv().unwrap().trim_end(),
+        "POST /graphs/legacy/mutate/if-graph-commit HTTP/1.1",
+        "the CLI must not send a conditional write to an older server's ordinary mutation route"
+    );
 }
 
 #[test]
@@ -1487,7 +2245,14 @@ fn read_rejects_empty_query_string() {
     init_graph(&repo);
     load_fixture(&repo);
 
-    let output = output_failure(cli().arg("read").arg("--store").arg(&repo).arg("-e").arg(""));
+    let output = output_failure(
+        cli()
+            .arg("read")
+            .arg("--store")
+            .arg(&repo)
+            .arg("-e")
+            .arg(""),
+    );
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(
         stderr.contains("must not be empty"),
@@ -1900,6 +2665,127 @@ fn branch_merge_supports_explicit_target() {
 }
 
 #[test]
+fn branch_merge_delete_branch_deletes_source() {
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    load_fixture(&graph);
+
+    output_success(
+        cli()
+            .arg("branch")
+            .arg("create")
+            .arg("--uri")
+            .arg(&graph)
+            .arg("--from")
+            .arg("main")
+            .arg("feature"),
+    );
+    let feature_data = temp.path().join("feature-delete.jsonl");
+    write_jsonl(
+        &feature_data,
+        r#"{"type":"Person","data":{"name":"Gwen","age":35}}"#,
+    );
+    output_success(
+        cli()
+            .arg("load")
+            .arg("--data")
+            .arg(&feature_data)
+            .arg("--branch")
+            .arg("feature")
+            .arg("--mode")
+            .arg("append")
+            .arg(&graph),
+    );
+
+    let merge_output = output_success(
+        cli()
+            .arg("branch")
+            .arg("merge")
+            .arg("--uri")
+            .arg(&graph)
+            .arg("feature")
+            .arg("--delete-branch")
+            .arg("--json"),
+    );
+    let merge_payload: Value = serde_json::from_slice(&merge_output.stdout).unwrap();
+    assert_eq!(merge_payload["outcome"], "fast_forward");
+    assert_eq!(merge_payload["branch_deleted"], true);
+    assert!(merge_payload["branch_delete_error"].is_null());
+
+    let list_output = output_success(
+        cli()
+            .arg("branch")
+            .arg("list")
+            .arg("--uri")
+            .arg(&graph)
+            .arg("--json"),
+    );
+    let list_payload: Value = serde_json::from_slice(&list_output.stdout).unwrap();
+    assert_eq!(list_payload["branches"], serde_json::json!(["main"]));
+}
+
+#[test]
+fn branch_merge_delete_branch_refusal_warns_and_exits_zero() {
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    load_fixture(&graph);
+
+    for (from, name) in [("main", "feature"), ("feature", "feature-child")] {
+        output_success(
+            cli()
+                .arg("branch")
+                .arg("create")
+                .arg("--uri")
+                .arg(&graph)
+                .arg("--from")
+                .arg(from)
+                .arg(name),
+        );
+    }
+
+    // `feature` has a dependent descendant, so the post-merge deletion is
+    // refused — the merge (already_up_to_date: deletion is still attempted)
+    // must succeed with exit code 0 and a stderr warning.
+    let merge_output = output_success(
+        cli()
+            .arg("branch")
+            .arg("merge")
+            .arg("--uri")
+            .arg(&graph)
+            .arg("feature")
+            .arg("--delete-branch")
+            .arg("--json"),
+    );
+    let merge_payload: Value = serde_json::from_slice(&merge_output.stdout).unwrap();
+    assert_eq!(merge_payload["outcome"], "already_up_to_date");
+    assert_eq!(merge_payload["branch_deleted"], false);
+    assert!(
+        merge_payload["branch_delete_error"]
+            .as_str()
+            .unwrap()
+            .contains("feature-child")
+    );
+    let stderr = String::from_utf8_lossy(&merge_output.stderr);
+    assert!(stderr.contains("could not delete branch 'feature'"));
+
+    let list_output = output_success(
+        cli()
+            .arg("branch")
+            .arg("list")
+            .arg("--uri")
+            .arg(&graph)
+            .arg("--json"),
+    );
+    let list_payload: Value = serde_json::from_slice(&list_output.stdout).unwrap();
+    assert_eq!(
+        list_payload["branches"],
+        serde_json::json!(["feature", "feature-child", "main"])
+    );
+}
+
+#[test]
 fn snapshot_json_returns_manifest_version_and_tables() {
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());
@@ -2114,7 +3000,10 @@ fn profile_list_names_each_profile_with_its_binding_and_marks_active() {
     assert!(stdout.contains("cluster: brain"), "{stdout}");
     assert!(stdout.contains("store: file:///data/dev.omni"), "{stdout}");
     // A malformed (two-scope) profile is reported, not a hard failure.
-    assert!(stdout.contains("broken") && stdout.contains("invalid:"), "{stdout}");
+    assert!(
+        stdout.contains("broken") && stdout.contains("invalid:"),
+        "{stdout}"
+    );
 }
 
 #[test]

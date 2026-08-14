@@ -94,9 +94,17 @@ pub(crate) type ChangeSet = HashMap<String, TableChange>;
 /// Row-local value validation — `@range`/`@check` (nodes) and enum membership
 /// (nodes **and** edges) — Δ-scoped to the changed rows. Reuses the loader
 /// leaves so the merge and write paths share one implementation; including the
-/// enum check here is what closes the merge-vs-write drift.
-pub(crate) fn evaluate_value_constraints(changeset: &ChangeSet, catalog: &Catalog) -> Vec<Violation> {
-    let mut violations = Vec::new();
+/// enum check here is what closes the merge-vs-write drift. Leaf validators
+/// still produce at most one error per invocation, while the sink avoids
+/// retaining their aggregate across every changed table and batch.
+fn evaluate_value_constraints_with_sink<F>(
+    changeset: &ChangeSet,
+    catalog: &Catalog,
+    sink: &mut F,
+) -> Result<()>
+where
+    F: FnMut(Violation) -> Result<()>,
+{
     for (table_key, change) in changeset {
         if let Some(type_name) = table_key.strip_prefix("node:") {
             let Some(node_type) = catalog.node_types.get(type_name) else {
@@ -104,10 +112,11 @@ pub(crate) fn evaluate_value_constraints(changeset: &ChangeSet, catalog: &Catalo
             };
             for batch in change.value_batches() {
                 if let Err(err) = validate_value_constraints(batch, node_type) {
-                    violations.push(value_violation(table_key, err));
+                    sink(value_violation(table_key, err))?;
                 }
-                if let Err(err) = validate_enum_constraints(batch, &node_type.properties, type_name) {
-                    violations.push(value_violation(table_key, err));
+                if let Err(err) = validate_enum_constraints(batch, &node_type.properties, type_name)
+                {
+                    sink(value_violation(table_key, err))?;
                 }
             }
         } else if let Some(type_name) = table_key.strip_prefix("edge:") {
@@ -117,13 +126,14 @@ pub(crate) fn evaluate_value_constraints(changeset: &ChangeSet, catalog: &Catalo
             // Edges carry no @range/@check (NodeType-only), but their properties
             // can be enum-typed — the check the merge path was missing.
             for batch in change.value_batches() {
-                if let Err(err) = validate_enum_constraints(batch, &edge_type.properties, type_name) {
-                    violations.push(value_violation(table_key, err));
+                if let Err(err) = validate_enum_constraints(batch, &edge_type.properties, type_name)
+                {
+                    sink(value_violation(table_key, err))?;
                 }
             }
         }
     }
-    violations
+    Ok(())
 }
 
 /// Wrap a leaf-check error as a value-constraint [`Violation`]. The message is
@@ -152,7 +162,7 @@ fn value_violation(table_key: &str, err: OmniError) -> Violation {
 #[derive(Debug, Clone)]
 pub(crate) enum Constraint {
     /// Row-local value/enum validation across the whole change-set (one entry
-    /// covers every table; handled by [`evaluate_value_constraints`]).
+    /// covers every table; handled by [`evaluate_value_constraints_with_sink`]).
     Value,
     Unique {
         table_key: String,
@@ -221,6 +231,11 @@ pub(crate) fn constraints_for(catalog: &Catalog) -> Vec<Constraint> {
     out
 }
 
+/// Keys per batched committed-uniqueness scan. Bounds the pushed-down filter
+/// size on the merge path (whose deltas are not row-capped); Mutation/Load
+/// deltas are already capped at this many rows, so they probe in one chunk.
+const UNIQUE_PROBE_CHUNK_KEYS: usize = 8_192;
+
 /// Index-backed view of committed target state for the merge delta's lookups.
 /// Every method reads the (indexed) target table via a structured `filter_expr`
 /// so Lance serves it from the BTREE (index-search → take) rather than a full
@@ -238,9 +253,10 @@ pub(crate) struct CommittedState<'a> {
     /// tables, not a global flag — an edges-only overwrite still sees committed
     /// nodes for RI. Empty on the merge / mutation / append / merge-load paths.
     overwritten: HashSet<String>,
-    /// Write path only: open edge tables at LIVE HEAD for `@card` (the #298
-    /// stale-handle fix). `None` on the merge and load paths — there the snapshot
-    /// (or empty) is the committed view for every check.
+    /// Write path only: open edge tables from a fresh graph-branch manifest
+    /// snapshot for `@card` (the #298 stale-handle fix). This is the live
+    /// committed graph view, not a raw Lance HEAD that may be unpublished or
+    /// belong to an inherited source ref. `None` on merge/load.
     live: Option<(&'a Omnigraph, Option<&'a str>)>,
 }
 
@@ -255,8 +271,13 @@ impl<'a> CommittedState<'a> {
     }
 
     /// Write path: existence/uniqueness read `committed` (the write's pinned
-    /// base); cardinality reads LIVE HEAD per edge table via `db` (#298).
-    pub(crate) fn write(committed: &'a Snapshot, db: &'a Omnigraph, branch: Option<&'a str>) -> Self {
+    /// base); cardinality reads the live committed branch snapshot via `db`
+    /// (#298).
+    pub(crate) fn write(
+        committed: &'a Snapshot,
+        db: &'a Omnigraph,
+        branch: Option<&'a str>,
+    ) -> Self {
         Self {
             committed: Some(committed),
             overwritten: HashSet::new(),
@@ -295,15 +316,17 @@ impl<'a> CommittedState<'a> {
             return Ok(None);
         };
         match committed.entry(table_key) {
-            Some(_) => Ok(Some(committed.open(table_key).await?)),
+            Some(_) => Ok(Some(committed.open_dataset(table_key).await?)),
             None => Ok(None),
         }
     }
 
-    /// Open an edge table for cardinality counting: LIVE HEAD on the write path
-    /// (so an edge a concurrent writer committed since the base was pinned is
-    /// counted — #298), the committed snapshot otherwise. `None` if there is no
-    /// committed view (Overwrite load) or the table isn't in it.
+    /// Open an edge table for cardinality counting: the current manifest-visible
+    /// graph-branch snapshot on the write path (so a concurrent published edge
+    /// is counted — #298), the pinned committed snapshot otherwise. Resolving
+    /// through the fresh graph snapshot is load-bearing for first-touch named
+    /// branches: their table still inherits another Lance ref until this write's
+    /// sidecar is armed, so opening the target ref directly would be invalid.
     async fn open_cardinality(&self, table_key: &str) -> Result<Option<Dataset>> {
         if self.overwritten.contains(table_key) {
             return Ok(None);
@@ -311,16 +334,23 @@ impl<'a> CommittedState<'a> {
         let Some(committed) = self.committed else {
             return Ok(None);
         };
-        let Some(entry) = committed.entry(table_key) else {
+        let Some(_entry) = committed.entry(table_key) else {
             return Ok(None);
         };
         match self.live {
             Some((db, branch)) => {
-                let full_path = db.storage().dataset_uri(&entry.table_path);
-                let handle = db.storage().open_dataset_head(&full_path, branch).await?;
-                Ok(Some(handle.dataset().clone()))
+                // `CommittedState::write` is constructed only after WriteTxn
+                // schema validation, so use the unchecked manifest refresh to
+                // avoid another full contract read while retaining live branch
+                // authority. Snapshot::open follows the entry's actual
+                // `table_branch` and pinned version (including inheritance).
+                let live = db.fresh_snapshot_for_branch_unchecked(branch).await?;
+                match live.entry(table_key) {
+                    Some(_) => Ok(Some(live.open_dataset(table_key).await?)),
+                    None => Ok(None),
+                }
             }
-            None => Ok(Some(committed.open(table_key).await?)),
+            None => Ok(Some(committed.open_dataset(table_key).await?)),
         }
     }
 
@@ -346,46 +376,94 @@ impl<'a> CommittedState<'a> {
         Ok(present)
     }
 
-    /// Ids of committed rows in `table_key` whose `columns` tuple equals `key`.
-    /// Used to detect a cross-version unique collision (the one constraint the
-    /// write path does not enforce, so it is load-bearing at merge).
+    /// Committed holders of the given `columns` tuples in `table_key`, as a map
+    /// from the canonical key to the holder row ids. Used to detect cross-version
+    /// unique collisions (the one constraint the write path does not enforce, so
+    /// it is load-bearing at merge). BATCHED: the dataset is opened once and each
+    /// ≤[`UNIQUE_PROBE_CHUNK_KEYS`]-key chunk is one filtered scan — never one
+    /// scan per key (per-row probes made an S3 merge/append load pay one dataset
+    /// open + one scan per row).
+    ///
+    /// Filter shape: an AND of per-column IN-lists, so each indexed column is
+    /// served by its BTREE as one `IsIn` query (a non-indexed `@unique` column
+    /// falls back to a scan — still one scan for the whole chunk). For a
+    /// composite group the AND of IN-lists is a SUPERSET (the per-column cross
+    /// product); exact tuple membership is decided here against the same
+    /// `composite_unique_key` canonicalization the delta used. The literals are
+    /// TYPED (built from the row's Arrow columns), so the pushed-down filter
+    /// compares like-typed. A stringified key would push a Utf8 literal against a
+    /// typed column — a coercion error on Date/Bool (breaking every write) or a
+    /// silent miss on Float.
     async fn unique_holders(
         &self,
         table_key: &str,
         columns: &[String],
-        key_values: &[ScalarValue],
-    ) -> Result<Vec<String>> {
-        let Some(ds) = self.open(table_key).await? else {
-            return Ok(Vec::new());
-        };
-        // AND of per-column equality so each indexed column is served by its
-        // BTREE (a non-indexed `@unique` column falls back to a scan). The
-        // literal is TYPED (built from the row's Arrow column), so the
-        // pushed-down filter compares like-typed. A stringified key would push a
-        // Utf8 literal against a typed column — a coercion error on Date/Bool
-        // (breaking every write) or a silent miss on Float.
-        let mut expr: Option<Expr> = None;
-        for (column, value) in columns.iter().zip(key_values.iter()) {
-            let eq = col(column.as_str()).eq(lit(value.clone()));
-            expr = Some(match expr {
-                Some(acc) => acc.and(eq),
-                None => eq,
-            });
+        keys: &[(Vec<String>, Vec<ScalarValue>)],
+    ) -> Result<HashMap<Vec<String>, Vec<String>>> {
+        let mut holders: HashMap<Vec<String>, Vec<String>> = HashMap::new();
+        if keys.is_empty() || columns.is_empty() {
+            return Ok(holders);
         }
-        let Some(expr) = expr else {
-            return Ok(Vec::new());
+        let Some(ds) = self.open(table_key).await? else {
+            return Ok(holders);
         };
-        let batches = scan_filtered(&ds, &["id"], expr).await?;
-        let mut ids = Vec::new();
-        for batch in &batches {
-            let column = string_col(batch, "id")?;
-            for i in 0..column.len() {
-                if !column.is_null(i) {
-                    ids.push(column.value(i).to_string());
+        let projection: Vec<&str> = std::iter::once("id")
+            .chain(columns.iter().map(String::as_str))
+            .collect();
+        for chunk in keys.chunks(UNIQUE_PROBE_CHUNK_KEYS) {
+            // Per-CHUNK wanted set: a composite chunk's AND-of-IN-lists superset
+            // can match a tuple belonging to a different chunk; every requested
+            // tuple is matched by its own chunk's scan, so collecting it only
+            // there keeps each holder exactly once.
+            let wanted: HashSet<&Vec<String>> =
+                chunk.iter().map(|(canonical, _)| canonical).collect();
+            let mut expr: Option<Expr> = None;
+            for (i, column) in columns.iter().enumerate() {
+                // Dedup per-column values by their canonical rendering (two keys
+                // sharing a column value push it once).
+                let mut seen: HashSet<&str> = HashSet::new();
+                let values: Vec<Expr> = chunk
+                    .iter()
+                    .filter(|(canonical, _)| seen.insert(canonical[i].as_str()))
+                    .map(|(_, typed)| lit(typed[i].clone()))
+                    .collect();
+                let in_list = col(column.as_str()).in_list(values, false);
+                expr = Some(match expr {
+                    Some(acc) => acc.and(in_list),
+                    None => in_list,
+                });
+            }
+            let expr = expr.expect("columns is non-empty");
+            let batches = scan_filtered(&ds, &projection, expr).await?;
+            for batch in &batches {
+                let ids = string_col(batch, "id")?;
+                let group_columns = columns
+                    .iter()
+                    .map(|name| {
+                        batch.column_by_name(name).cloned().ok_or_else(|| {
+                            OmniError::manifest(format!(
+                                "table {table_key} missing unique column '{name}'"
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                for row in 0..batch.num_rows() {
+                    if ids.is_null(row) {
+                        continue;
+                    }
+                    let Some(key) = composite_unique_key(&group_columns, row)? else {
+                        continue;
+                    };
+                    if wanted.contains(&key) {
+                        holders
+                            .entry(key)
+                            .or_default()
+                            .push(ids.value(row).to_string());
+                    }
                 }
             }
         }
-        Ok(ids)
+        Ok(holders)
     }
 
     /// Committed edges `(id, src)` in `edge_table` matching `keys` on `key_col`
@@ -507,7 +585,7 @@ pub(crate) async fn overwrite_removed_ids(
             }
         }
     }
-    let ds = base.open(table_key).await?;
+    let ds = base.open_dataset(table_key).await?;
     let mut removed = Vec::new();
     for batch in &scan_all(&ds, &["id"]).await? {
         let column = string_col(batch, "id")?;
@@ -585,61 +663,102 @@ pub(crate) async fn evaluate(
     catalog: &Catalog,
 ) -> Result<Vec<Violation>> {
     let mut violations = Vec::new();
-    for constraint in constraints {
-        match constraint {
-            Constraint::Value => {
-                violations.extend(evaluate_value_constraints(changeset, catalog));
-            }
-            Constraint::Unique {
-                table_key,
-                columns,
-                is_key,
-            } => {
-                if let Some(change) = changeset.get(table_key) {
-                    violations.extend(
-                        evaluate_unique(table_key, columns, *is_key, change, committed).await?,
-                    );
+    evaluate_with_sink(constraints, changeset, committed, catalog, |violation| {
+        violations.push(violation);
+        Ok(())
+    })
+    .await?;
+    Ok(violations)
+}
+
+/// Run the declared constraints while emitting each violation as soon as it is
+/// produced. Constraint order, per-constraint ordering, and messages are
+/// identical to [`evaluate`]; unlike that compatibility wrapper, this entry
+/// point does not retain a graph-wide violation vector.
+///
+/// A fallible sink may observe a successful prefix before either it or a later
+/// validator returns an error. The returned count includes only violations the
+/// sink accepted.
+pub(crate) async fn evaluate_with_sink<F>(
+    constraints: &[Constraint],
+    changeset: &ChangeSet,
+    committed: &CommittedState<'_>,
+    catalog: &Catalog,
+    mut sink: F,
+) -> Result<usize>
+where
+    F: FnMut(Violation) -> Result<()>,
+{
+    let mut violation_count = 0usize;
+    {
+        let mut emit = |violation| {
+            let next_count = violation_count
+                .checked_add(1)
+                .ok_or_else(|| OmniError::manifest("integrity violation count overflow"))?;
+            sink(violation)?;
+            violation_count = next_count;
+            Ok(())
+        };
+
+        for constraint in constraints {
+            match constraint {
+                Constraint::Value => {
+                    evaluate_value_constraints_with_sink(changeset, catalog, &mut emit)?;
                 }
-            }
-            Constraint::EdgeRi {
-                table_key,
-                from_type,
-                to_type,
-            } => {
-                // Run when the edge itself has a delta OR when a referenced node
-                // type has deletions (path-b can strand a committed target edge
-                // even if this edge table has no delta of its own).
-                let node_deleted = |node_type: &str| {
-                    changeset
-                        .get(&format!("node:{node_type}"))
-                        .map(|change| !change.deleted_ids.is_empty())
-                        .unwrap_or(false)
-                };
-                let change = changeset.get(table_key);
-                if change.is_some() || node_deleted(from_type) || node_deleted(to_type) {
-                    violations.extend(
-                        evaluate_edge_ri(table_key, from_type, to_type, change, changeset, committed)
-                            .await?,
-                    );
+                Constraint::Unique {
+                    table_key,
+                    columns,
+                    is_key,
+                } => {
+                    if let Some(change) = changeset.get(table_key) {
+                        evaluate_unique(table_key, columns, *is_key, change, committed, &mut emit)
+                            .await?;
+                    }
                 }
-            }
-            Constraint::Cardinality { table_key } => {
-                if let Some(change) = changeset.get(table_key) {
-                    let Some(type_name) = table_key.strip_prefix("edge:") else {
-                        continue;
+                Constraint::EdgeRi {
+                    table_key,
+                    from_type,
+                    to_type,
+                } => {
+                    // Run when the edge itself has a delta OR when a referenced node
+                    // type has deletions (path-b can strand a committed target edge
+                    // even if this edge table has no delta of its own).
+                    let node_deleted = |node_type: &str| {
+                        changeset
+                            .get(&format!("node:{node_type}"))
+                            .map(|change| !change.deleted_ids.is_empty())
+                            .unwrap_or(false)
                     };
-                    if let Some(edge_type) = catalog.edge_types.get(type_name) {
-                        violations.extend(
-                            evaluate_cardinality(table_key, edge_type, change, changeset, committed)
-                                .await?,
-                        );
+                    let change = changeset.get(table_key);
+                    if change.is_some() || node_deleted(from_type) || node_deleted(to_type) {
+                        evaluate_edge_ri(
+                            table_key, from_type, to_type, change, changeset, committed, &mut emit,
+                        )
+                        .await?;
+                    }
+                }
+                Constraint::Cardinality { table_key } => {
+                    if let Some(change) = changeset.get(table_key) {
+                        let Some(type_name) = table_key.strip_prefix("edge:") else {
+                            continue;
+                        };
+                        if let Some(edge_type) = catalog.edge_types.get(type_name) {
+                            evaluate_cardinality(
+                                table_key, edge_type, change, changeset, committed, &mut emit,
+                            )
+                            .await?;
+                        }
                     }
                 }
             }
         }
     }
-    Ok(violations)
+    Ok(violation_count)
 }
+
+/// One entry of the coalesced `final_by_id` image: `(id, (key column strings,
+/// typed key values))`.
+type FinalKeyByIdEntry = (String, (Vec<String>, Vec<ScalarValue>));
 
 /// Uniqueness for one `@unique`/`@key` group on `table_key`, evaluated against
 /// the delta's FINAL coalesced image (last-wins per id) — the same image commit
@@ -655,14 +774,18 @@ pub(crate) async fn evaluate(
 ///    SURVIVING committed row (not itself in the delta, not deleted). `@key` is
 ///    id-backed, so a committed holder of a key value is the same row (an
 ///    upsert) — self-excluded — so the probe is skipped.
-async fn evaluate_unique(
+async fn evaluate_unique<F>(
     table_key: &str,
     columns: &[String],
     is_key: bool,
     change: &TableChange,
     committed: &CommittedState<'_>,
-) -> Result<Vec<Violation>> {
-    let mut violations = Vec::new();
+    sink: &mut F,
+) -> Result<()>
+where
+    F: FnMut(Violation) -> Result<()>,
+{
+    let mut has_within_batch_violation = false;
     let delta_ids = delta_id_set(change)?;
     let deleted: HashSet<&String> = change.deleted_ids.iter().collect();
 
@@ -688,7 +811,8 @@ async fn evaluate_unique(
                 continue;
             };
             if let Some(prior) = seen_in_batch.insert(key.clone(), id.clone()) {
-                violations.push(unique_violation(table_key, columns, &key, &id, &prior));
+                sink(unique_violation(table_key, columns, &key, &id, &prior))?;
+                has_within_batch_violation = true;
             }
             // Typed literals from the row's Arrow columns for the committed probe
             // (a stringified key would compare a typed column to Utf8). `key` is
@@ -701,15 +825,15 @@ async fn evaluate_unique(
             final_by_id.insert(id, (key, values));
         }
     }
-    // A within-batch duplicate is an unambiguous bulk-input error; report it
-    // without the coalesced cross-row pass (which would re-report the same pair).
-    if !violations.is_empty() {
-        return Ok(violations);
+    // Preserve the established bulk-input contract and error ordering: a
+    // within-batch duplicate is reported before the coalesced cross-row and
+    // committed passes.
+    if has_within_batch_violation {
+        return Ok(());
     }
 
     // Deterministic order — no HashMap iteration in violation ordering.
-    let mut entries: Vec<(String, (Vec<String>, Vec<ScalarValue>))> =
-        final_by_id.into_iter().collect();
+    let mut entries: Vec<FinalKeyByIdEntry> = final_by_id.into_iter().collect();
     entries.sort_by(|a, b| a.0.cmp(&b.0));
 
     // Pass 2: two DISTINCT ids holding the same final key.
@@ -717,23 +841,34 @@ async fn evaluate_unique(
     for (id, (key, _)) in &entries {
         if let Some(other) = holder_by_key.insert(key, id) {
             if other != id {
-                violations.push(unique_violation(table_key, columns, key, id, other));
+                sink(unique_violation(table_key, columns, key, id, other))?;
             }
         }
     }
 
-    // Pass 3: committed cross-version (non-`@key` only).
+    // Pass 3: committed cross-version (non-`@key` only). ONE batched probe for
+    // the whole group — dedup'd keys, dataset opened once — never a scan per row.
     if !is_key {
-        for (id, (key, values)) in &entries {
-            for holder in committed.unique_holders(table_key, columns, values).await? {
-                if !delta_ids.contains(&holder) && !deleted.contains(&holder) {
-                    violations.push(unique_violation(table_key, columns, key, id, &holder));
+        let mut seen: HashSet<&Vec<String>> = HashSet::new();
+        let probe: Vec<(Vec<String>, Vec<ScalarValue>)> = entries
+            .iter()
+            .filter(|(_, (key, _))| seen.insert(key))
+            .map(|(_, (key, values))| (key.clone(), values.clone()))
+            .collect();
+        let holders_by_key = committed.unique_holders(table_key, columns, &probe).await?;
+        for (id, (key, _)) in &entries {
+            let Some(holders) = holders_by_key.get(key) else {
+                continue;
+            };
+            for holder in holders {
+                if !delta_ids.contains(holder) && !deleted.contains(holder) {
+                    sink(unique_violation(table_key, columns, key, id, holder))?;
                     break;
                 }
             }
         }
     }
-    Ok(violations)
+    Ok(())
 }
 
 /// Edge referential integrity for added∪changed edges: each endpoint must exist
@@ -744,17 +879,20 @@ async fn evaluate_unique(
 /// cascade-removed or surface as a structural `DeleteVsUpdate`). So checking the
 /// edge delta is sufficient and equivalent to the old full scan on all reachable
 /// inputs.
-async fn evaluate_edge_ri(
+async fn evaluate_edge_ri<F>(
     edge_table: &str,
     from_type: &str,
     to_type: &str,
     change: Option<&TableChange>,
     changeset: &ChangeSet,
     committed: &CommittedState<'_>,
-) -> Result<Vec<Violation>> {
+    sink: &mut F,
+) -> Result<()>
+where
+    F: FnMut(Violation) -> Result<()>,
+{
     let from_table = format!("node:{from_type}");
     let to_table = format!("node:{to_type}");
-    let mut violations = Vec::new();
     // Delta edge ids — excluded from path-b (path-a already covers them).
     let mut delta_edge_ids: HashSet<String> = HashSet::new();
 
@@ -775,14 +913,15 @@ async fn evaluate_edge_ri(
         if !edges.is_empty() {
             let srcs: Vec<String> = edges.iter().map(|(_, src, _)| src.clone()).collect();
             let dsts: Vec<String> = edges.iter().map(|(_, _, dst)| dst.clone()).collect();
-            let from_exist = merged_node_existence(&from_table, &srcs, changeset, committed).await?;
+            let from_exist =
+                merged_node_existence(&from_table, &srcs, changeset, committed).await?;
             let to_exist = merged_node_existence(&to_table, &dsts, changeset, committed).await?;
             for (id, src, dst) in &edges {
                 if !from_exist.contains(src) {
-                    violations.push(orphan_violation(edge_table, id, "src", src, from_type));
+                    sink(orphan_violation(edge_table, id, "src", src, from_type))?;
                 }
                 if !to_exist.contains(dst) {
-                    violations.push(orphan_violation(edge_table, id, "dst", dst, to_type));
+                    sink(orphan_violation(edge_table, id, "dst", dst, to_type))?;
                 }
             }
         }
@@ -815,15 +954,15 @@ async fn evaluate_edge_ri(
                 continue;
             }
             if from_set.contains(&src) {
-                violations.push(orphan_violation(edge_table, &id, "src", &src, from_type));
+                sink(orphan_violation(edge_table, &id, "src", &src, from_type))?;
             }
             if to_set.contains(&dst) {
-                violations.push(orphan_violation(edge_table, &id, "dst", &dst, to_type));
+                sink(orphan_violation(edge_table, &id, "dst", &dst, to_type))?;
             }
         }
     }
 
-    Ok(violations)
+    Ok(())
 }
 
 /// Which of `ids` exist in the merged node table `node_table` = `target ± delta`:
@@ -864,17 +1003,21 @@ async fn merged_node_existence(
 /// new src of each delta edge AND the old committed src of each changed/deleted
 /// edge id, so moving an edge off a src recounts the vacated src. A src that is
 /// itself a deleted node is skipped.
-async fn evaluate_cardinality(
+async fn evaluate_cardinality<F>(
     edge_table: &str,
     edge_type: &EdgeType,
     change: &TableChange,
     changeset: &ChangeSet,
     committed: &CommittedState<'_>,
-) -> Result<Vec<Violation>> {
+    sink: &mut F,
+) -> Result<()>
+where
+    F: FnMut(Violation) -> Result<()>,
+{
     let card = &edge_type.cardinality;
     // Default unbounded cardinality can never be violated — skip the lookups.
     if card.min == 0 && card.max.is_none() {
-        return Ok(Vec::new());
+        return Ok(());
     }
     let delta_edges = delta_edge_src(change)?;
     let removed_ids: Vec<String> = change.deleted_ids.clone();
@@ -896,8 +1039,12 @@ async fn evaluate_cardinality(
     // in `deleted_ids`). `moved_from` are the changed ids' OLD committed srcs: an
     // upsert that moves an edge's src vacates its old src, which must be
     // recounted or a drop below @card min is missed.
-    let removed_edges = committed.committed_edges(edge_table, "id", &removed_ids).await?;
-    let moved_from = committed.committed_edges(edge_table, "id", &changed_ids).await?;
+    let removed_edges = committed
+        .committed_edges(edge_table, "id", &removed_ids)
+        .await?;
+    let moved_from = committed
+        .committed_edges(edge_table, "id", &changed_ids)
+        .await?;
 
     let deleted_src_nodes: HashSet<String> = changeset
         .get(&format!("node:{}", edge_type.from_type))
@@ -913,7 +1060,7 @@ async fn evaluate_cardinality(
     }
     affected.retain(|src| !deleted_src_nodes.contains(src));
     if affected.is_empty() {
-        return Ok(Vec::new());
+        return Ok(());
     }
 
     let affected_vec: Vec<String> = affected.iter().cloned().collect();
@@ -937,33 +1084,32 @@ async fn evaluate_cardinality(
         per_src.entry(src.clone()).or_default().insert(id.clone());
     }
 
-    let mut violations = Vec::new();
     for src in &affected {
         let count = per_src.get(src).map(|ids| ids.len() as u32).unwrap_or(0);
         if let Some(max) = card.max {
             if count > max {
-                violations.push(cardinality_violation(
+                sink(cardinality_violation(
                     edge_table,
                     &edge_type.name,
                     src,
                     count,
                     "max",
                     max,
-                ));
+                ))?;
             }
         }
         if count < card.min {
-            violations.push(cardinality_violation(
+            sink(cardinality_violation(
                 edge_table,
                 &edge_type.name,
                 src,
                 count,
                 "min",
                 card.min,
-            ));
+            ))?;
         }
     }
-    Ok(violations)
+    Ok(())
 }
 
 /// Canonical `@unique` violation message, matching the write path's format
@@ -1039,7 +1185,8 @@ mod tests {
     use omnigraph_compiler::catalog::build_catalog;
     use omnigraph_compiler::schema::parser::parse_schema;
 
-    const DOC_SCHEMA: &str = "node Doc {\n  slug: String @key\n  status: enum(draft, published)\n}\n";
+    const DOC_SCHEMA: &str =
+        "node Doc {\n  slug: String @key\n  status: enum(draft, published)\n}\n";
 
     fn catalog(src: &str) -> Catalog {
         build_catalog(&parse_schema(src).unwrap()).unwrap()
@@ -1047,10 +1194,21 @@ mod tests {
 
     /// A change-set touching only `Doc.status` with the given values.
     fn status_change(values: &[&str]) -> ChangeSet {
-        let schema = Arc::new(Schema::new(vec![Field::new("status", DataType::Utf8, true)]));
-        let batch =
-            RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(values.to_vec())) as _])
-                .unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("status", DataType::Utf8, true),
+        ]));
+        let ids = (0..values.len())
+            .map(|index| format!("doc-{index}"))
+            .collect::<Vec<_>>();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(ids)) as _,
+                Arc::new(StringArray::from(values.to_vec())) as _,
+            ],
+        )
+        .unwrap();
         let mut change = TableChange::default();
         change.changed.push(batch);
         let mut cs = ChangeSet::new();
@@ -1058,28 +1216,157 @@ mod tests {
         cs
     }
 
+    fn duplicate_slug_change() -> ChangeSet {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("slug", DataType::Utf8, false),
+            Field::new("status", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["doc-0", "doc-1", "doc-2", "doc-3"])) as _,
+                Arc::new(StringArray::from(vec!["alpha", "alpha", "beta", "beta"])) as _,
+                Arc::new(StringArray::from(vec![
+                    "bogus",
+                    "draft",
+                    "draft",
+                    "published",
+                ])) as _,
+            ],
+        )
+        .unwrap();
+        let mut change = TableChange::default();
+        change.changed.push(batch);
+        let mut changeset = ChangeSet::new();
+        changeset.insert("node:Doc".to_string(), change);
+        changeset
+    }
+
+    fn collect_value_constraints(changeset: &ChangeSet, catalog: &Catalog) -> Vec<Violation> {
+        let mut violations = Vec::new();
+        evaluate_value_constraints_with_sink(changeset, catalog, &mut |violation| {
+            violations.push(violation);
+            Ok(())
+        })
+        .expect("the test violation collector is infallible");
+        violations
+    }
+
     /// The merge path previously validated `@range`/`@check` but NOT enum
     /// membership, so a delta carrying an out-of-enum value slipped through (W1).
     /// The unified evaluator runs the enum check the write path always ran.
     #[test]
     fn evaluator_flags_out_of_enum_value_in_delta() {
-        let v = evaluate_value_constraints(&status_change(&["bogus"]), &catalog(DOC_SCHEMA));
+        let v = collect_value_constraints(&status_change(&["bogus"]), &catalog(DOC_SCHEMA));
         assert_eq!(v.len(), 1, "expected one enum violation, got {v:?}");
         assert_eq!(v[0].kind, MergeConflictKind::ValueConstraintViolation);
-        assert!(v[0].message.contains("bogus"), "message was: {}", v[0].message);
+        assert!(
+            v[0].message.contains("bogus"),
+            "message was: {}",
+            v[0].message
+        );
     }
 
     #[test]
     fn evaluator_accepts_valid_delta() {
         assert!(
-            evaluate_value_constraints(&status_change(&["draft"]), &catalog(DOC_SCHEMA)).is_empty()
+            collect_value_constraints(&status_change(&["draft"]), &catalog(DOC_SCHEMA)).is_empty()
         );
     }
 
-    /// Δ-scoping: an empty change-set does no work and raises nothing —
-    /// validation cost follows the delta, not the table size.
+    #[tokio::test]
+    async fn sink_evaluator_matches_collecting_order_and_messages() {
+        let catalog = catalog(DOC_SCHEMA);
+        let constraints = vec![
+            Constraint::Value,
+            Constraint::Unique {
+                table_key: "node:Doc".to_string(),
+                columns: vec!["slug".to_string()],
+                is_key: true,
+            },
+        ];
+        let changeset = duplicate_slug_change();
+        let committed = CommittedState {
+            committed: None,
+            overwritten: HashSet::new(),
+            live: None,
+        };
+
+        let collected = evaluate(&constraints, &changeset, &committed, &catalog)
+            .await
+            .unwrap();
+        let mut streamed = Vec::new();
+        let count = evaluate_with_sink(
+            &constraints,
+            &changeset,
+            &committed,
+            &catalog,
+            |violation| {
+                streamed.push(violation);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(count, collected.len());
+        assert_eq!(streamed.len(), collected.len());
+        assert_eq!(collected.len(), 3, "one value then two unique violations");
+        assert_eq!(
+            collected
+                .iter()
+                .map(|violation| (&violation.kind, violation.row_id.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![
+                (&MergeConflictKind::ValueConstraintViolation, None),
+                (&MergeConflictKind::UniqueViolation, Some("doc-1")),
+                (&MergeConflictKind::UniqueViolation, Some("doc-3")),
+            ]
+        );
+        for (actual, expected) in streamed.iter().zip(&collected) {
+            assert_eq!(actual.table_key, expected.table_key);
+            assert_eq!(actual.row_id, expected.row_id);
+            assert_eq!(actual.kind, expected.kind);
+            assert_eq!(actual.message, expected.message);
+        }
+    }
+
+    #[tokio::test]
+    async fn sink_evaluator_propagates_sink_failure_without_buffering_later_violations() {
+        let catalog = catalog(DOC_SCHEMA);
+        let constraints = vec![Constraint::Unique {
+            table_key: "node:Doc".to_string(),
+            columns: vec!["slug".to_string()],
+            is_key: true,
+        }];
+        let changeset = duplicate_slug_change();
+        let committed = CommittedState {
+            committed: None,
+            overwritten: HashSet::new(),
+            live: None,
+        };
+        let mut observed = Vec::new();
+
+        let error = evaluate_with_sink(
+            &constraints,
+            &changeset,
+            &committed,
+            &catalog,
+            |violation| {
+                observed.push(violation.row_id);
+                Err(OmniError::manifest("test sink stopped"))
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("test sink stopped"));
+        assert_eq!(observed, [Some("doc-1".to_string())]);
+    }
+
     #[test]
     fn evaluator_ignores_empty_changeset() {
-        assert!(evaluate_value_constraints(&ChangeSet::new(), &catalog(DOC_SCHEMA)).is_empty());
+        assert!(collect_value_constraints(&ChangeSet::new(), &catalog(DOC_SCHEMA)).is_empty());
     }
 }

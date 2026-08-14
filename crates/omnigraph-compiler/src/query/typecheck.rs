@@ -9,17 +9,32 @@ use crate::types::{Direction, PropType, ScalarType};
 
 use super::ast::*;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BindingKind {
-    Node,
-    Edge,
+/// A variable in the query's single namespace, tagged by what it binds.
+///
+/// Node and edge bindings share one symbol table (GQ has one variable
+/// namespace) but live in *separate type namespaces* — a node type and an edge
+/// type may share a name. A type name therefore only means something once the
+/// kind is known, so the kind is the discriminant: every consumer must match,
+/// and a new kind is a compile error at each site.
+#[derive(Debug, Clone)]
+pub enum BoundVariable {
+    Node { type_name: String },
+    Edge { type_name: String },
 }
 
-#[derive(Debug, Clone)]
-pub struct BoundVariable {
-    pub var_name: String,
-    pub type_name: String,
-    pub kind: BindingKind,
+impl BoundVariable {
+    /// Node type name of a traversal endpoint, or T23 if `self` is an edge
+    /// binding. The type name is only reachable through this check, so no
+    /// caller can compare endpoint types without having ruled the edge case
+    /// out. `var` names the variable for the error message only.
+    fn require_traversal_endpoint(&self, var: &str) -> Result<&str> {
+        match self {
+            Self::Node { type_name } => Ok(type_name),
+            Self::Edge { .. } => Err(CompilerError::Type(format!(
+                "T23: edge binding `${var}` cannot be used as a traversal endpoint; traversal endpoints must be node bindings"
+            ))),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -37,6 +52,9 @@ pub struct ResolvedTraversal {
     pub direction: Direction,
     pub min_hops: u32,
     pub max_hops: Option<u32>,
+    /// Variable bound to the matched edge row (`$p $w:knows $f`), if any;
+    /// lowering uses it to carry edge property columns through the expand.
+    pub edge_binding: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -56,9 +74,19 @@ impl ResolvedType {
     }
 }
 
+/// The exact graph namespace selected for a mutation target.
+///
+/// Node and edge declarations may share a name, so consumers must carry the
+/// resolved kind from type checking instead of re-deriving it from spelling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MutationTarget {
+    Node { type_name: String },
+    Edge { type_name: String },
+}
+
 #[derive(Debug, Clone)]
 pub struct MutationTypeContext {
-    pub target_types: Vec<String>,
+    pub targets: Vec<MutationTarget>,
 }
 
 #[derive(Debug, Clone)]
@@ -69,12 +97,11 @@ pub enum CheckedQuery {
 
 pub fn typecheck_query_decl(catalog: &Catalog, query: &QueryDecl) -> Result<CheckedQuery> {
     if !query.mutations.is_empty() {
-        let mut target_types = Vec::with_capacity(query.mutations.len());
+        let mut targets = Vec::with_capacity(query.mutations.len());
         for mutation in &query.mutations {
-            let target_type = typecheck_mutation(catalog, mutation, &query.params)?;
-            target_types.push(target_type);
+            targets.push(typecheck_mutation(catalog, mutation, &query.params)?);
         }
-        Ok(CheckedQuery::Mutation(MutationTypeContext { target_types }))
+        Ok(CheckedQuery::Mutation(MutationTypeContext { targets }))
     } else {
         Ok(CheckedQuery::Read(typecheck_read_query(catalog, query)?))
     }
@@ -148,6 +175,7 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<TypeCont
     // Typecheck return projections
     for proj in &query.return_clause {
         let resolved = resolve_expr_type(catalog, &proj.expr, &ctx, &params)?;
+        reject_blob_read_value(&resolved, &proj.expr)?;
         if let Some(alias) = &proj.alias {
             ctx.aliases.insert(alias.clone(), resolved);
             alias_exprs.insert(alias.clone(), &proj.expr);
@@ -156,7 +184,8 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<TypeCont
 
     // Typecheck order expressions
     for ord in &query.order_clause {
-        resolve_expr_type(catalog, &ord.expr, &ctx, &params)?;
+        let resolved = resolve_expr_type(catalog, &ord.expr, &ctx, &params)?;
+        reject_blob_read_value(&resolved, &ord.expr)?;
     }
 
     let has_standalone_nearest = query
@@ -215,7 +244,11 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<TypeCont
     Ok(ctx)
 }
 
-fn typecheck_mutation(catalog: &Catalog, mutation: &Mutation, params: &[Param]) -> Result<String> {
+fn typecheck_mutation(
+    catalog: &Catalog,
+    mutation: &Mutation,
+    params: &[Param],
+) -> Result<MutationTarget> {
     let param_types = parse_declared_param_types(params)?;
 
     match mutation {
@@ -276,7 +309,9 @@ fn typecheck_mutation(catalog: &Catalog, mutation: &Mutation, params: &[Param]) 
                         insert.type_name, prop_name
                     )));
                 }
-                return Ok(insert.type_name.clone());
+                return Ok(MutationTarget::Node {
+                    type_name: insert.type_name.clone(),
+                });
             }
 
             if let Some(edge_type) = catalog.edge_types.get(&insert.type_name) {
@@ -347,7 +382,9 @@ fn typecheck_mutation(catalog: &Catalog, mutation: &Mutation, params: &[Param]) 
                         )));
                     }
                 }
-                return Ok(insert.type_name.clone());
+                return Ok(MutationTarget::Edge {
+                    type_name: insert.type_name.clone(),
+                });
             }
 
             Err(CompilerError::Type(format!(
@@ -402,7 +439,9 @@ fn typecheck_mutation(catalog: &Catalog, mutation: &Mutation, params: &[Param]) 
                 node_type,
                 &param_types,
             )?;
-            Ok(update.type_name.clone())
+            Ok(MutationTarget::Node {
+                type_name: update.type_name.clone(),
+            })
         }
         Mutation::Delete(delete) => {
             if let Some(node_type) = catalog.node_types.get(&delete.type_name) {
@@ -412,7 +451,9 @@ fn typecheck_mutation(catalog: &Catalog, mutation: &Mutation, params: &[Param]) 
                     node_type,
                     &param_types,
                 )?;
-                Ok(delete.type_name.clone())
+                Ok(MutationTarget::Node {
+                    type_name: delete.type_name.clone(),
+                })
             } else if let Some(edge_type) = catalog.edge_types.get(&delete.type_name) {
                 typecheck_edge_mutation_predicate(
                     &delete.type_name,
@@ -420,7 +461,9 @@ fn typecheck_mutation(catalog: &Catalog, mutation: &Mutation, params: &[Param]) 
                     edge_type,
                     &param_types,
                 )?;
-                Ok(delete.type_name.clone())
+                Ok(MutationTarget::Edge {
+                    type_name: delete.type_name.clone(),
+                })
             } else {
                 Err(CompilerError::Type(format!(
                     "T10: unknown node/edge type `{}`",
@@ -498,6 +541,12 @@ fn typecheck_edge_mutation_predicate(
                 type_name, predicate.property
             ))
         })?;
+    if matches!(prop_type.scalar, ScalarType::Blob) {
+        return Err(CompilerError::Type(format!(
+            "T11: blob property `{}` cannot be used in WHERE predicates",
+            predicate.property
+        )));
+    }
     check_match_value_type(
         &predicate.value,
         param_types,
@@ -576,22 +625,19 @@ fn typecheck_clauses(
                 let mut has_outer = false;
                 for clause in inner {
                     match clause {
-                        Clause::Traversal(t) => {
-                            if outer_vars.contains(&t.src) || outer_vars.contains(&t.dst) {
-                                has_outer = true;
-                            }
+                        Clause::Traversal(t)
+                            if outer_vars.contains(&t.src) || outer_vars.contains(&t.dst) =>
+                        {
+                            has_outer = true;
                         }
-                        Clause::Filter(f) => {
+                        Clause::Filter(f)
                             if expr_references_any(&f.left, &outer_vars)
-                                || expr_references_any(&f.right, &outer_vars)
-                            {
-                                has_outer = true;
-                            }
+                                || expr_references_any(&f.right, &outer_vars) =>
+                        {
+                            has_outer = true;
                         }
-                        Clause::Binding(b) => {
-                            if outer_vars.contains(&b.variable) {
-                                has_outer = true;
-                            }
+                        Clause::Binding(b) if outer_vars.contains(&b.variable) => {
+                            has_outer = true;
                         }
                         _ => {}
                     }
@@ -654,22 +700,32 @@ fn typecheck_binding(
         }
     }
 
-    // Don't overwrite if already bound to same type (re-binding same var is OK)
-    if let Some(existing) = ctx.bindings.get(&binding.variable)
-        && existing.type_name != binding.type_name
-    {
-        return Err(CompilerError::Type(format!(
-            "variable `${}` already bound to type `{}`, cannot rebind to `{}`",
-            binding.variable, existing.type_name, binding.type_name
-        )));
+    // Don't overwrite if already bound to the same node type (re-binding the
+    // same node var is OK). Node and edge namespaces are independent, so a
+    // matching type name does not make a cross-kind rebind valid.
+    if let Some(existing) = ctx.bindings.get(&binding.variable) {
+        match existing {
+            BoundVariable::Edge { type_name } => {
+                return Err(CompilerError::Type(format!(
+                    "T23: variable `${}` is bound to edge type `{}` and cannot be rebound as node type `{}`",
+                    binding.variable, type_name, binding.type_name
+                )));
+            }
+            BoundVariable::Node { type_name } => {
+                if *type_name != binding.type_name {
+                    return Err(CompilerError::Type(format!(
+                        "variable `${}` already bound to type `{}`, cannot rebind to `{}`",
+                        binding.variable, type_name, binding.type_name
+                    )));
+                }
+            }
+        }
     }
 
     ctx.bindings.insert(
         binding.variable.clone(),
-        BoundVariable {
-            var_name: binding.variable.clone(),
+        BoundVariable::Node {
             type_name: binding.type_name.clone(),
-            kind: BindingKind::Node,
         },
     );
 
@@ -778,6 +834,41 @@ fn typecheck_traversal(
         )));
     }
 
+    // T23: a {min,max} traversal matches a path of edges; there is no single
+    // row for a binding to name.
+    let edge_binding = traversal
+        .edge_binding
+        .as_deref()
+        .filter(|binding| *binding != "_")
+        .map(str::to_string);
+    if traversal.edge_binding.is_some()
+        && (traversal.min_hops != 1 || traversal.max_hops != Some(1))
+    {
+        return Err(CompilerError::Type(format!(
+            "T23: edge binding `${}` cannot be combined with traversal bounds; a multi-hop traversal matches a path of edges, not one edge row",
+            traversal.edge_binding.as_deref().unwrap_or("_")
+        )));
+    }
+    if let Some(binding) = &edge_binding {
+        if binding == &traversal.src || binding == &traversal.dst {
+            return Err(CompilerError::Type(format!(
+                "T23: edge binding `${binding}` cannot reuse a traversal endpoint name; edge bindings and node endpoints need distinct names"
+            )));
+        }
+        if ctx.bindings.contains_key(binding) {
+            return Err(CompilerError::Type(format!(
+                "T23: variable `${}` is already bound; an edge binding needs a fresh name",
+                binding
+            )));
+        }
+        ctx.bindings.insert(
+            binding.clone(),
+            BoundVariable::Edge {
+                type_name: edge.name.clone(),
+            },
+        );
+    }
+
     // Determine direction based on bound variables and edge endpoints
     let src_bound = ctx.bindings.get(&traversal.src);
     let dst_bound = ctx.bindings.get(&traversal.dst);
@@ -785,33 +876,35 @@ fn typecheck_traversal(
     let mut direction;
 
     if let Some(src_bv) = src_bound {
+        let src_type = src_bv.require_traversal_endpoint(&traversal.src)?;
         // T5: src type must match one endpoint of the edge
-        if src_bv.type_name == edge.from_type {
+        if src_type == edge.from_type {
             direction = Direction::Out;
             // dst should be edge.to_type
             bind_traversal_endpoint(ctx, &traversal.dst, &edge.to_type, edge)?;
-        } else if src_bv.type_name == edge.to_type {
+        } else if src_type == edge.to_type {
             direction = Direction::In;
             // dst should be edge.from_type
             bind_traversal_endpoint(ctx, &traversal.dst, &edge.from_type, edge)?;
         } else {
             return Err(CompilerError::Type(format!(
                 "T5: variable `${}` has type `{}`, which is not an endpoint of edge `{}: {} -> {}`",
-                traversal.src, src_bv.type_name, edge.name, edge.from_type, edge.to_type
+                traversal.src, src_type, edge.name, edge.from_type, edge.to_type
             )));
         }
     } else if let Some(dst_bv) = dst_bound {
+        let dst_type = dst_bv.require_traversal_endpoint(&traversal.dst)?;
         // dst is bound, infer direction from it
-        if dst_bv.type_name == edge.to_type {
+        if dst_type == edge.to_type {
             direction = Direction::Out;
             bind_traversal_endpoint(ctx, &traversal.src, &edge.from_type, edge)?;
-        } else if dst_bv.type_name == edge.from_type {
+        } else if dst_type == edge.from_type {
             direction = Direction::In;
             bind_traversal_endpoint(ctx, &traversal.src, &edge.to_type, edge)?;
         } else {
             return Err(CompilerError::Type(format!(
                 "T5: variable `${}` has type `{}`, which is not an endpoint of edge `{}: {} -> {}`",
-                traversal.dst, dst_bv.type_name, edge.name, edge.from_type, edge.to_type
+                traversal.dst, dst_type, edge.name, edge.from_type, edge.to_type
             )));
         }
     } else {
@@ -834,6 +927,7 @@ fn typecheck_traversal(
         direction,
         min_hops: traversal.min_hops,
         max_hops: traversal.max_hops,
+        edge_binding,
     });
 
     Ok(())
@@ -849,19 +943,18 @@ fn bind_traversal_endpoint(
         return Ok(()); // anonymous variable
     }
     if let Some(existing) = ctx.bindings.get(var) {
-        if existing.type_name != expected_type {
+        let existing_type = existing.require_traversal_endpoint(var)?;
+        if existing_type != expected_type {
             return Err(CompilerError::Type(format!(
                 "T5: variable `${}` has type `{}` but edge `{}` expects `{}`",
-                var, existing.type_name, edge.name, expected_type
+                var, existing_type, edge.name, expected_type
             )));
         }
     } else {
         ctx.bindings.insert(
             var.to_string(),
-            BoundVariable {
-                var_name: var.to_string(),
+            BoundVariable::Node {
                 type_name: expected_type.to_string(),
-                kind: BindingKind::Node,
             },
         );
     }
@@ -878,10 +971,32 @@ fn typecheck_filter(
     let right_type = resolve_expr_type(catalog, &filter.right, ctx, params)?;
 
     if let (ResolvedType::Scalar(l), ResolvedType::Scalar(r)) = (&left_type, &right_type) {
+        // Blob values never participate in `.gq` filters. Keep this ahead of
+        // every operator-specific early return so public-AST callers cannot
+        // bypass containment with a list-membership shape such as
+        // `[Blob] contains Blob`.
+        if matches!(l.scalar, ScalarType::Blob) || matches!(r.scalar, ScalarType::Blob) {
+            return Err(CompilerError::Type(
+                "T7: blob comparisons in filters are not supported".to_string(),
+            ));
+        }
+
         if filter.op == CompOp::Contains {
+            // Overloaded on the left operand: list → membership, scalar
+            // String → exact substring. Lowering resolves the String form to
+            // `StringContains` so execution never re-derives the dispatch.
+            if !l.list && matches!(l.scalar, ScalarType::String) {
+                if r.list || !matches!(r.scalar, ScalarType::String) {
+                    return Err(CompilerError::Type(format!(
+                        "T7: string contains requires a String right operand, got {}",
+                        r.display_name()
+                    )));
+                }
+                return Ok(());
+            }
             if !l.list {
                 return Err(CompilerError::Type(format!(
-                    "T7: contains requires a list property on the left, got {}",
+                    "T7: contains requires a list property (membership) or a String property (substring) on the left, got {}",
                     l.display_name()
                 )));
             }
@@ -909,6 +1024,28 @@ fn typecheck_filter(
             return Ok(());
         }
 
+        if matches!(filter.op, CompOp::StartsWith | CompOp::StringContains) {
+            // Exact, case-sensitive string predicates: scalar String on both
+            // sides. (`StringContains` only exists post-lowering, but the
+            // check is written over both ops so re-typechecking IR-shaped
+            // input stays consistent.)
+            if l.list || !matches!(l.scalar, ScalarType::String) {
+                return Err(CompilerError::Type(format!(
+                    "T7: {} requires a String property on the left, got {}",
+                    filter.op,
+                    l.display_name()
+                )));
+            }
+            if r.list || !matches!(r.scalar, ScalarType::String) {
+                return Err(CompilerError::Type(format!(
+                    "T7: {} requires a String right operand, got {}",
+                    filter.op,
+                    r.display_name()
+                )));
+            }
+            return Ok(());
+        }
+
         // T7: check type compatibility
         if l.list || r.list {
             return Err(CompilerError::Type(
@@ -918,11 +1055,6 @@ fn typecheck_filter(
         if matches!(l.scalar, ScalarType::Vector(_)) || matches!(r.scalar, ScalarType::Vector(_)) {
             return Err(CompilerError::Type(
                 "T7: vector comparisons in filters are not supported".to_string(),
-            ));
-        }
-        if matches!(l.scalar, ScalarType::Blob) || matches!(r.scalar, ScalarType::Blob) {
-            return Err(CompilerError::Type(
-                "T7: blob comparisons in filters are not supported".to_string(),
             ));
         }
         if !types_compatible(l, r) {
@@ -943,6 +1075,26 @@ fn typecheck_filter(
     Ok(())
 }
 
+/// Search/rank filters are hoisted onto the field variable's NodeScan; an
+/// edge binding has none, so accepting one here would silently drop the
+/// filter. Reject at typecheck instead.
+fn reject_edge_binding_search_field(ctx: &TypeContext, field: &Expr, func: &str) -> Result<()> {
+    if let Expr::PropAccess { variable, property } = field
+        && let Some(bv) = ctx.bindings.get(variable)
+    {
+        match bv {
+            BoundVariable::Node { .. } => {}
+            BoundVariable::Edge { .. } => {
+                return Err(CompilerError::Type(format!(
+                    "T23: {} cannot target edge property `${}.{}`; text/rank search runs on node columns — edge properties support comparison filters and projection",
+                    func, variable, property
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn resolve_expr_type(
     catalog: &Catalog,
     expr: &Expr,
@@ -960,16 +1112,43 @@ fn resolve_expr_type(
                 CompilerError::Type(format!("T6: variable `${}` is not bound", variable))
             })?;
 
-            let node_type = catalog.node_types.get(&bv.type_name).ok_or_else(|| {
-                CompilerError::Type(format!("T6: type `{}` not found in catalog", bv.type_name))
-            })?;
+            let prop = match bv {
+                BoundVariable::Node { type_name } => {
+                    let node_type = catalog.node_types.get(type_name).ok_or_else(|| {
+                        CompilerError::Type(format!(
+                            "T6: type `{}` not found in catalog",
+                            type_name
+                        ))
+                    })?;
+                    node_type.properties.get(property).ok_or_else(|| {
+                        CompilerError::Type(format!(
+                            "T6: type `{}` has no property `{}`",
+                            type_name, property
+                        ))
+                    })?
+                }
+                BoundVariable::Edge { type_name } => {
+                    let edge_type = catalog.lookup_edge_by_name(type_name).ok_or_else(|| {
+                        CompilerError::Type(format!(
+                            "T6: edge type `{}` not found in catalog",
+                            type_name
+                        ))
+                    })?;
+                    edge_type.properties.get(property).ok_or_else(|| {
+                        CompilerError::Type(format!(
+                            "T6: edge `{}` has no property `{}`",
+                            type_name, property
+                        ))
+                    })?
+                }
+            };
 
-            let prop = node_type.properties.get(property).ok_or_else(|| {
-                CompilerError::Type(format!(
-                    "T6: type `{}` has no property `{}`",
-                    bv.type_name, property
-                ))
-            })?;
+            if matches!(prop.scalar, ScalarType::Blob) {
+                return Err(CompilerError::Type(format!(
+                    "T24: Blob property `${}.{}` is not available as a .gq read value; Blob values require a dedicated API",
+                    variable, property
+                )));
+            }
 
             Ok(ResolvedType::Scalar(prop.clone()))
         }
@@ -978,22 +1157,31 @@ fn resolve_expr_type(
             property,
             query,
         } => {
-            let node_binding = ctx.bindings.get(variable).ok_or_else(|| {
-                CompilerError::Type(format!("T15: variable `${}` is not bound", variable))
+            let node_type_name = match ctx.bindings.get(variable) {
+                Some(BoundVariable::Node { type_name }) => type_name,
+                Some(BoundVariable::Edge { .. }) => {
+                    return Err(CompilerError::Type(format!(
+                        "T23: nearest cannot target edge binding `${}`; vector search runs on node columns",
+                        variable
+                    )));
+                }
+                None => {
+                    return Err(CompilerError::Type(format!(
+                        "T15: variable `${}` is not bound",
+                        variable
+                    )));
+                }
+            };
+            let node_type = catalog.node_types.get(node_type_name).ok_or_else(|| {
+                CompilerError::Type(format!(
+                    "T15: type `{}` not found in catalog",
+                    node_type_name
+                ))
             })?;
-            let node_type = catalog
-                .node_types
-                .get(&node_binding.type_name)
-                .ok_or_else(|| {
-                    CompilerError::Type(format!(
-                        "T15: type `{}` not found in catalog",
-                        node_binding.type_name
-                    ))
-                })?;
             let prop_type = node_type.properties.get(property).ok_or_else(|| {
                 CompilerError::Type(format!(
                     "T15: type `{}` has no property `{}`",
-                    node_binding.type_name, property
+                    node_type_name, property
                 ))
             })?;
             let vector_dim = match prop_type.scalar {
@@ -1001,7 +1189,7 @@ fn resolve_expr_type(
                 _ => {
                     return Err(CompilerError::Type(format!(
                         "T15: nearest requires a Vector property, got {}.{}: {}",
-                        node_binding.type_name,
+                        node_type_name,
                         property,
                         prop_type.display_name()
                     )));
@@ -1065,6 +1253,7 @@ fn resolve_expr_type(
             )))
         }
         Expr::Search { field, query } => {
+            reject_edge_binding_search_field(ctx, field, "search")?;
             let field_type = resolve_expr_type(catalog, field, ctx, params)?;
             match field_type {
                 ResolvedType::Scalar(s) if s.scalar == ScalarType::String && !s.list => {}
@@ -1107,6 +1296,7 @@ fn resolve_expr_type(
             query,
             max_edits,
         } => {
+            reject_edge_binding_search_field(ctx, field, "fuzzy")?;
             let field_type = resolve_expr_type(catalog, field, ctx, params)?;
             match field_type {
                 ResolvedType::Scalar(s) if s.scalar == ScalarType::String && !s.list => {}
@@ -1171,6 +1361,7 @@ fn resolve_expr_type(
             )))
         }
         Expr::MatchText { field, query } => {
+            reject_edge_binding_search_field(ctx, field, "match_text")?;
             let field_type = resolve_expr_type(catalog, field, ctx, params)?;
             match field_type {
                 ResolvedType::Scalar(s) if s.scalar == ScalarType::String && !s.list => {}
@@ -1209,6 +1400,7 @@ fn resolve_expr_type(
             )))
         }
         Expr::Bm25 { field, query } => {
+            reject_edge_binding_search_field(ctx, field, "bm25")?;
             let field_type = resolve_expr_type(catalog, field, ctx, params)?;
             match field_type {
                 ResolvedType::Scalar(s) if s.scalar == ScalarType::String && !s.list => {}
@@ -1326,7 +1518,13 @@ fn resolve_expr_type(
             if let Some(prop_type) = params.get(name) {
                 Ok(ResolvedType::Scalar(prop_type.clone()))
             } else if let Some(bv) = ctx.bindings.get(name) {
-                Ok(ResolvedType::Node(bv.type_name.clone()))
+                match bv {
+                    BoundVariable::Node { type_name } => Ok(ResolvedType::Node(type_name.clone())),
+                    BoundVariable::Edge { .. } => Err(CompilerError::Type(format!(
+                        "T23: edge binding `${}` cannot be used bare; access one of its properties (`${}.{{prop}}`)",
+                        name, name
+                    ))),
+                }
             } else {
                 Err(CompilerError::Type(format!(
                     "variable `${}` is not bound",
@@ -1337,6 +1535,7 @@ fn resolve_expr_type(
         Expr::Literal(lit) => Ok(ResolvedType::Scalar(literal_type(lit)?)),
         Expr::Aggregate { func, arg } => {
             let arg_type = resolve_expr_type(catalog, arg, ctx, params)?;
+            reject_blob_read_value(&arg_type, arg)?;
 
             // T8: sum/avg require numeric; min/max require numeric or string
             match func {
@@ -1379,6 +1578,26 @@ fn resolve_expr_type(
     }
 }
 
+fn reject_blob_read_value(resolved: &ResolvedType, expr: &Expr) -> Result<()> {
+    if matches!(
+        resolved,
+        ResolvedType::Scalar(PropType {
+            scalar: ScalarType::Blob,
+            ..
+        })
+    ) {
+        let subject = match expr {
+            Expr::Variable(name) => format!("Blob parameter `${name}`"),
+            Expr::AliasRef(name) => format!("Blob alias `{name}`"),
+            _ => "Blob expression".to_string(),
+        };
+        return Err(CompilerError::Type(format!(
+            "T24: {subject} is not available as a .gq read value; Blob values require a dedicated API"
+        )));
+    }
+    Ok(())
+}
+
 fn infer_projection_field(
     catalog: &Catalog,
     expr: &Expr,
@@ -1389,12 +1608,17 @@ fn infer_projection_field(
     let name = projection_name(expr, alias);
     match expr {
         Expr::Aggregate { func, arg } => {
+            // Keep result-schema inference fail-closed even when a caller has
+            // not first passed through `typecheck_read_query`. In particular,
+            // Count's output shape is fixed, but its argument may still be an
+            // unsupported Blob value.
+            let resolved_arg = resolve_expr_type(catalog, arg, ctx, params)?;
+            reject_blob_read_value(&resolved_arg, arg)?;
             let (data_type, nullable) = match func {
                 AggFunc::Count => (DataType::Int64, true),
                 AggFunc::Avg | AggFunc::Sum => (DataType::Float64, true),
                 AggFunc::Min | AggFunc::Max => {
-                    let resolved = resolve_expr_type(catalog, arg, ctx, params)?;
-                    let (data_type, _) = resolved_type_to_field_shape(catalog, &resolved)?;
+                    let (data_type, _) = resolved_type_to_field_shape(catalog, &resolved_arg)?;
                     (data_type, true)
                 }
             };
@@ -1402,6 +1626,7 @@ fn infer_projection_field(
         }
         _ => {
             let resolved = resolve_expr_type(catalog, expr, ctx, params)?;
+            reject_blob_read_value(&resolved, expr)?;
             let (data_type, nullable) = resolved_type_to_field_shape(catalog, &resolved)?;
             Ok(Field::new(name, data_type, nullable))
         }
@@ -1522,15 +1747,13 @@ fn check_literal_type(lit: &Literal, expected: &PropType, prop_name: &str) -> Re
     if expected.is_enum() {
         let allowed = expected.enum_values.as_ref().cloned().unwrap_or_default();
         match lit {
-            Literal::String(v) => {
-                if !allowed.contains(v) {
-                    return Err(CompilerError::Type(format!(
-                        "T3: property `{}` expects one of [{}], got '{}'",
-                        prop_name,
-                        allowed.join(", "),
-                        v
-                    )));
-                }
+            Literal::String(v) if !allowed.contains(v) => {
+                return Err(CompilerError::Type(format!(
+                    "T3: property `{}` expects one of [{}], got '{}'",
+                    prop_name,
+                    allowed.join(", "),
+                    v
+                )));
             }
             Literal::List(items) if expected.list => {
                 for item in items {

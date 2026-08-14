@@ -1,8 +1,12 @@
 mod helpers;
 
+use lance::Dataset;
+use lance::dataset::cleanup::{CleanupPolicy, cleanup_old_versions};
 use omnigraph::changes::{ChangeFilter, ChangeOp, EntityKind};
 use omnigraph::db::commit_graph::CommitGraph;
 use omnigraph::db::{MergeOutcome, Omnigraph, ReadTarget};
+use omnigraph::error::OmniError;
+use omnigraph::loader::LoadMode;
 
 use helpers::*;
 
@@ -41,6 +45,492 @@ fn change_tuples(change_set: &omnigraph::changes::ChangeSet) -> Vec<(String, Str
 // ─── Same-branch diff tests ────────────────────────────────────────────────
 
 #[tokio::test]
+async fn write_receipts_identify_exact_commits_and_mutation_noops() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+
+    let receipt = db
+        .mutate_with_receipt(
+            "main",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+        )
+        .await
+        .unwrap();
+    let commit = receipt
+        .commit
+        .expect("a row-changing mutation publishes once");
+    let stored = db.get_commit(&commit.graph_commit_id).await.unwrap();
+    assert_eq!(stored.graph_commit_id, commit.graph_commit_id);
+    assert_eq!(stored.manifest_version, commit.manifest_version);
+
+    let changes = db
+        .diff_commits(
+            commit.parent_commit_id.as_deref().unwrap(),
+            &commit.graph_commit_id,
+            &ChangeFilter::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(changes.to_version, commit.manifest_version);
+    assert_eq!(
+        change_tuples(&changes),
+        vec![("node:Person".into(), "Eve".into(), ChangeOp::Insert)]
+    );
+
+    let head_before_no_op = snapshot_id(&db, "main").await.unwrap();
+    let no_op = db
+        .mutate_with_receipt(
+            "main",
+            MUTATION_QUERIES,
+            "set_age",
+            &mixed_params(&[("$name", "Missing")], &[("$age", 22)]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(no_op.result.affected_nodes, 0);
+    assert!(no_op.commit.is_none());
+    assert_eq!(snapshot_id(&db, "main").await.unwrap(), head_before_no_op);
+
+    let load_receipt = db
+        .load_with_receipt(
+            "main",
+            r#"{"type":"Person","data":{"name":"LoadReceipt","age":40}}"#,
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+    assert_eq!(load_receipt.result.nodes_loaded.get("Person"), Some(&1));
+    let stored = db
+        .get_commit(&load_receipt.commit.graph_commit_id)
+        .await
+        .unwrap();
+    assert_eq!(stored.graph_commit_id, load_receipt.commit.graph_commit_id);
+    assert_eq!(
+        stored.manifest_version,
+        load_receipt.commit.manifest_version
+    );
+
+    // Empty Load has no table effect or recovery sidecar, but Load's public
+    // contract still publishes one lineage commit and returns that exact
+    // receipt rather than reconstructing it from a later branch-head read.
+    let head_before_empty_load = snapshot_id(&db, "main").await.unwrap();
+    let empty_load_receipt = db
+        .load_with_receipt("main", "", LoadMode::Merge)
+        .await
+        .unwrap();
+    assert!(empty_load_receipt.result.nodes_loaded.is_empty());
+    assert!(empty_load_receipt.result.edges_loaded.is_empty());
+    assert_eq!(
+        empty_load_receipt.commit.parent_commit_id.as_deref(),
+        Some(head_before_empty_load.as_str())
+    );
+    assert_eq!(
+        snapshot_id(&db, "main").await.unwrap().as_str(),
+        empty_load_receipt.commit.graph_commit_id.as_str()
+    );
+    let stored = db
+        .get_commit(&empty_load_receipt.commit.graph_commit_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        stored.graph_commit_id,
+        empty_load_receipt.commit.graph_commit_id
+    );
+}
+
+#[tokio::test]
+async fn commit_changes_are_exact_ordered_and_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+
+    let first = db
+        .list_commits(Some("main"))
+        .await
+        .unwrap()
+        .into_iter()
+        .last()
+        .unwrap();
+    let first_page = db
+        .commit_changes_page(
+            &first.graph_commit_id,
+            None,
+            100,
+            omnigraph::changes::COMMIT_CHANGES_DEFAULT_BYTES,
+        )
+        .await
+        .unwrap();
+    assert!(first_page.commit_complete);
+    assert!(first_page.changes.is_empty());
+
+    let inserted = db
+        .load_with_receipt(
+            "main",
+            "{\"type\":\"Person\",\"data\":{\"name\":\"feed-C\",\"age\":3}}\n{\"type\":\"Person\",\"data\":{\"name\":\"feed-A\",\"age\":1}}\n{\"type\":\"Person\",\"data\":{\"name\":\"feed-B\",\"age\":2}}",
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+    let first_page = db
+        .commit_changes_page(
+            &inserted.commit.graph_commit_id,
+            None,
+            2,
+            omnigraph::changes::COMMIT_CHANGES_DEFAULT_BYTES,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        first_page
+            .changes
+            .iter()
+            .map(|change| (change.change_index, change.id.as_str(), change.op))
+            .collect::<Vec<_>>(),
+        vec![
+            (0, "feed-A", ChangeOp::Insert),
+            (1, "feed-B", ChangeOp::Insert)
+        ]
+    );
+    assert!(!first_page.commit_complete);
+    let second_page = db
+        .commit_changes_page(
+            &inserted.commit.graph_commit_id,
+            first_page.next_cursor.as_deref(),
+            2,
+            omnigraph::changes::COMMIT_CHANGES_DEFAULT_BYTES,
+        )
+        .await
+        .unwrap();
+    assert_eq!(second_page.changes[0].change_index, 2);
+    assert_eq!(second_page.changes[0].id, "feed-C");
+    assert_eq!(second_page.changes[0].before, None);
+    assert_eq!(second_page.changes[0].after.as_ref().unwrap()["age"], 3);
+    assert!(second_page.commit_complete);
+    assert!(second_page.next_cursor.is_none());
+
+    let updated = db
+        .mutate_with_receipt(
+            "main",
+            MUTATION_QUERIES,
+            "set_age",
+            &mixed_params(&[("$name", "Bob")], &[("$age", 99)]),
+        )
+        .await
+        .unwrap()
+        .commit
+        .unwrap();
+    let update_page = db
+        .commit_changes_page(
+            &updated.graph_commit_id,
+            None,
+            10,
+            omnigraph::changes::COMMIT_CHANGES_DEFAULT_BYTES,
+        )
+        .await
+        .unwrap();
+    assert_eq!(update_page.changes.len(), 1);
+    assert_eq!(update_page.changes[0].op, ChangeOp::Update);
+    assert!(update_page.changes[0].before.is_none());
+    assert_eq!(update_page.changes[0].after.as_ref().unwrap()["age"], 99);
+
+    let deleted = db
+        .mutate_with_receipt(
+            "main",
+            MUTATION_QUERIES,
+            "remove_person",
+            &params(&[("$name", "Alice")]),
+        )
+        .await
+        .unwrap()
+        .commit
+        .unwrap();
+    let delete_page = db
+        .commit_changes_page(
+            &deleted.graph_commit_id,
+            None,
+            10,
+            omnigraph::changes::COMMIT_CHANGES_DEFAULT_BYTES,
+        )
+        .await
+        .unwrap();
+    assert!(
+        delete_page
+            .changes
+            .iter()
+            .all(|change| change.op == ChangeOp::Delete)
+    );
+    assert!(
+        delete_page
+            .changes
+            .iter()
+            .all(|change| change.before.is_some())
+    );
+    assert!(
+        delete_page
+            .changes
+            .iter()
+            .all(|change| change.after.is_none())
+    );
+    assert!(
+        delete_page
+            .changes
+            .iter()
+            .any(|change| change.kind == EntityKind::Edge)
+    );
+    assert_eq!(
+        delete_page
+            .changes
+            .iter()
+            .map(|change| change.change_index)
+            .collect::<Vec<_>>(),
+        (0..delete_page.changes.len()).collect::<Vec<_>>()
+    );
+
+    let mut cursor = None;
+    let mut paged = Vec::new();
+    loop {
+        let page = db
+            .commit_changes_page(
+                &deleted.graph_commit_id,
+                cursor.as_deref(),
+                1,
+                omnigraph::changes::COMMIT_CHANGES_DEFAULT_BYTES,
+            )
+            .await
+            .unwrap();
+        paged.extend(
+            page.changes
+                .iter()
+                .map(|change| (change.table_key.clone(), change.id.clone())),
+        );
+        if page.commit_complete {
+            break;
+        }
+        cursor = page.next_cursor;
+    }
+    assert_eq!(
+        paged,
+        delete_page
+            .changes
+            .iter()
+            .map(|change| (change.table_key.clone(), change.id.clone()))
+            .collect::<Vec<_>>()
+    );
+
+    let empty = db
+        .load_with_receipt("main", "", LoadMode::Merge)
+        .await
+        .unwrap();
+    let empty_page = db
+        .commit_changes_page(
+            &empty.commit.graph_commit_id,
+            None,
+            10,
+            omnigraph::changes::COMMIT_CHANGES_DEFAULT_BYTES,
+        )
+        .await
+        .unwrap();
+    assert!(empty_page.commit_complete);
+    assert!(empty_page.changes.is_empty());
+
+    let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let person_path = &snapshot.entry("node:Person").unwrap().table_path;
+    let person_uri = format!(
+        "{}/{}",
+        db.uri().trim_end_matches('/'),
+        person_path.trim_start_matches('/')
+    );
+    let person = Dataset::open(&person_uri).await.unwrap();
+    let removed = cleanup_old_versions(
+        &person,
+        CleanupPolicy {
+            before_version: Some(person.version().version),
+            delete_unverified: true,
+            error_if_tagged_old_versions: false,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        removed.old_versions > 0,
+        "precondition: history was reclaimed"
+    );
+    let gap = db
+        .commit_changes_page(
+            &inserted.commit.graph_commit_id,
+            None,
+            10,
+            omnigraph::changes::COMMIT_CHANGES_DEFAULT_BYTES,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            &gap,
+            OmniError::ChangeFeedGap {
+                first_unreadable_commit_id,
+                ..
+            } if first_unreadable_commit_id == &inserted.commit.graph_commit_id
+        ),
+        "unexpected retention-gap result: {gap:?}"
+    );
+}
+
+#[tokio::test]
+async fn commit_changes_use_the_commit_era_physical_schema() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(
+        uri,
+        r#"
+node Document {
+    title: String @key
+    payload: Blob?
+}
+"#,
+    )
+    .await
+    .unwrap();
+    let inserted = db
+        .load_with_receipt(
+            "main",
+            r#"{"type":"Document","data":{"title":"old","payload":"base64:T2xk"}}"#,
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+
+    db.apply_schema(
+        r#"
+node Article @rename_from("Document") {
+    title: String @key
+    summary: String?
+}
+"#,
+    )
+    .await
+    .unwrap();
+
+    let page = db
+        .commit_changes_page(
+            &inserted.commit.graph_commit_id,
+            None,
+            10,
+            omnigraph::changes::COMMIT_CHANGES_DEFAULT_BYTES,
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.changes.len(), 1);
+    assert_eq!(page.changes[0].table_key, "node:Document");
+    assert_eq!(
+        page.changes[0].after,
+        Some(serde_json::json!({
+            "id": "old",
+            "title": "old",
+            "payload": "base64:T2xk",
+        }))
+    );
+}
+
+#[tokio::test]
+async fn commit_changes_suppress_unchanged_blob_rows_and_physical_only_commits() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(
+        uri,
+        r#"
+node Document {
+    title: String @key
+    note: String?
+    payload: Blob?
+}
+"#,
+    )
+    .await
+    .unwrap();
+    db.load_with_receipt(
+        "main",
+        concat!(
+            r#"{"type":"Document","data":{"title":"a","note":"one","payload":"base64:QQ=="}}"#,
+            "\n",
+            r#"{"type":"Document","data":{"title":"b","note":"two","payload":"base64:Qg=="}}"#,
+        ),
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+
+    // A scalar-only update to one row: the sibling row's Blob descriptor is
+    // untouched, so the page holds exactly one change whose after-image still
+    // carries the stored payload, and the unchanged sibling never surfaces.
+    let updated = db
+        .load_with_receipt(
+            "main",
+            r#"{"type":"Document","data":{"title":"a","note":"revised","payload":"base64:QQ=="}}"#,
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap();
+    let page = db
+        .commit_changes_page(
+            &updated.commit.graph_commit_id,
+            None,
+            10,
+            omnigraph::changes::COMMIT_CHANGES_DEFAULT_BYTES,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        page.changes
+            .iter()
+            .map(|change| (change.id.as_str(), change.op))
+            .collect::<Vec<_>>(),
+        vec![("a", ChangeOp::Update)],
+        "an unchanged sibling row must not surface as a change"
+    );
+    assert_eq!(
+        page.changes[0].after,
+        Some(serde_json::json!({
+            "id": "a",
+            "title": "a",
+            "note": "revised",
+            "payload": "base64:QQ==",
+        }))
+    );
+
+    // Compaction rewrites the Blob table and moves every descriptor without
+    // touching logical rows. The moved descriptors force the payload
+    // tie-break, which must classify every row as unchanged: the maintenance
+    // commit is an empty block, not a phantom full-table update.
+    let stats = db.optimize().await.unwrap();
+    assert!(
+        stats
+            .iter()
+            .any(|table| table.fragments_removed > 0 && table.committed),
+        "the fixture must actually compact so descriptors move"
+    );
+    let optimize_commit = head_commit_id(uri, None).await;
+    assert_ne!(optimize_commit, updated.commit.graph_commit_id);
+    let physical_only = db
+        .commit_changes_page(
+            &optimize_commit,
+            None,
+            10,
+            omnigraph::changes::COMMIT_CHANGES_DEFAULT_BYTES,
+        )
+        .await
+        .unwrap();
+    assert!(
+        physical_only.changes.is_empty(),
+        "a physical-only commit is an empty block: {:?}",
+        physical_only.changes
+    );
+    assert!(physical_only.commit_complete);
+}
+
+#[tokio::test]
 async fn diff_empty_when_nothing_changed() {
     let dir = tempfile::tempdir().unwrap();
     let db = init_and_load(&dir).await;
@@ -57,6 +547,102 @@ async fn diff_empty_when_nothing_changed() {
     assert_eq!(cs.stats.inserts, 0);
     assert_eq!(cs.stats.updates, 0);
     assert_eq!(cs.stats.deletes, 0);
+}
+
+#[tokio::test]
+async fn diff_pairs_type_renames_by_identity_and_separates_reincarnations() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(
+        uri,
+        r#"
+node Person { name: String @key }
+node Anchor { name: String @key }
+"#,
+    )
+    .await
+    .unwrap();
+    db.load(
+        "main",
+        r#"{"type":"Person","data":{"name":"Alice"}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    let before_rename = snapshot_id(&db, "main").await.unwrap();
+
+    db.apply_schema(
+        r#"
+node Human @rename_from("Person") { name: String @key }
+node Anchor { name: String @key }
+"#,
+    )
+    .await
+    .unwrap();
+    let after_rename = snapshot_id(&db, "main").await.unwrap();
+
+    let rename_diff = db
+        .diff_between(
+            ReadTarget::Snapshot(before_rename),
+            ReadTarget::Snapshot(after_rename.clone()),
+            &ChangeFilter::default(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        rename_diff.changes.is_empty(),
+        "a pure alias change on one table identity must not become delete+insert: {:?}",
+        change_tuples(&rename_diff)
+    );
+
+    // Drop the renamed type, then independently declare the same public name.
+    // The replacement is a new logical lifetime even though the alias matches.
+    db.apply_schema("node Anchor { name: String @key }")
+        .await
+        .unwrap();
+    db.apply_schema(
+        r#"
+node Human { name: String @key }
+node Anchor { name: String @key }
+"#,
+    )
+    .await
+    .unwrap();
+    db.load(
+        "main",
+        r#"{"type":"Human","data":{"name":"Bob"}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+
+    let reincarnation_diff = diff_since_branch(&db, "main", after_rename, &ChangeFilter::default())
+        .await
+        .unwrap();
+    let reincarnation_changes = reincarnation_diff
+        .changes
+        .iter()
+        .map(|change| (change.table_key.clone(), change.id.clone(), change.op))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reincarnation_changes,
+        vec![
+            (
+                "node:Human".to_string(),
+                "Alice".to_string(),
+                ChangeOp::Delete,
+            ),
+            (
+                "node:Human".to_string(),
+                "Bob".to_string(),
+                ChangeOp::Insert,
+            ),
+        ],
+        "drop/re-add under one alias must visit the old identity before the newly allocated identity"
+    );
+    assert_eq!(reincarnation_diff.stats.deletes, 1);
+    assert_eq!(reincarnation_diff.stats.inserts, 1);
+    assert_eq!(reincarnation_diff.stats.updates, 0);
 }
 
 #[tokio::test]
@@ -150,6 +736,15 @@ async fn diff_detects_node_delete_with_cascade() {
     let cs = diff_since_branch(&db, "main", v_before, &ChangeFilter::default())
         .await
         .unwrap();
+    let table_keys = cs
+        .changes
+        .iter()
+        .map(|change| change.table_key.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        table_keys.windows(2).all(|pair| pair[0] <= pair[1]),
+        "multi-table changes must follow graph-visible table-key order: {table_keys:?}"
+    );
 
     // Should have node:Person delete
     let person_deletes: Vec<_> = cs
@@ -388,7 +983,7 @@ async fn diff_after_merge_reports_actual_changes() {
 
     // Bob's update should be detected
     assert!(
-        !person_updates.is_empty() || person_inserts.len() > 0,
+        !person_updates.is_empty() || !person_inserts.is_empty(),
         "Should detect Bob's age update or Eve's insert"
     );
 }
@@ -397,7 +992,7 @@ async fn diff_after_merge_reports_actual_changes() {
 async fn diff_commits_resolves_feature_commit_from_main_handle() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_and_load(&dir).await;
+    let main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
 
     let mut feature = Omnigraph::open(uri).await.unwrap();
@@ -444,7 +1039,7 @@ async fn diff_commits_resolves_feature_commit_from_main_handle() {
 async fn cross_branch_diff_honors_insert_only_filter() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_and_load(&dir).await;
+    let main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
 
     let mut feature = Omnigraph::open(uri).await.unwrap();
@@ -495,7 +1090,7 @@ async fn cross_branch_diff_honors_insert_only_filter() {
 async fn diff_commits_resolves_commits_across_branches_from_any_handle() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_and_load(&dir).await;
+    let main = init_and_load(&dir).await;
     let base_commit = head_commit_id(uri, None).await;
 
     main.branch_create("feature").await.unwrap();
@@ -530,7 +1125,7 @@ async fn diff_commits_resolves_commits_across_branches_from_any_handle() {
 async fn cross_lineage_diff_honors_delete_only_filter() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_and_load(&dir).await;
+    let main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
     let mut feature = Omnigraph::open(uri).await.unwrap();
     let before = snapshot_id(&feature, "feature").await.unwrap();
@@ -578,7 +1173,7 @@ async fn cross_lineage_diff_honors_delete_only_filter() {
 async fn same_branch_diff_across_first_lazy_fork_detects_update() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_and_load(&dir).await;
+    let main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
     let mut feature = Omnigraph::open(uri).await.unwrap();
     let before = snapshot_id(&feature, "feature").await.unwrap();
@@ -605,7 +1200,7 @@ async fn same_branch_diff_across_first_lazy_fork_detects_update() {
 async fn diff_commits_cross_branch_reports_property_only_updates() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main = init_and_load(&dir).await;
+    let main = init_and_load(&dir).await;
     let base_commit = head_commit_id(uri, None).await;
 
     main.branch_create("feature").await.unwrap();

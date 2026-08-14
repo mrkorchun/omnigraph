@@ -12,6 +12,7 @@ use omnigraph::changes::{ChangeFilter, ChangeSet};
 use omnigraph::db::{Omnigraph, ReadTarget, Snapshot, SnapshotId};
 use omnigraph::error::Result;
 use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::{BLOB_READ_RANGE_MAX_BYTES, BlobCell, BlobContent, EntityKind};
 use omnigraph_compiler::ir::ParamMap;
 use omnigraph_compiler::query::ast::Literal;
 use omnigraph_compiler::result::{MutationResult, QueryResult};
@@ -47,6 +48,56 @@ query insert_person_and_friend($name: String, $age: I32, $friend: String) {
 }
 "#;
 
+/// Build the graph-level selector used by the dedicated Blob read facade.
+pub fn node_blob_cell(
+    type_name: impl Into<String>,
+    id: impl Into<String>,
+    property: impl Into<String>,
+) -> BlobCell {
+    BlobCell {
+        entity: EntityKind::Node,
+        type_name: type_name.into(),
+        id: id.into(),
+        property: property.into(),
+    }
+}
+
+/// Collect a managed Blob through the public bounded-range reader.
+///
+/// Integration tests use this only for small fixtures, but keeping every read
+/// below the facade's per-call ceiling ensures callers do not accidentally
+/// reintroduce the removed Lance `BlobFile::read()` escape hatch.
+pub async fn read_managed_blob_bytes(
+    db: &Omnigraph,
+    target: impl Into<ReadTarget>,
+    cell: BlobCell,
+) -> Vec<u8> {
+    let read = db
+        .read_blob_at(target.into(), cell)
+        .await
+        .expect("read managed Blob");
+    let BlobContent::Managed { reader, .. } = read.content else {
+        panic!("expected managed Blob content, got external reference");
+    };
+
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(reader.len()).expect("test Blob length must fit in memory"),
+    );
+    let mut start = 0_u64;
+    while start < reader.len() {
+        let end = start
+            .saturating_add(BLOB_READ_RANGE_MAX_BYTES)
+            .min(reader.len());
+        let chunk = reader
+            .read_range(start..end)
+            .await
+            .expect("read managed Blob range");
+        bytes.extend_from_slice(&chunk);
+        start = end;
+    }
+    bytes
+}
+
 /// A standalone Lance `Session` for tests that construct a `TableStore`
 /// directly (production stores share the graph's per-connection session;
 /// tests get a fresh one — the cache scope is the test).
@@ -54,27 +105,34 @@ pub fn test_session() -> std::sync::Arc<lance::session::Session> {
     std::sync::Arc::new(lance::session::Session::default())
 }
 
+/// Open the latest physical Lance head, optionally at a native branch.
+///
+/// Recovery/failpoint tests use this only to forge or inspect physical state
+/// that intentionally bypasses OmniGraph's manifest. Keeping the raw opener in
+/// test support avoids exposing the engine's crate-private `TableStore`.
+pub async fn open_dataset_head(uri: &str, branch: Option<&str>) -> lance::Dataset {
+    let ds = lance::dataset::builder::DatasetBuilder::from_uri(uri)
+        .with_session(test_session())
+        .load()
+        .await
+        .unwrap();
+    match branch {
+        Some(branch) if branch != "main" => ds.checkout_branch(branch).await.unwrap(),
+        _ => ds,
+    }
+}
+
 /// Init a graph and load the standard test data.
 pub async fn init_and_load(dir: &tempfile::TempDir) -> Omnigraph {
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-    load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite)
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    load_jsonl(&db, TEST_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
+    // Mutation/load publish only exact data effects; physical indexes are
+    // reconciled separately as derived state.
+    db.ensure_indices().await.unwrap();
     db
-}
-
-/// On-disk Lance dataset URI for a node type, mirroring the engine's
-/// `nodes/{fnv1a(type)}` layout. Used by tests that reach the raw Lance
-/// dataset to forge or inspect branch state. (Local copies exist in
-/// `failpoints.rs` / `maintenance.rs`; this is the shared one for new tests.)
-pub fn node_table_uri(root: &str, type_name: &str) -> String {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in type_name.as_bytes() {
-        hash ^= b as u64;
-        hash = hash.wrapping_mul(0x100_0000_01b3);
-    }
-    format!("{}/nodes/{hash:016x}", root.trim_end_matches('/'))
 }
 
 /// Read all rows from a sub-table by table_key.
@@ -88,6 +146,44 @@ pub async fn read_table(db: &Omnigraph, table_key: &str) -> Vec<RecordBatch> {
         .try_collect()
         .await
         .unwrap()
+}
+
+/// Assert that physical user fields carry the accepted graph property
+/// lifetime, while Lance plumbing fields do not impersonate graph identity.
+pub async fn assert_stable_property_markers(db: &Omnigraph, table_key: &str) {
+    let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let dataset = snapshot.open(table_key).await.unwrap();
+    let (entity_kind, type_name) = table_key.split_once(':').unwrap();
+    for field in &dataset.schema().fields {
+        let marker = field.metadata.get("omnigraph.stable_property_id");
+        if matches!(field.name.as_str(), "id" | "src" | "dst") {
+            assert!(
+                marker.is_none(),
+                "physical field {table_key}.{} must not carry graph property identity",
+                field.name
+            );
+            continue;
+        }
+
+        let property_id = match entity_kind {
+            "node" => db.catalog().node_property_id(type_name, &field.name),
+            "edge" => db.catalog().edge_property_id(type_name, &field.name),
+            other => panic!("unexpected graph table kind {other}"),
+        }
+        .unwrap_or_else(|| {
+            panic!(
+                "missing graph property identity for {table_key}.{}",
+                field.name
+            )
+        });
+        let expected = property_id.get().to_string();
+        assert_eq!(
+            marker.map(String::as_str),
+            Some(expected.as_str()),
+            "physical user field {table_key}.{} must persist its authoritative graph property lifetime",
+            field.name
+        );
+    }
 }
 
 /// Read all rows from a branch-local sub-table by table_key.
@@ -211,15 +307,18 @@ pub async fn commit_many(db: &mut Omnigraph, n: usize) {
     }
 }
 
-/// Like [`commit_many`] but every commit carries an actor, so it grows
-/// `_graph_commit_actors.lance` too — the authenticated (server/CLI) write path.
+/// Like [`commit_many`] but every commit carries an actor in its inline
+/// `__manifest` lineage row — the authenticated (server/CLI) write path.
 pub async fn commit_many_as(db: &mut Omnigraph, n: usize, actor: &str) {
     for i in 0..n {
         db.mutate_as(
             "main",
             MUTATION_QUERIES,
             "insert_person",
-            &mixed_params(&[("$name", &format!("commit_many_as_{i}"))], &[("$age", 30)]),
+            &mixed_params(
+                &[("$name", &format!("commit_many_as_{i}"))],
+                &[("$age", 30)],
+            ),
             Some(actor),
         )
         .await

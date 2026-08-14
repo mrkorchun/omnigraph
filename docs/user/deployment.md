@@ -138,8 +138,7 @@ shown; MinIO works the same way.
 ```bash
 docker run -d --name omnigraph-s3 -p 9000:9000 \
   -e RUSTFS_ACCESS_KEY=omnigraph -e RUSTFS_SECRET_KEY=omnigraph \
-  -e RUSTFS_ALLOW_INSECURE_DEFAULT_CREDENTIALS=true \
-  rustfs/rustfs:latest /data
+  rustfs/rustfs:1.0.0-beta.12 /data
 
 export AWS_ACCESS_KEY_ID=omnigraph AWS_SECRET_ACCESS_KEY=omnigraph \
   AWS_REGION=us-east-1 AWS_ENDPOINT_URL_S3=http://127.0.0.1:9000 \
@@ -172,7 +171,15 @@ endpoint and credentials. CI exercises this path against containerized RustFS.
 
 ## Container Deployment
 
-Build the image:
+Pull the prebuilt public image (published for every `v*` release by
+`publish-image.yml`; built with the `aws` feature, linux/amd64):
+
+```bash
+docker pull modernrelay/omnigraph-server:v0.9.0          # Docker Hub
+# or: docker pull ghcr.io/modernrelay/omnigraph-server:v0.9.0
+```
+
+Or build it yourself:
 
 ```bash
 docker build -t omnigraph-server:local .
@@ -266,9 +273,8 @@ Manager secret whose `SecretString` is a JSON object of
 `{"actor_id": "token", ...}`:
 
 ```bash
-omnigraph-server-aws s3://my-bucket/graphs/example ...
-  # Environment:
-  # OMNIGRAPH_SERVER_BEARER_TOKENS_AWS_SECRET=arn:aws:secretsmanager:us-east-1:123456789012:secret:omnigraph-tokens-AbCdEf
+OMNIGRAPH_SERVER_BEARER_TOKENS_AWS_SECRET=arn:aws:secretsmanager:us-east-1:123456789012:secret:omnigraph-tokens-AbCdEf \
+  omnigraph-server --cluster s3://my-bucket/cluster --bind 0.0.0.0:8080
 ```
 
 Credentials are resolved via the AWS default chain (env vars, shared config,

@@ -2,8 +2,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::error::{OmniError, Result};
+use datafusion::logical_expr::Expr;
 use lance::Dataset;
+use lance::dataset::scanner::{DatasetRecordBatchStream, Scanner};
+use lance::datatypes::{BlobHandling, Schema as LanceSchema};
+use lance::index::DatasetIndexExt;
 use lance_namespace::models::CreateTableVersionRequest;
+use lance_table::format::IndexMetadata;
 use omnigraph_compiler::catalog::Catalog;
 
 #[path = "manifest/graph.rs"]
@@ -27,26 +32,39 @@ mod recovery;
 #[path = "manifest/state.rs"]
 mod state;
 
-use graph::{init_manifest_graph, open_manifest_graph, snapshot_state_at};
-use layout::{open_manifest_dataset, table_uri_for_path, type_name_hash};
+use graph::{
+    init_manifest_graph, open_manifest_graph, open_manifest_graph_with_lineage, snapshot_state_at,
+};
 pub(crate) use layout::manifest_uri;
+#[cfg(test)]
+use layout::open_manifest_dataset;
+use layout::{open_manifest_dataset_with_session, table_uri_for_path};
 pub(crate) use metadata::TableVersionMetadata;
 #[cfg(test)]
 use metadata::{OMNIGRAPH_ROW_COUNT_KEY, table_version_metadata_for_state};
 #[cfg(test)]
 use namespace::{branch_manifest_namespace, staged_table_namespace};
-pub(crate) use publisher::LineageIntent;
+pub(crate) use publisher::{GraphHeadExpectation, LineageIntent, PublishPrecondition};
 use publisher::{GraphNamespacePublisher, ManifestBatchPublisher, PublishOutcome};
+#[cfg(test)]
+pub(crate) use recovery::MAX_EFFECT_IDENTITY_SCAN_VERSIONS;
 pub(crate) use recovery::{
-    RecoveryMode, RecoverySidecar, RecoverySidecarHandle, SidecarKind, SidecarTablePin,
-    SidecarTableRegistration, SidecarTombstone, confirm_sidecar_phase_b, delete_sidecar,
-    has_schema_apply_sidecar, heal_pending_sidecars_roll_forward, list_sidecars, new_sidecar,
-    recover_manifest_drift, schema_apply_serial_queue_key, write_sidecar,
+    HealPendingOutcome, MAX_BRANCH_MERGE_DATA_TRANSACTIONS, RecoveryAuthorityToken,
+    RecoveryBranchMergeEffect, RecoveryBranchMergeEffectKind, RecoveryLineageIntent,
+    RecoveryManifestDelta, RecoveryMode, RecoverySchemaApplyEffect, RecoverySchemaApplyEffectKind,
+    RecoverySidecar, RecoverySidecarHandle, RecoveryTableUpdateSlot, SidecarKind, SidecarTablePin,
+    SidecarTableRegistration, SidecarTableRename, SidecarTombstone,
+    confirm_branch_merge_sidecar_v9, confirm_ensure_indices_sidecar_v9, confirm_occ_sidecar_v9,
+    confirm_schema_apply_sidecar_v9, delete_sidecar, ensure_read_only_schema_coherent,
+    finalize_effect_free_occ_sidecar, heal_pending_sidecars_roll_forward, list_sidecars,
+    new_branch_merge_sidecar_v9, new_ensure_indices_sidecar_v9, new_occ_sidecar_v9,
+    new_optimize_sidecar_v9, new_schema_apply_sidecar_v9, recover_manifest_drift,
+    schema_apply_serial_queue_key, write_sidecar,
 };
 pub use state::SubTableEntry;
-pub(crate) use state::{GraphLineageRow, read_graph_lineage};
 #[cfg(test)]
 use state::string_column;
+pub(crate) use state::{GraphLineageRow, read_graph_lineage};
 use state::{ManifestState, read_manifest_state};
 
 /// The internal-schema (storage-format) version this binary writes and reads.
@@ -66,7 +84,6 @@ const OBJECT_TYPE_GRAPH_COMMIT: &str = "graph_commit";
 /// Mutable per-branch head pointer for the graph lineage (RFC-013 Phase 7).
 /// `object_id` is `graph_head:<branch>` (`graph_head:main` for the main branch).
 const OBJECT_TYPE_GRAPH_HEAD: &str = "graph_head";
-const TABLE_VERSION_MANAGEMENT_KEY: &str = "table_version_management";
 
 /// Stable head-key segment for the main branch in `graph_head:<branch>` rows.
 /// `table_branch`/`manifest_branch` encode main as null, but `object_id` must be
@@ -87,10 +104,16 @@ pub(crate) struct CommitOutcome {
 }
 
 /// The on-disk internal-schema stamp of `__manifest` at `branch` (main when
-/// `None`). Used by the open-path refusal guard and to surface the storage
-/// version to operators (`omnigraph snapshot`).
-pub(crate) async fn internal_schema_stamp_at(root_uri: &str, branch: Option<&str>) -> Result<u32> {
-    let dataset = open_manifest_dataset(root_uri, branch).await?;
+/// `None`), or `None` when no parseable stamp exists (a torn init by an
+/// older binary, a genuine pre-stamp store, or corrupt metadata — see
+/// `migrations::guard_stamp`, which the open paths use instead). Surfaces
+/// the storage version to operators (`omnigraph snapshot`).
+pub(crate) async fn internal_schema_stamp_at(
+    root_uri: &str,
+    branch: Option<&str>,
+) -> Result<Option<u32>> {
+    let control_session = crate::lance_access::control_session();
+    let dataset = open_manifest_dataset_with_session(root_uri, branch, &control_session).await?;
     Ok(migrations::read_stamp(&dataset))
 }
 
@@ -110,8 +133,9 @@ pub(crate) async fn internal_schema_stamp_at(root_uri: &str, branch: Option<&str
 /// (writes are refused per-branch by the publisher; a newer binary advancing
 /// main is refused here). See the matching known gap in `docs/dev/invariants.md`.
 pub(crate) async fn refuse_if_internal_schema_unsupported(root_uri: &str) -> Result<()> {
-    let stamp = internal_schema_stamp_at(root_uri, None).await?;
-    migrations::refuse_if_stamp_unsupported(stamp)
+    let control_session = crate::lance_access::control_session();
+    let dataset = open_manifest_dataset_with_session(root_uri, None, &control_session).await?;
+    migrations::guard_stamp(&dataset).map(|_| ())
 }
 
 /// Immutable point-in-time view of the database.
@@ -123,6 +147,12 @@ pub struct Snapshot {
     root_uri: String,
     version: u64,
     entries: HashMap<String, SubTableEntry>,
+    /// Exact materialized `graph_head:<branch>` commit ids from this SAME
+    /// pinned manifest version (see `ManifestState::graph_heads`). Carried so
+    /// a read can report the commit id of the world it was served from —
+    /// resolving the head separately (e.g. via `CommitGraph`) could pair this
+    /// snapshot's tables with a different version's head.
+    graph_heads: HashMap<String, String>,
     /// Per-graph read caches (shared `Session` + held-handle cache), injected by
     /// `Omnigraph::resolved_target` for live Branch reads so table opens reuse
     /// handles (0 IO on a warm repeat) and one `Session`. `None` for write-prelude
@@ -131,11 +161,250 @@ pub struct Snapshot {
     read_caches: Option<Arc<crate::runtime_cache::ReadCaches>>,
 }
 
+/// Read-only view of one table pinned by a [`Snapshot`].
+///
+/// The underlying Lance [`Dataset`] is deliberately private: a snapshot table
+/// can scan rows and inspect read metadata, but it cannot reach Lance's
+/// mutating APIs or advance a table HEAD outside OmniGraph's coordinated write
+/// path.
+#[derive(Debug, Clone)]
+pub struct SnapshotTable {
+    dataset: Dataset,
+}
+
+/// Read-only scan builder for a [`SnapshotTable`].
+///
+/// This forwards scan configuration and execution, but not Lance's raw
+/// [`Scanner`] or physical-plan construction. A Lance physical scan plan
+/// exposes its embedded [`Dataset`], which would let SDK callers recover a
+/// writable handle and bypass graph publication.
+pub struct SnapshotScanner {
+    scanner: Scanner,
+}
+
+impl SnapshotScanner {
+    /// Select the output columns.
+    pub fn project<T: AsRef<str>>(&mut self, columns: &[T]) -> Result<&mut Self> {
+        self.scanner
+            .project(columns)
+            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        Ok(self)
+    }
+
+    /// Apply a SQL filter expression.
+    pub fn filter(&mut self, filter: &str) -> Result<&mut Self> {
+        self.scanner
+            .filter(filter)
+            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        Ok(self)
+    }
+
+    /// Apply a structured DataFusion filter expression.
+    pub fn filter_expr(&mut self, filter: Expr) -> &mut Self {
+        self.scanner.filter_expr(filter);
+        self
+    }
+
+    /// Set the requested number of rows returned in one scan batch.
+    ///
+    /// Lance's byte-based batch target overrides this setting unless
+    /// [`Self::strict_batch_size`] is also enabled.
+    pub fn batch_size(&mut self, batch_size: usize) -> &mut Self {
+        self.scanner.batch_size(batch_size);
+        self
+    }
+
+    /// Set the approximate in-memory byte target for one scan batch.
+    pub fn batch_size_bytes(&mut self, batch_size_bytes: u64) -> &mut Self {
+        self.scanner.batch_size_bytes(batch_size_bytes);
+        self
+    }
+
+    /// Require full output batches to contain exactly the requested row count.
+    ///
+    /// The final batch may contain fewer rows. This restores a hard output-row
+    /// ceiling when [`Self::batch_size_bytes`] is also configured.
+    pub fn strict_batch_size(&mut self, strict_batch_size: bool) -> &mut Self {
+        self.scanner.strict_batch_size(strict_batch_size);
+        self
+    }
+
+    /// Apply a row limit and offset.
+    pub fn limit(&mut self, limit: Option<i64>, offset: Option<i64>) -> Result<&mut Self> {
+        self.scanner
+            .limit(limit, offset)
+            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        Ok(self)
+    }
+
+    /// Include Lance's stable row-id column in the output.
+    pub fn with_row_id(&mut self) -> &mut Self {
+        self.scanner.with_row_id();
+        self
+    }
+
+    /// Choose how blob columns are represented in scan output.
+    pub fn blob_handling(&mut self, blob_handling: BlobHandling) -> &mut Self {
+        self.scanner.blob_handling(blob_handling);
+        self
+    }
+
+    /// Execute the configured read without exposing its physical plan.
+    pub async fn try_into_stream(&self) -> Result<DatasetRecordBatchStream> {
+        self.scanner
+            .try_into_stream()
+            .await
+            .map_err(|error| OmniError::Lance(error.to_string()))
+    }
+}
+
+impl SnapshotTable {
+    fn new(dataset: Dataset) -> Self {
+        Self { dataset }
+    }
+
+    /// Build a read-only scanner over this pinned table version.
+    pub fn scan(&self) -> SnapshotScanner {
+        SnapshotScanner {
+            scanner: self.dataset.scan(),
+        }
+    }
+
+    /// Count rows in this pinned table version, optionally with a filter.
+    pub async fn count_rows(&self, filter: Option<String>) -> Result<usize> {
+        self.dataset
+            .count_rows(filter)
+            .await
+            .map_err(|error| OmniError::Lance(error.to_string()))
+    }
+
+    /// Lance schema of this pinned table version.
+    pub fn schema(&self) -> &LanceSchema {
+        self.dataset.schema()
+    }
+
+    /// Lance manifest version of this pinned table.
+    pub fn version(&self) -> u64 {
+        self.dataset.version().version
+    }
+
+    /// Read-only physical index metadata for this pinned table version.
+    pub async fn load_indices(&self) -> Result<Arc<Vec<IndexMetadata>>> {
+        self.dataset
+            .load_indices()
+            .await
+            .map_err(|error| OmniError::Lance(error.to_string()))
+    }
+
+    /// Whether `column` has complete usable BTREE coverage.
+    pub async fn index_coverage(&self, column: &str) -> Result<crate::IndexCoverage> {
+        crate::table_store::TableStore::key_column_index_coverage(&self.dataset, column).await
+    }
+
+    /// Whether any user index leaves current fragments uncovered.
+    pub async fn has_unindexed_fragments(&self) -> Result<bool> {
+        crate::table_store::TableStore::has_unindexed_fragments(&self.dataset).await
+    }
+
+    /// Whether this table has a user BTREE index on `column`.
+    pub async fn has_btree_index(&self, column: &str) -> Result<bool> {
+        crate::table_store::TableStore::has_btree_index_on(&self.dataset, column).await
+    }
+
+    /// Whether this table has a user full-text index on `column`.
+    pub async fn has_fts_index(&self, column: &str) -> Result<bool> {
+        crate::table_store::TableStore::has_fts_index_on(&self.dataset, column).await
+    }
+
+    /// Whether this table has a user vector index on `column`.
+    pub async fn has_vector_index(&self, column: &str) -> Result<bool> {
+        crate::table_store::TableStore::has_vector_index_on(&self.dataset, column).await
+    }
+}
+
 impl Snapshot {
+    /// Exact `graph_head:<branch>` commit id from this snapshot's own pinned
+    /// manifest version (`None` = main). Absent on a branch with no commits.
+    ///
+    /// This exact row is write authority when present. A fresh named branch has
+    /// no materialized row yet; callers that need its effective inherited
+    /// lineage head must resolve it through `GraphCoordinator`.
+    pub fn graph_head(&self, branch: Option<&str>) -> Option<&str> {
+        let branch_key = branch.unwrap_or(MAIN_BRANCH_HEAD_KEY);
+        self.graph_heads.get(branch_key).map(String::as_str)
+    }
+
+    /// Bind the current accepted catalog's aliases onto a historical snapshot
+    /// by immutable table identity for query execution.
+    ///
+    /// Public historical snapshots retain their original aliases. This method
+    /// is used only on the operation-local copy behind `run_query_at` and an
+    /// explicit snapshot-target query, whose source is typechecked against the
+    /// current catalog. A pure type rename can therefore address the same old
+    /// table lifetime under its current name. Conversely, a reused name whose
+    /// current identity is absent from the historical snapshot is removed from
+    /// the execution view, preventing cross-incarnation adoption.
+    pub(crate) fn bind_catalog_aliases(&mut self, catalog: &Catalog) -> Result<()> {
+        // Freeze the historical identity map before changing any aliases. A
+        // renamed-away alias may later be reused by a new live type; resolving
+        // that replacement first must not remove the only entry needed to bind
+        // the original identity under its current renamed alias.
+        let historical_by_identity = self
+            .entries
+            .values()
+            .cloned()
+            .map(|entry| (entry.identity, entry))
+            .collect::<HashMap<_, _>>();
+        let schema_ir = catalog.bound_schema_ir().ok_or_else(|| {
+            OmniError::manifest_internal(
+                "historical query alias binding requires an identity-bound catalog".to_string(),
+            )
+        })?;
+        let table_aliases = schema_ir
+            .nodes
+            .iter()
+            .map(|node| {
+                (
+                    format!("node:{}", node.name),
+                    node.type_id.get(),
+                    node.table_incarnation_id.get(),
+                )
+            })
+            .chain(schema_ir.edges.iter().map(|edge| {
+                (
+                    format!("edge:{}", edge.name),
+                    edge.type_id.get(),
+                    edge.table_incarnation_id.get(),
+                )
+            }))
+            .collect::<Vec<_>>();
+
+        for (table_key, stable_table_id, incarnation_id) in table_aliases {
+            let identity = TableIdentity::new(stable_table_id, incarnation_id)?;
+
+            // An exact alias belonging to another lifetime is actively unsafe:
+            // remove it before looking for this catalog type's identity under a
+            // historical name.
+            self.entries.remove(&table_key);
+            if let Some(entry) = historical_by_identity.get(&identity) {
+                self.entries.insert(table_key, entry.clone());
+            }
+        }
+        Ok(())
+    }
+
     /// Open a sub-table dataset at its pinned version. With read caches present
     /// (live Branch reads), reuse a held handle through the cache (0 open IO on a
     /// warm repeat) and the shared `Session`; otherwise plain-open (Fix 2).
-    pub async fn open(&self, table_key: &str) -> Result<Dataset> {
+    pub async fn open(&self, table_key: &str) -> Result<SnapshotTable> {
+        self.open_dataset(table_key).await.map(SnapshotTable::new)
+    }
+
+    /// Open the raw Lance dataset for engine-internal read execution.
+    ///
+    /// This stays crate-private so downstream SDK callers cannot obtain a
+    /// writable `Dataset` from a logical graph snapshot.
+    pub(crate) async fn open_dataset(&self, table_key: &str) -> Result<Dataset> {
         let entry = self
             .entries
             .get(table_key)
@@ -210,6 +479,58 @@ impl ManifestIncarnation {
     }
 }
 
+/// Immutable probe handle captured from one exact manifest dataset
+/// incarnation.
+///
+/// It retains only Lance's pinned Dataset handle plus the active branch and
+/// incarnation token. It does not carry mutable graph-head state or a lineage
+/// projection, so callers cannot mistake it for publish authority.
+#[derive(Debug, Clone)]
+pub(crate) struct CapturedManifestProbe {
+    dataset: Dataset,
+    active_branch: Option<String>,
+    captured: ManifestIncarnation,
+}
+
+impl CapturedManifestProbe {
+    pub(crate) async fn probe_latest_incarnation(&self) -> Result<ManifestIncarnation> {
+        crate::instrumentation::record_probe();
+        probe_dataset_latest_incarnation(&self.dataset, self.active_branch.as_deref()).await
+    }
+
+    pub(crate) async fn is_current(&self) -> Result<bool> {
+        Ok(self
+            .probe_latest_incarnation()
+            .await?
+            .matches(&self.captured))
+    }
+}
+
+async fn probe_dataset_latest_incarnation(
+    dataset: &Dataset,
+    active_branch: Option<&str>,
+) -> Result<ManifestIncarnation> {
+    if active_branch.is_none() {
+        return Ok(ManifestIncarnation {
+            version: dataset
+                .latest_version_id()
+                .await
+                .map_err(|e| OmniError::Lance(e.to_string()))?,
+            e_tag: dataset.manifest_location().e_tag.clone(),
+            timestamp_nanos: Some(dataset.manifest().timestamp_nanos),
+        });
+    }
+    let (manifest, location) = dataset
+        .latest_manifest()
+        .await
+        .map_err(|e| OmniError::Lance(e.to_string()))?;
+    Ok(ManifestIncarnation {
+        version: manifest.version,
+        e_tag: location.e_tag,
+        timestamp_nanos: Some(manifest.timestamp_nanos),
+    })
+}
+
 impl SubTableUpdate {
     pub(crate) fn to_create_table_version_request(&self) -> CreateTableVersionRequest {
         self.version_metadata.to_create_table_version_request(
@@ -221,24 +542,100 @@ impl SubTableUpdate {
     }
 }
 
-#[derive(Debug, Clone)]
+/// Immutable graph-level identity of one physical table lifetime.
+///
+/// `stable_table_id` survives supported type renames. Dropping and re-adding a
+/// type mints a new `table_incarnation_id`, so old version and tombstone rows
+/// can never alias the replacement even when it reuses the same display name.
+/// Both components are non-zero; zero remains the sentinel for "no table" in
+/// external formats and is never persisted on a table-bearing manifest row.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+pub(crate) struct TableIdentity {
+    pub(crate) stable_table_id: u64,
+    pub(crate) table_incarnation_id: u64,
+}
+
+impl TableIdentity {
+    pub(crate) fn new(stable_table_id: u64, table_incarnation_id: u64) -> Result<Self> {
+        let identity = Self {
+            stable_table_id,
+            table_incarnation_id,
+        };
+        identity.validate()?;
+        Ok(identity)
+    }
+
+    pub(crate) fn validate(self) -> Result<()> {
+        if self.stable_table_id == 0 || self.table_incarnation_id == 0 {
+            return Err(OmniError::manifest(format!(
+                "table identity components must be non-zero (stable_table_id={}, \
+                 table_incarnation_id={})",
+                self.stable_table_id, self.table_incarnation_id
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for TableIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:016x}:{:016x}",
+            self.stable_table_id, self.table_incarnation_id
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TableRegistration {
+    pub(crate) identity: TableIdentity,
     pub(crate) table_key: String,
     pub(crate) table_path: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TableTombstone {
+    pub(crate) identity: TableIdentity,
     pub(crate) table_key: String,
     pub(crate) tombstone_version: u64,
+}
+
+/// Metadata-only rebinding of one live table identity to a new alias.
+///
+/// `table_path` is the path the caller observed. The publisher requires it to
+/// equal the currently registered path and rewrites only the registration row;
+/// no `table_version` row is emitted, so the Lance version is preserved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TableRename {
+    pub(crate) identity: TableIdentity,
+    pub(crate) expected_table_key: String,
+    pub(crate) table_key: String,
+    pub(crate) table_path: String,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) enum ManifestChange {
     Update(SubTableUpdate),
     RegisterTable(TableRegistration),
+    RenameTable(TableRename),
     Tombstone(TableTombstone),
 }
+
+/// One table-version authority assertion supplied to a publish attempt.
+///
+/// The map key is the immutable table identity. `table_key` is retained only
+/// as a diagnostic binding and is itself checked, so a caller prepared before a
+/// metadata-only rename cannot accidentally publish against the renamed table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TableVersionExpectation {
+    pub(crate) table_key: String,
+    pub(crate) table_version: u64,
+}
+
+pub(crate) type ExpectedTableVersions = HashMap<TableIdentity, TableVersionExpectation>;
 
 impl SubTableEntry {
     /// Open this sub-table at its pinned version directly by location (Fix 2),
@@ -276,12 +673,18 @@ impl SubTableEntry {
     }
 }
 
-pub(crate) fn table_path_for_table_key(table_key: &str) -> Result<String> {
-    if let Some(type_name) = table_key.strip_prefix("node:") {
-        return Ok(format!("nodes/{}", type_name_hash(type_name)));
+pub(crate) fn table_path_for_identity(table_key: &str, identity: TableIdentity) -> Result<String> {
+    if table_key.strip_prefix("node:").is_some() {
+        return Ok(format!(
+            "nodes/{:016x}-{:016x}",
+            identity.stable_table_id, identity.table_incarnation_id
+        ));
     }
-    if let Some(type_name) = table_key.strip_prefix("edge:") {
-        return Ok(format!("edges/{}", type_name_hash(type_name)));
+    if table_key.strip_prefix("edge:").is_some() {
+        return Ok(format!(
+            "edges/{:016x}-{:016x}",
+            identity.stable_table_id, identity.table_incarnation_id
+        ));
     }
     Err(OmniError::manifest(format!(
         "invalid table key '{}'",
@@ -292,6 +695,7 @@ pub(crate) fn table_path_for_table_key(table_key: &str) -> Result<String> {
 /// An update to apply to the manifest via `commit`.
 #[derive(Debug, Clone)]
 pub struct SubTableUpdate {
+    pub(crate) identity: TableIdentity,
     pub table_key: String,
     pub table_version: u64,
     pub table_branch: Option<String>,
@@ -305,7 +709,7 @@ pub struct SubTableUpdate {
 /// `table_version` rows are the graph publish boundary and reconstruct the
 /// current graph snapshot by selecting the latest visible version row per
 /// sub-table.
-pub struct ManifestCoordinator {
+pub(crate) struct ManifestCoordinator {
     root_uri: String,
     dataset: Dataset,
     known_state: ManifestState,
@@ -317,8 +721,13 @@ impl ManifestCoordinator {
     fn default_batch_publisher(
         root_uri: &str,
         active_branch: Option<&str>,
+        control_session: Arc<lance::session::Session>,
     ) -> Arc<dyn ManifestBatchPublisher> {
-        Arc::new(GraphNamespacePublisher::new(root_uri, active_branch))
+        Arc::new(GraphNamespacePublisher::new_with_session(
+            root_uri,
+            active_branch,
+            control_session,
+        ))
     }
 
     fn from_parts(
@@ -343,7 +752,8 @@ impl ManifestCoordinator {
         known_state: ManifestState,
         active_branch: Option<String>,
     ) -> Self {
-        let publisher = Self::default_batch_publisher(root_uri, active_branch.as_deref());
+        let publisher =
+            Self::default_batch_publisher(root_uri, active_branch.as_deref(), dataset.session());
         Self::from_parts(root_uri, dataset, known_state, active_branch, publisher)
     }
 
@@ -356,6 +766,7 @@ impl ManifestCoordinator {
                 .into_iter()
                 .map(|entry| (entry.table_key.clone(), entry))
                 .collect(),
+            graph_heads: state.graph_heads,
             read_caches: None,
         }
     }
@@ -366,28 +777,48 @@ impl ManifestCoordinator {
         self
     }
 
+    /// Test-only compatibility helper for manifest fixtures that need only the
+    /// coordinator and not the coherently decoded lineage rows.
+    #[cfg(test)]
+    pub(crate) async fn init(root_uri: &str, catalog: &Catalog) -> Result<Self> {
+        let control_session = crate::lance_access::control_session();
+        let (coordinator, _) = Self::init_with_lineage(root_uri, catalog, &control_session).await?;
+        Ok(coordinator)
+    }
+
     /// Create a new graph at `root_uri` from a catalog.
     ///
     /// Creates per-type Lance datasets and the namespace `__manifest` table.
     /// The genesis graph commit is folded into the init write, so `__manifest`
     /// is the single source of graph lineage from version one — callers read it
     /// back through the lineage projection rather than via a second write.
-    pub async fn init(root_uri: &str, catalog: &Catalog) -> Result<Self> {
+    pub(crate) async fn init_with_lineage(
+        root_uri: &str,
+        catalog: &Catalog,
+        control_session: &Arc<lance::session::Session>,
+    ) -> Result<(Self, Vec<GraphLineageRow>)> {
         let root = root_uri.trim_end_matches('/');
-        let (dataset, known_state) = init_manifest_graph(root, catalog).await?;
+        let (dataset, known_state, lineage_rows) =
+            init_manifest_graph(root, catalog, control_session).await?;
 
-        Ok(Self::from_parts_with_default_publisher(
-            root,
-            dataset,
-            known_state,
-            None,
+        Ok((
+            Self::from_parts_with_default_publisher(root, dataset, known_state, None),
+            lineage_rows,
         ))
     }
 
     /// Open an existing graph's manifest.
     pub async fn open(root_uri: &str) -> Result<Self> {
+        let control_session = crate::lance_access::control_session();
+        Self::open_with_session(root_uri, &control_session).await
+    }
+
+    pub(crate) async fn open_with_session(
+        root_uri: &str,
+        control_session: &Arc<lance::session::Session>,
+    ) -> Result<Self> {
         let root = root_uri.trim_end_matches('/');
-        let (dataset, known_state) = open_manifest_graph(root, None).await?;
+        let (dataset, known_state) = open_manifest_graph(root, None, control_session).await?;
         Ok(Self::from_parts_with_default_publisher(
             root,
             dataset,
@@ -398,17 +829,47 @@ impl ManifestCoordinator {
 
     /// Open an existing graph's manifest at a specific branch.
     pub async fn open_at_branch(root_uri: &str, branch: &str) -> Result<Self> {
+        let control_session = crate::lance_access::control_session();
+        Self::open_at_branch_with_session(root_uri, branch, &control_session).await
+    }
+
+    pub(crate) async fn open_at_branch_with_session(
+        root_uri: &str,
+        branch: &str,
+        control_session: &Arc<lance::session::Session>,
+    ) -> Result<Self> {
         if branch == "main" {
-            return Self::open(root_uri).await;
+            return Self::open_with_session(root_uri, control_session).await;
         }
 
         let root = root_uri.trim_end_matches('/');
-        let (dataset, known_state) = open_manifest_graph(root, Some(branch)).await?;
+        let (dataset, known_state) =
+            open_manifest_graph(root, Some(branch), control_session).await?;
         Ok(Self::from_parts_with_default_publisher(
             root,
             dataset,
             known_state,
             Some(branch.to_string()),
+        ))
+    }
+
+    pub(crate) async fn open_with_lineage(
+        root_uri: &str,
+        branch: Option<&str>,
+        control_session: &Arc<lance::session::Session>,
+    ) -> Result<(Self, Vec<GraphLineageRow>)> {
+        let root = root_uri.trim_end_matches('/');
+        let branch = branch.filter(|branch| *branch != "main");
+        let (dataset, known_state, lineage_rows) =
+            open_manifest_graph_with_lineage(root, branch, control_session).await?;
+        Ok((
+            Self::from_parts_with_default_publisher(
+                root,
+                dataset,
+                known_state,
+                branch.map(str::to_string),
+            ),
+            lineage_rows,
         ))
     }
 
@@ -429,18 +890,71 @@ impl ManifestCoordinator {
         Self::snapshot_from_state(&self.root_uri, self.known_state.clone())
     }
 
-    /// Re-read manifest from storage to see other writers' commits.
-    pub async fn refresh(&mut self) -> Result<()> {
-        self.dataset = open_manifest_dataset(&self.root_uri, self.active_branch.as_deref()).await?;
-        self.known_state = read_manifest_state(&self.dataset).await?;
-        Ok(())
+    pub(crate) fn control_session(&self) -> Arc<lance::session::Session> {
+        self.dataset.session()
+    }
+
+    pub(crate) fn captured_probe(&self) -> CapturedManifestProbe {
+        CapturedManifestProbe {
+            dataset: self.dataset.clone(),
+            active_branch: self.active_branch.clone(),
+            captured: self.incarnation(),
+        }
+    }
+
+    pub(crate) async fn refresh_with_lineage(&mut self) -> Result<Vec<GraphLineageRow>> {
+        let control_session = self.dataset.session();
+        let (dataset, known_state, lineage_rows) = open_manifest_graph_with_lineage(
+            &self.root_uri,
+            self.active_branch.as_deref(),
+            &control_session,
+        )
+        .await?;
+        self.dataset = dataset;
+        self.known_state = known_state;
+        Ok(lineage_rows)
+    }
+
+    /// Refresh one live-read view without ever installing a manifest state
+    /// whose inherited lineage projection has not also been refreshed.
+    ///
+    /// Branches with an exact `graph_head` row keep the cheap state-only path.
+    /// A fresh named branch has no such row and needs the lineage fallback;
+    /// every fallible read completes before either field is replaced so a
+    /// transient lineage failure leaves the previous coordinator coherent.
+    pub(crate) async fn refresh_for_live_read(&mut self) -> Result<Option<Vec<GraphLineageRow>>> {
+        let control_session = self.dataset.session();
+        let dataset = open_manifest_dataset_with_session(
+            &self.root_uri,
+            self.active_branch.as_deref(),
+            &control_session,
+        )
+        .await?;
+        let known_state = read_manifest_state(&dataset).await?;
+        let branch_key = self
+            .active_branch
+            .as_deref()
+            .unwrap_or(MAIN_BRANCH_HEAD_KEY);
+        let lineage_rows = if known_state.graph_heads.contains_key(branch_key) {
+            None
+        } else {
+            crate::failpoints::maybe_fail(
+                crate::failpoints::names::READ_REFRESH_POST_STATE_PRE_LINEAGE,
+            )?;
+            Some(read_graph_lineage(&dataset).await?.0)
+        };
+
+        self.dataset = dataset;
+        self.known_state = known_state;
+        Ok(lineage_rows)
     }
 
     /// Commit updated sub-table versions to the manifest.
     ///
     /// Atomically inserts one immutable `table_version` row per updated table.
     /// The merge-insert commit on `__manifest` is the graph-level publish point.
-    pub async fn commit(&mut self, updates: &[SubTableUpdate]) -> Result<u64> {
+    #[cfg(test)]
+    pub(crate) async fn commit(&mut self, updates: &[SubTableUpdate]) -> Result<u64> {
         let changes = updates
             .iter()
             .cloned()
@@ -452,12 +966,13 @@ impl ManifestCoordinator {
     /// Same as [`commit`], but with caller-supplied per-table expected
     /// versions used for optimistic concurrency control. Each entry asserts
     /// the manifest's current latest non-tombstoned `table_version` for that
-    /// `table_key` is exactly what the caller observed; mismatches surface
+    /// table identity is exactly what the caller observed; mismatches surface
     /// as `OmniError::Manifest` with `ManifestConflictDetails::ExpectedVersionMismatch`.
-    pub async fn commit_with_expected(
+    #[cfg(test)]
+    pub(crate) async fn commit_with_expected(
         &mut self,
         updates: &[SubTableUpdate],
-        expected_table_versions: &HashMap<String, u64>,
+        expected_table_versions: &ExpectedTableVersions,
     ) -> Result<u64> {
         let changes = updates
             .iter()
@@ -468,15 +983,17 @@ impl ManifestCoordinator {
             .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn commit_changes(&mut self, changes: &[ManifestChange]) -> Result<u64> {
         self.commit_changes_with_expected(changes, &HashMap::new())
             .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn commit_changes_with_expected(
         &mut self,
         changes: &[ManifestChange],
-        expected_table_versions: &HashMap<String, u64>,
+        expected_table_versions: &ExpectedTableVersions,
     ) -> Result<u64> {
         Ok(self
             .commit_changes_with_lineage(changes, expected_table_versions, None)
@@ -492,13 +1009,36 @@ impl ManifestCoordinator {
     /// per-write commit-graph refresh. Returns the new version and the parent the
     /// publisher resolved for the commit (so the caller can update its in-memory
     /// commit cache without a re-read).
+    #[cfg(test)]
     pub(crate) async fn commit_changes_with_lineage(
         &mut self,
         changes: &[ManifestChange],
-        expected_table_versions: &HashMap<String, u64>,
+        expected_table_versions: &ExpectedTableVersions,
         lineage: Option<&LineageIntent>,
     ) -> Result<CommitOutcome> {
-        if changes.is_empty() && expected_table_versions.is_empty() && lineage.is_none() {
+        self.commit_changes_with_lineage_and_precondition(
+            changes,
+            expected_table_versions,
+            lineage,
+            &PublishPrecondition::Any,
+        )
+        .await
+    }
+
+    /// Token-aware graph publication. Exact authority is checked by the
+    /// publisher from every CAS attempt's existing one-scan state.
+    pub(crate) async fn commit_changes_with_lineage_and_precondition(
+        &mut self,
+        changes: &[ManifestChange],
+        expected_table_versions: &ExpectedTableVersions,
+        lineage: Option<&LineageIntent>,
+        precondition: &PublishPrecondition,
+    ) -> Result<CommitOutcome> {
+        if changes.is_empty()
+            && expected_table_versions.is_empty()
+            && lineage.is_none()
+            && matches!(precondition, PublishPrecondition::Any)
+        {
             return Ok(CommitOutcome {
                 version: self.version(),
                 parent_commit_id: None,
@@ -511,7 +1051,7 @@ impl ManifestCoordinator {
             known_state,
         } = self
             .publisher
-            .publish(changes, expected_table_versions, lineage)
+            .publish_with_precondition(changes, expected_table_versions, lineage, precondition)
             .await?;
         // RFC-013 PR2 #1b: the publisher folded the new visible state in-memory
         // (byte-identical to a re-scan via the shared `assemble_manifest_state`),
@@ -531,7 +1071,9 @@ impl ManifestCoordinator {
         root_uri: &str,
         branch: Option<&str>,
     ) -> Result<(Vec<GraphLineageRow>, HashMap<String, String>)> {
-        let dataset = open_manifest_dataset(root_uri, branch).await?;
+        let control_session = crate::lance_access::control_session();
+        let dataset =
+            open_manifest_dataset_with_session(root_uri, branch, &control_session).await?;
         read_graph_lineage(&dataset).await
     }
 
@@ -540,14 +1082,34 @@ impl ManifestCoordinator {
         self.dataset.version().version
     }
 
-    /// Latest committed manifest version on disk (one object-store op, no row
-    /// scan). The freshness probe for warm reuse: compare against `version()`
-    /// (the held handle's pinned version) to decide whether to refresh.
-    pub async fn probe_latest_version(&self) -> Result<u64> {
+    #[cfg(test)]
+    pub(crate) async fn probe_latest_version(&self) -> Result<u64> {
         self.dataset
             .latest_version_id()
             .await
+            .map_err(|error| OmniError::Lance(error.to_string()))
+    }
+
+    /// Lance-native stable identity for the active manifest branch. Unlike a
+    /// manifest version/eTag, this remains stable across ordinary commits and
+    /// changes when a named branch is deleted and recreated (ABA protection).
+    pub(crate) async fn branch_identifier(&self) -> Result<lance::dataset::refs::BranchIdentifier> {
+        self.dataset
+            .branch_identifier()
+            .await
             .map_err(|e| OmniError::Lance(e.to_string()))
+    }
+
+    /// Exact materialized `graph_head:<active-branch>` from the same pinned
+    /// manifest version as [`Self::snapshot`]. This is write authority, not a
+    /// lineage-cache query: a read may refresh only the manifest, so consulting
+    /// `CommitGraph` here would combine a fresh table snapshot with a stale head.
+    pub(crate) fn exact_graph_head(&self) -> Option<String> {
+        let branch_key = self
+            .active_branch
+            .as_deref()
+            .unwrap_or(MAIN_BRANCH_HEAD_KEY);
+        self.known_state.graph_heads.get(branch_key).cloned()
     }
 
     pub(crate) fn incarnation(&self) -> ManifestIncarnation {
@@ -563,52 +1125,63 @@ impl ManifestCoordinator {
     /// branches can be deleted and recreated with the same version number, so
     /// load the latest manifest location and compare its e_tag / timestamp too.
     pub(crate) async fn probe_latest_incarnation(&self) -> Result<ManifestIncarnation> {
-        if self.active_branch.is_none() {
-            return Ok(ManifestIncarnation {
-                version: self.probe_latest_version().await?,
-                e_tag: self.dataset.manifest_location().e_tag.clone(),
-                timestamp_nanos: Some(self.dataset.manifest().timestamp_nanos),
-            });
-        }
-        let (manifest, location) = self
-            .dataset
-            .latest_manifest()
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-        Ok(ManifestIncarnation {
-            version: manifest.version,
-            e_tag: location.e_tag,
-            timestamp_nanos: Some(manifest.timestamp_nanos),
-        })
+        probe_dataset_latest_incarnation(&self.dataset, self.active_branch.as_deref()).await
     }
 
-    pub fn active_branch(&self) -> Option<&str> {
-        self.active_branch.as_deref()
-    }
-
-    pub async fn create_branch(&mut self, name: &str) -> Result<()> {
+    pub(crate) async fn create_branch(&mut self, name: &str) -> Result<()> {
         let mut ds = self.dataset.clone();
-        ds.create_branch(name, self.version(), None)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-        Ok(())
+        match crate::branch_control::create_branch_recoverably(&mut ds, name, self.version())
+            .await?
+        {
+            crate::branch_control::BranchCreateOutcome::Created(_) => Ok(()),
+            crate::branch_control::BranchCreateOutcome::RefAlreadyExists => Err(
+                OmniError::manifest_conflict(format!("branch '{}' already exists", name)),
+            ),
+        }
     }
 
-    pub async fn delete_branch(&mut self, name: &str) -> Result<()> {
+    async fn open_branch_control_dataset(&self) -> Result<Dataset> {
         let uri = manifest_uri(&self.root_uri);
-        let mut ds = crate::instrumentation::open_dataset(
+        crate::instrumentation::open_dataset(
             &uri,
             crate::instrumentation::VersionResolution::Latest,
             None,
             crate::instrumentation::manifest_wrapper(),
         )
-        .await?;
-        ds.delete_branch(name)
+        .await
+    }
+
+    pub(crate) async fn delete_branch(&mut self, name: &str) -> Result<()> {
+        let mut ds = self.open_branch_control_dataset().await?;
+        let branches = ds
+            .list_branches()
             .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-        self.dataset = open_manifest_dataset(&self.root_uri, self.active_branch.as_deref()).await?;
-        self.known_state = read_manifest_state(&self.dataset).await?;
+            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        let expected_identifier = branches
+            .get(name)
+            .ok_or_else(|| OmniError::manifest_not_found(format!("branch '{}' not found", name)))?
+            .identifier
+            .clone();
+        crate::branch_control::delete_branch_recoverably(&mut ds, name, &expected_identifier)
+            .await?;
         Ok(())
+    }
+
+    /// Delete `name` only if its live Lance BranchContents still has the exact
+    /// identifier captured by the caller's post-gate branch view.
+    ///
+    /// The coordinator may itself be bound to `name`: operation-local native
+    /// controls discard that captured coordinator after the authority change,
+    /// so refreshing a just-deleted bound ref would be both wasted work and an
+    /// error. Deleting a sibling ref does not mutate this coordinator's pinned
+    /// manifest version/state either.
+    pub(crate) async fn delete_branch_with_expected(
+        &mut self,
+        name: &str,
+        expected_identifier: &lance::dataset::refs::BranchIdentifier,
+    ) -> Result<()> {
+        let mut ds = self.open_branch_control_dataset().await?;
+        crate::branch_control::delete_branch_recoverably(&mut ds, name, expected_identifier).await
     }
 
     pub async fn list_branches(&self) -> Result<Vec<String>> {
@@ -652,11 +1225,6 @@ impl ManifestCoordinator {
         }
 
         Ok(descendants)
-    }
-
-    /// Root URI of the graph.
-    pub fn root_uri(&self) -> &str {
-        &self.root_uri
     }
 }
 

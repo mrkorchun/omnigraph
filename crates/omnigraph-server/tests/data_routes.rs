@@ -1,25 +1,745 @@
 //! Data-plane routes: read/query/change/ingest/branches/snapshot/export.
 //! Moved verbatim from tests/server.rs in the modularization.
 
+use std::convert::Infallible;
 use std::fs;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
-use axum::body::{Body, to_bytes};
-use axum::http::{Method, Request, StatusCode};
+use axum::body::{Body, Bytes, to_bytes};
+use axum::http::{HeaderValue, Method, Request, StatusCode};
+use futures::TryStreamExt;
 use omnigraph::db::{Omnigraph, ReadTarget};
-use omnigraph::loader::LoadMode;
+use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::{
+    BLOB_READ_RANGE_MAX_BYTES, ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy,
+};
 use omnigraph_server::api::{
-    BranchCreateRequest, BranchMergeRequest, ChangeRequest, ErrorOutput, ExportRequest,
-    IngestRequest, QueryRequest, ReadRequest,
+    BranchCreateRequest, BranchMergeRequest, ChangeRequest, ErrorCode, ErrorOutput, ExportRequest,
+    GraphBatchLoadOutput, IngestRequest, QueryRequest, ReadRequest,
 };
 use omnigraph_server::{AppState, build_app};
 use serde_json::{Value, json};
 use serial_test::serial;
 use tower::ServiceExt;
 
-
 mod support;
 use support::*;
+
+const BLOB_HTTP_SCHEMA: &str = r#"
+node Document {
+    title: String @key
+    content: Blob?
+}
+
+edge Attachment: Document -> Document {
+    payload: Blob?
+}
+"#;
+
+const BLOB_HTTP_DATA: &str = r#"{"type":"Document","data":{"title":"readme","content":"base64:SGVsbG8gV29ybGQ="}}
+{"type":"Document","data":{"title":"empty","content":"base64:"}}
+{"type":"Document","data":{"title":"null"}}
+{"type":"Document","data":{"title":"peer"}}
+{"edge":"Attachment","from":"readme","to":"peer","data":{"id":"attachment-1","payload":"base64:RWRnZQ=="}}"#;
+
+async fn app_for_blob_http_data(data: &str) -> (tempfile::TempDir, axum::Router) {
+    let temp = init_graph_with_schema_and_data(BLOB_HTTP_SCHEMA, data).await;
+    let graph = graph_path(temp.path());
+    let state = AppState::open(graph.to_string_lossy().to_string())
+        .await
+        .unwrap();
+    (temp, build_app(state))
+}
+
+fn blob_uri(entity: &str, type_name: &str, id: &str, property: &str, target: &str) -> String {
+    g(&format!(
+        "/blob?entity={entity}&type={type_name}&id={id}&property={property}{target}"
+    ))
+}
+
+fn repeated_zero_blob_input(length: usize) -> String {
+    let full_triples = length / 3;
+    let tail = match length % 3 {
+        0 => "",
+        1 => "AA==",
+        2 => "AAA=",
+        _ => unreachable!(),
+    };
+    format!("base64:{}{tail}", "AAAA".repeat(full_triples))
+}
+
+async fn assert_receipt_commit_matches_get(app: &axum::Router, output: &Value) {
+    let receipt = output
+        .get("commit")
+        .filter(|commit| !commit.is_null())
+        .expect("successful effectful mutation must return a commit receipt");
+    let commit_id = receipt["graph_commit_id"]
+        .as_str()
+        .expect("commit receipt must carry graph_commit_id")
+        .to_string();
+    let (status, shown) = json_response(
+        app,
+        Request::builder()
+            .uri(g(&format!("/commits/{commit_id}")))
+            .method(Method::GET)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        &shown, receipt,
+        "receipt must be the exact published commit"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn blob_get_head_ranges_and_conditionals_follow_http_contract() {
+    let (_temp, app) = app_for_blob_http_data(BLOB_HTTP_DATA).await;
+    let uri = blob_uri("node", "Document", "readme", "content", "");
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&uri)
+                .method(Method::GET)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "application/octet-stream"
+    );
+    assert_eq!(response.headers().get("content-length").unwrap(), "11");
+    assert_eq!(response.headers().get("accept-ranges").unwrap(), "bytes");
+    let etag = response
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(etag.starts_with('"') && etag.ends_with('"'));
+    let snapshot_id = response
+        .headers()
+        .get("omnigraph-snapshot-id")
+        .expect("managed response carries its exact resolved snapshot")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(!snapshot_id.is_empty());
+    assert_eq!(
+        &to_bytes(response.into_body(), usize::MAX).await.unwrap()[..],
+        b"Hello World"
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&uri)
+                .method(Method::GET)
+                .header("if-match", "\"stale\"")
+                .header("if-none-match", format!("W/{etag}"))
+                .header("range", "bytes=0-1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+    assert_eq!(response.headers().get("etag").unwrap(), etag.as_str());
+    assert_eq!(
+        response.headers().get("omnigraph-snapshot-id").unwrap(),
+        snapshot_id.as_str()
+    );
+    let output: ErrorOutput =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(output.code, Some(ErrorCode::Conflict));
+
+    for (range, expected_range, expected) in [
+        ("bytes=1-4", "bytes 1-4/11", &b"ello"[..]),
+        ("bytes=6-", "bytes 6-10/11", &b"World"[..]),
+        ("bytes=-5", "bytes 6-10/11", &b"World"[..]),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&uri)
+                    .method(Method::GET)
+                    .header("range", range)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT, "{range}");
+        assert_eq!(
+            response.headers().get("content-range").unwrap(),
+            expected_range
+        );
+        assert_eq!(response.headers().get("etag").unwrap(), etag.as_str());
+        assert_eq!(
+            response.headers().get("omnigraph-snapshot-id").unwrap(),
+            snapshot_id.as_str()
+        );
+        assert_eq!(
+            &to_bytes(response.into_body(), usize::MAX).await.unwrap()[..],
+            expected,
+            "{range}"
+        );
+    }
+
+    // V1 deliberately ignores multipart ranges and returns the full
+    // representation instead of silently inventing multipart framing.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&uri)
+                .method(Method::GET)
+                .header("range", "bytes=0-1,6-10")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().get("content-range").is_none());
+    assert_eq!(
+        &to_bytes(response.into_body(), usize::MAX).await.unwrap()[..],
+        b"Hello World"
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&uri)
+                .method(Method::GET)
+                .header("if-none-match", format!("\"other\", W/{etag}"))
+                .header("range", "bytes=0-1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(response.headers().get("content-length").unwrap(), "11");
+    assert_eq!(response.headers().get("etag").unwrap(), etag.as_str());
+    assert_eq!(
+        response.headers().get("omnigraph-snapshot-id").unwrap(),
+        snapshot_id.as_str()
+    );
+    assert!(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let weak_etag = format!("W/{etag}");
+    for (if_range, expected_status, expected) in [
+        (etag.as_str(), StatusCode::PARTIAL_CONTENT, &b"Hello"[..]),
+        (weak_etag.as_str(), StatusCode::OK, &b"Hello World"[..]),
+        ("\"different\"", StatusCode::OK, &b"Hello World"[..]),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&uri)
+                    .method(Method::GET)
+                    .header("range", "bytes=0-4")
+                    .header("if-range", if_range)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected_status, "If-Range: {if_range}");
+        assert_eq!(
+            &to_bytes(response.into_body(), usize::MAX).await.unwrap()[..],
+            expected,
+            "If-Range: {if_range}"
+        );
+    }
+
+    // HEAD is an explicit metadata path: it ignores Range and If-Range, but
+    // still honors If-None-Match. In particular, an unsatisfiable range cannot
+    // turn HEAD into 416 and no response carries payload bytes.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&uri)
+                .method(Method::HEAD)
+                .header("range", "bytes=99-")
+                .header("if-range", &etag)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers().get("content-length").unwrap(), "11");
+    assert_eq!(response.headers().get("etag").unwrap(), etag.as_str());
+    assert_eq!(
+        response.headers().get("omnigraph-snapshot-id").unwrap(),
+        snapshot_id.as_str()
+    );
+    assert!(response.headers().get("content-range").is_none());
+    assert!(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&uri)
+                .method(Method::HEAD)
+                .header("if-none-match", "*")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(response.headers().get("content-length").unwrap(), "11");
+    assert_eq!(
+        response.headers().get("omnigraph-snapshot-id").unwrap(),
+        snapshot_id.as_str()
+    );
+    assert!(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&uri)
+                .method(Method::HEAD)
+                .header("if-match", "W/\"stale\"")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+    assert_eq!(response.headers().get("etag").unwrap(), etag.as_str());
+    assert_eq!(
+        response.headers().get("omnigraph-snapshot-id").unwrap(),
+        snapshot_id.as_str()
+    );
+    assert!(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn blob_get_preserves_empty_null_edge_and_target_semantics() {
+    let (temp, app) = app_for_blob_http_data(BLOB_HTTP_DATA).await;
+    let graph = graph_path(temp.path());
+    let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+    let snapshot_id = db.resolve_snapshot("main").await.unwrap().to_string();
+    db.branch_create_from(ReadTarget::branch("main"), "feature")
+        .await
+        .unwrap();
+    drop(db);
+
+    let empty_uri = blob_uri("node", "Document", "empty", "content", "");
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&empty_uri)
+                .method(Method::GET)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers().get("content-length").unwrap(), "0");
+    assert!(response.headers().get("etag").is_some());
+    assert!(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // A byte range cannot select any representation bytes from a valid empty
+    // Blob. This is 416, not the engine's valid half-open descriptor range
+    // 0..0 (which HTTP's inclusive Range syntax cannot express).
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&empty_uri)
+                .method(Method::GET)
+                .header("range", "bytes=0-0")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(
+        response.headers().get("content-range").unwrap(),
+        "bytes */0"
+    );
+    assert_eq!(response.headers().get("accept-ranges").unwrap(), "bytes");
+    assert!(response.headers().get("etag").is_some());
+    assert!(response.headers().get("omnigraph-snapshot-id").is_some());
+    let error: ErrorOutput =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(
+        error.code,
+        Some(omnigraph_server::api::ErrorCode::BadRequest)
+    );
+    let range = error
+        .blob_range
+        .expect("HTTP 416 carries the normalized half-open range");
+    assert_eq!((range.start, range.end, range.length), (0, 1, 0));
+
+    for (id, expected) in [
+        ("null", StatusCode::NOT_FOUND),
+        ("missing", StatusCode::NOT_FOUND),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(blob_uri("node", "Document", id, "content", ""))
+                    .method(Method::GET)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected, "id={id}");
+    }
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(blob_uri("node", "Document", "readme", "title", ""))
+                .method(Method::GET)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(blob_uri(
+                    "edge",
+                    "Attachment",
+                    "attachment-1",
+                    "payload",
+                    "",
+                ))
+                .method(Method::GET)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        &to_bytes(response.into_body(), usize::MAX).await.unwrap()[..],
+        b"Edge"
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(blob_uri(
+                    "node",
+                    "Document",
+                    "readme",
+                    "content",
+                    &format!("&snapshot={snapshot_id}"),
+                ))
+                .method(Method::GET)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("omnigraph-snapshot-id").unwrap(),
+        snapshot_id.as_str()
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(blob_uri(
+                    "node",
+                    "Document",
+                    "readme",
+                    "content",
+                    "&branch=feature",
+                ))
+                .method(Method::GET)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().get("omnigraph-snapshot-id").is_some());
+    assert_eq!(
+        &to_bytes(response.into_body(), usize::MAX).await.unwrap()[..],
+        b"Hello World"
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(blob_uri(
+                    "node",
+                    "Document",
+                    "readme",
+                    "content",
+                    &format!("&branch=main&snapshot={snapshot_id}"),
+                ))
+                .method(Method::GET)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let malformed_selectors = [
+        (
+            "missing property",
+            g("/blob?entity=node&type=Document&id=readme"),
+        ),
+        (
+            "invalid entity kind",
+            g("/blob?entity=dataset&type=Document&id=readme&property=content"),
+        ),
+    ];
+    for method in [Method::GET, Method::HEAD] {
+        for (case, uri) in &malformed_selectors {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .method(method.clone())
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "{method} {case}"
+            );
+            assert_eq!(
+                response.headers().get("content-type").unwrap(),
+                "application/json",
+                "{method} {case}"
+            );
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            if method == Method::HEAD {
+                assert!(body.is_empty(), "HEAD {case}");
+                continue;
+            }
+            let output: ErrorOutput = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                output.code,
+                Some(omnigraph_server::api::ErrorCode::BadRequest),
+                "{case}"
+            );
+            assert!(
+                output
+                    .error
+                    .starts_with("invalid Blob selector query parameters:"),
+                "{case}"
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn blob_external_get_and_head_redirect_without_target_io() {
+    let temp = tempfile::tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    fs::create_dir_all(&graph).unwrap();
+    let external_dir = tempfile::tempdir().unwrap();
+    let external_path = external_dir.path().join("external.bin");
+    fs::write(&external_path, b"must not be read by the Blob route").unwrap();
+    let external_uri = format!("file://{}", external_path.display());
+    let canonical_external_uri = format!(
+        "file://{}",
+        fs::canonicalize(&external_path).unwrap().display()
+    );
+    let external_base = format!("file://{}/", external_dir.path().display());
+    let policy = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(external_base, ExternalBlobExecutionScope::EmbeddedOnly).unwrap(),
+    ])
+    .unwrap();
+    let db = Omnigraph::init(graph.to_str().unwrap(), BLOB_HTTP_SCHEMA)
+        .await
+        .unwrap()
+        .with_external_blob_policy(policy)
+        .unwrap();
+    load_jsonl(
+        &db,
+        &serde_json::json!({
+            "type": "Document",
+            "data": {"title": "external", "content": external_uri},
+        })
+        .to_string(),
+        LoadMode::Overwrite,
+    )
+    .await
+    .unwrap();
+    fs::remove_file(&external_path).unwrap();
+
+    let app = build_app(AppState::new(graph.to_string_lossy().to_string(), db));
+    let uri = blob_uri("node", "Document", "external", "content", "");
+    for method in [Method::GET, Method::HEAD] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&uri)
+                    .method(method.clone())
+                    .header("range", "bytes=1-2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FOUND, "{method}");
+        assert_eq!(
+            response.headers().get("location").unwrap(),
+            canonical_external_uri.as_str()
+        );
+        assert_eq!(response.headers().get("cache-control").unwrap(), "no-store");
+        assert!(response.headers().get("omnigraph-snapshot-id").is_some());
+        assert!(response.headers().get("etag").is_none());
+        if let Some(content_length) = response.headers().get("content-length") {
+            assert_eq!(
+                content_length, "0",
+                "a redirect may frame its empty response body but never assert the external object's length"
+            );
+        }
+        assert!(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn blob_get_streams_large_managed_values_in_bounded_chunks() {
+    let payload_len = usize::try_from(BLOB_READ_RANGE_MAX_BYTES + 1).unwrap();
+    let data = serde_json::json!({
+        "type": "Document",
+        "data": {
+            "title": "large",
+            "content": repeated_zero_blob_input(payload_len),
+        },
+    })
+    .to_string();
+    let (_temp, app) = app_for_blob_http_data(&data).await;
+    let uri = blob_uri("node", "Document", "large", "content", "");
+    let head = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&uri)
+                .method(Method::HEAD)
+                .header("range", "bytes=0-0")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(head.status(), StatusCode::OK);
+    assert_eq!(
+        head.headers().get("content-length").unwrap(),
+        payload_len.to_string().as_str()
+    );
+    assert!(
+        to_bytes(head.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .method(Method::GET)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("content-length").unwrap(),
+        payload_len.to_string().as_str()
+    );
+
+    let mut body = response.into_body().into_data_stream();
+    let mut chunks = 0_u64;
+    let mut bytes = 0_usize;
+    while let Some(chunk) = body.try_next().await.unwrap() {
+        chunks += 1;
+        bytes += chunk.len();
+        assert!(
+            chunk.len() <= usize::try_from(BLOB_READ_RANGE_MAX_BYTES).unwrap(),
+            "one HTTP payload chunk exceeded the engine's 4 MiB read bound"
+        );
+        assert!(chunk.iter().all(|byte| *byte == 0));
+    }
+    assert_eq!(bytes, payload_len);
+    assert!(
+        chunks >= 2,
+        "the fixture must cross at least one chunk boundary"
+    );
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn export_route_returns_jsonl_for_branch_snapshot() {
@@ -90,6 +810,91 @@ async fn export_route_returns_jsonl_for_branch_snapshot() {
     assert_eq!(text, expected);
 }
 
+fn export_request(type_names: Vec<String>) -> Request<Body> {
+    Request::builder()
+        .uri(g("/export"))
+        .method(Method::POST)
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&ExportRequest {
+                branch: Some("main".to_string()),
+                type_names,
+                table_keys: Vec::new(),
+            })
+            .unwrap(),
+        ))
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn export_invalid_filter_refuses_before_success_headers() {
+    let (_temp, app) = app_for_loaded_graph().await;
+    let response = app
+        .oneshot(export_request(vec!["Missing".to_string()]))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "application/json"
+    );
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
+    assert!(error.error.contains("unknown export type 'Missing'"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stalled_export_refuses_a_second_cut_and_disconnect_releases_it() {
+    let (_temp, app) = app_for_loaded_graph().await;
+
+    // Keep the first response body completely unpolled. Its bounded channel
+    // may fill, but the queued terminal frame or in-flight producer must keep
+    // ownership of the sole immutable root cut.
+    let first = app
+        .clone()
+        .oneshot(export_request(Vec::new()))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let second = app
+        .clone()
+        .oneshot(export_request(Vec::new()))
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let second_body = to_bytes(second.into_body(), usize::MAX).await.unwrap();
+    let error: ErrorOutput = serde_json::from_slice(&second_body).unwrap();
+    let limit = error.resource_limit.expect("typed root-cut ceiling");
+    assert_eq!(limit.resource, "stream_export_slots");
+    assert_eq!((limit.limit, limit.actual), (1, 2));
+
+    // Dropping the body is the HTTP disconnect analogue. The producer's
+    // cancellation path must release the cut and the body's byte reservation
+    // without waiting for another output write.
+    drop(first);
+    let response = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let response = app
+                .clone()
+                .oneshot(export_request(Vec::new()))
+                .await
+                .unwrap();
+            if response.status() == StatusCode::OK {
+                break response;
+            }
+            assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+            drop(response);
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("disconnect must promptly release served-export ownership");
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert!(!body.is_empty());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn snapshot_route_returns_manifest_dataset_version() {
     let (temp, app) = app_for_loaded_graph().await;
@@ -151,6 +956,10 @@ async fn ingest_creates_branch_returns_metadata_and_stamps_actor() {
     assert_eq!(body["actor_id"], "act-andrew");
     assert_eq!(body["tables"][0]["table_key"], "node:Person");
     assert_eq!(body["tables"][0]["rows_loaded"], 2);
+    let receipt_commit_id = body["commit"]["graph_commit_id"]
+        .as_str()
+        .expect("effectful ingest must return a commit receipt")
+        .to_string();
 
     let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
     let snapshot = db
@@ -164,8 +973,9 @@ async fn ingest_creates_branch_returns_metadata_and_stamps_actor() {
         .await
         .unwrap()
         .into_iter()
-        .last()
+        .next()
         .unwrap();
+    assert_eq!(head.graph_commit_id, receipt_commit_id);
     assert_eq!(head.actor_id.as_deref(), Some("act-andrew"));
 }
 
@@ -419,6 +1229,7 @@ async fn branch_merge_conflict_response_includes_structured_conflicts() {
     let merge = BranchMergeRequest {
         source: "feature".to_string(),
         target: Some("main".to_string()),
+        delete_branch: false,
     };
     let (status, body) = json_response(
         &app,
@@ -579,6 +1390,29 @@ async fn mutate_endpoint_runs_inline_mutation() {
     assert_eq!(body["affected_nodes"], 1);
     assert_eq!(body["query_name"], "insert_person");
     assert_eq!(body["branch"], "main");
+    assert_receipt_commit_matches_get(&app, &body).await;
+
+    let (status, no_op) = json_response(
+        &app,
+        Request::builder()
+            .uri(g("/mutate"))
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "query": MUTATION_QUERIES,
+                    "name": "set_age",
+                    "params": { "name": "Missing", "age": 99 },
+                    "branch": "main",
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(no_op["affected_nodes"], 0);
+    assert!(no_op["commit"].is_null());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -633,7 +1467,14 @@ async fn load_endpoint_loads_into_existing_branch() {
         branch: Some("main".to_string()),
         from: None,
         mode: Some(LoadMode::Merge),
-        data: r#"{"type":"Person","data":{"name":"Loaded","age":7}}"#.to_string(),
+        data: concat!(
+            r#"{"type":"Person","data":{"name":"Loaded C","age":7}}"#,
+            "\n",
+            r#"{"type":"Person","data":{"name":"Loaded A","age":7}}"#,
+            "\n",
+            r#"{"type":"Person","data":{"name":"Loaded B","age":7}}"#,
+        )
+        .to_string(),
     };
     let response = app
         .clone()
@@ -657,6 +1498,326 @@ async fn load_endpoint_loads_into_existing_branch() {
     let body: Value = serde_json::from_slice(&body_bytes).unwrap();
     assert_eq!(body["branch"], "main");
     assert_eq!(body["tables"][0]["table_key"], "node:Person");
+    let commit_id = body["commit"]["graph_commit_id"]
+        .as_str()
+        .expect("effectful JSON load must return a commit receipt");
+    let (status, first) = json_response(
+        &app,
+        Request::builder()
+            .uri(g(&format!(
+                "/commits/{commit_id}/changes?limit=2&max_bytes=65536"
+            )))
+            .method(Method::GET)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(first["commit"]["graph_commit_id"], commit_id);
+    assert_eq!(first["changes"][0]["id"], "Loaded A");
+    assert_eq!(first["changes"][0]["change_index"], 0);
+    assert_eq!(first["changes"][1]["id"], "Loaded B");
+    assert_eq!(first["changes"][1]["change_index"], 1);
+    assert_eq!(first["commit_complete"], false);
+    assert!(
+        first["changes"][0].get("manifest_version").is_none(),
+        "cause is stated once on the commit block, never per entity"
+    );
+    let cursor = first["next_cursor"].as_str().expect("first page cursor");
+
+    let (status, second) = json_response(
+        &app,
+        Request::builder()
+            .uri(g(&format!(
+                "/commits/{commit_id}/changes?limit=2&max_bytes=65536&cursor={cursor}"
+            )))
+            .method(Method::GET)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(second["changes"][0]["id"], "Loaded C");
+    assert_eq!(second["changes"][0]["change_index"], 2);
+    assert_eq!(second["commit_complete"], true);
+    assert!(second["next_cursor"].is_null());
+
+    for (query, expected) in [
+        ("limit=0", StatusCode::BAD_REQUEST),
+        ("limit=8193", StatusCode::PAYLOAD_TOO_LARGE),
+        ("max_bytes=1", StatusCode::PAYLOAD_TOO_LARGE),
+    ] {
+        let (status, _) = json_response(
+            &app,
+            Request::builder()
+                .uri(g(&format!("/commits/{commit_id}/changes?{query}")))
+                .method(Method::GET)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, expected, "query: {query}");
+    }
+
+    let (status, rejected) = json_response(
+        &app,
+        Request::builder()
+            .uri(g(&format!(
+                "/commits/{commit_id}/changes?cursor=not-a-cursor"
+            )))
+            .method(Method::GET)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        rejected["error"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("change cursor rejected"),
+        "a malformed cursor is a typed 400 rejection, not a retention gap: {rejected}"
+    );
+
+    let (status, _) = json_response(
+        &app,
+        Request::builder()
+            .uri(g("/commits/not-a-commit/changes"))
+            .method(Method::GET)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn raw_graph_batch_load_publishes_mixed_declarations_in_one_commit() {
+    let (temp, app) = app_for_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let commits_before = Omnigraph::open(graph.to_str().unwrap())
+        .await
+        .unwrap()
+        .list_commits(Some("main"))
+        .await
+        .unwrap()
+        .len();
+    let batch = concat!(
+        r#"{"type":"Person","data":{"name":"Raw Ada","age":31}}"#,
+        "\n",
+        r#"{"type":"Company","data":{"name":"Raw Labs"}}"#,
+        "\n",
+        r#"{"edge":"WorksAt","from":"Raw Ada","to":"Raw Labs","data":{}}"#,
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(g("/load/ndjson?branch=main&mode=append"))
+                .method(Method::POST)
+                .header("content-type", "application/x-ndjson")
+                .body(Body::from(batch))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let text = std::str::from_utf8(&body).unwrap();
+    assert!(
+        !text.contains("table_key"),
+        "graph-batch responses must not expose physical table identity: {text}"
+    );
+    let output: GraphBatchLoadOutput = serde_json::from_slice(&body).unwrap();
+    assert_eq!(output.branch, "main");
+    assert_eq!(output.total_rows, 3);
+    let receipt = output
+        .commit
+        .as_ref()
+        .expect("effectful NDJSON load must return a commit receipt");
+    assert!(
+        receipt.manifest_branch.is_none(),
+        "main is represented by the absence of a native manifest branch"
+    );
+    assert_eq!(
+        output
+            .nodes
+            .iter()
+            .map(|entry| (entry.name.as_str(), entry.rows_loaded))
+            .collect::<Vec<_>>(),
+        [("Company", 1), ("Person", 1)]
+    );
+    assert_eq!(
+        output
+            .edges
+            .iter()
+            .map(|entry| (entry.name.as_str(), entry.rows_loaded))
+            .collect::<Vec<_>>(),
+        [("WorksAt", 1)]
+    );
+
+    let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+    assert_eq!(
+        db.list_commits(Some("main")).await.unwrap().len(),
+        commits_before + 1,
+        "one mixed graph batch must append exactly one graph commit"
+    );
+    let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    assert_eq!(
+        snapshot
+            .open("node:Person")
+            .await
+            .unwrap()
+            .count_rows(None)
+            .await
+            .unwrap(),
+        5
+    );
+    assert_eq!(
+        snapshot
+            .open("node:Company")
+            .await
+            .unwrap()
+            .count_rows(None)
+            .await
+            .unwrap(),
+        3
+    );
+    assert_eq!(
+        snapshot
+            .open("edge:WorksAt")
+            .await
+            .unwrap()
+            .count_rows(None)
+            .await
+            .unwrap(),
+        3
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn invalid_raw_graph_batch_has_no_effect() {
+    let (temp, app) = app_for_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+    let commits_before = db.list_commits(Some("main")).await.unwrap().len();
+    let rows_before = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .open("node:Person")
+        .await
+        .unwrap()
+        .count_rows(None)
+        .await
+        .unwrap();
+    drop(db);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(g("/load/ndjson?branch=main&mode=append"))
+                .method(Method::POST)
+                .header("content-type", "application/x-ndjson")
+                .body(Body::from(concat!(
+                    r#"{"type":"Person","data":{"name":"Must Not Land","age":9}}"#,
+                    "\nnot-json"
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+    assert_eq!(
+        db.list_commits(Some("main")).await.unwrap().len(),
+        commits_before
+    );
+    assert_eq!(
+        db.snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .open("node:Person")
+            .await
+            .unwrap()
+            .count_rows(None)
+            .await
+            .unwrap(),
+        rows_before
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn raw_graph_batch_requires_ndjson_and_enforces_body_cap() {
+    let (_temp, app) = app_for_loaded_graph().await;
+    let wrong_type = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(g("/load/ndjson?branch=main"))
+                .method(Method::POST)
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(wrong_type.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+    let oversized = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(g("/load/ndjson?branch=main"))
+                .method(Method::POST)
+                .header("content-type", "application/x-ndjson")
+                .header("content-length", (32_u64 * 1024 * 1024 + 1).to_string())
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn raw_graph_batch_policy_refusal_does_not_poll_body() {
+    let (_temp, app) = app_for_loaded_graph_with_auth_tokens_and_policy(
+        &[("act-bruno", "team-token")],
+        INGEST_CREATE_ONLY_POLICY_YAML,
+    )
+    .await;
+    let polled = Arc::new(AtomicBool::new(false));
+    let body_polled = Arc::clone(&polled);
+    let body = Body::from_stream(futures::stream::once(async move {
+        body_polled.store(true, Ordering::SeqCst);
+        Ok::<Bytes, Infallible>(Bytes::from_static(
+            br#"{"type":"Person","data":{"name":"Denied","age":1}}"#,
+        ))
+    }));
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(g("/load/ndjson?branch=main"))
+                .method(Method::POST)
+                .header("authorization", "Bearer team-token")
+                .header("content-type", "application/x-ndjson")
+                .body(body)
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(
+        !polled.load(Ordering::SeqCst),
+        "Cedar refusal must happen before the NDJSON body is polled"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -741,6 +1902,17 @@ async fn read_endpoint_emits_deprecation_headers() {
         Some("<query>; rel=\"successor-version\""),
         "POST /read must point at /query via `Link` rel=successor-version (RFC 8288)"
     );
+    let body_bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        body_bytes.as_ref(),
+        br#"{"query_name":"get_person","target":{"branch":"main","snapshot":null},"row_count":1,"columns":["p.name","p.age"],"rows":[{"p.name":"Alice","p.age":30}]}"#,
+        "POST /read's legacy response bytes are an indefinite compatibility contract"
+    );
+    let body: Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert!(
+        body.get("graph_commit_id").is_none(),
+        "POST /read has an indefinite byte-stable body contract and must not gain the canonical route's graph_commit_id: {body}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -774,6 +1946,12 @@ async fn query_endpoint_does_not_emit_deprecation_headers() {
     assert!(
         response.headers().get("deprecation").is_none(),
         "POST /query is canonical and must not advertise itself as deprecated"
+    );
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert!(
+        body["graph_commit_id"].as_str().is_some(),
+        "POST /query must expose the pinned graph-commit token used by conditional writes: {body}"
     );
 }
 
@@ -912,6 +2090,7 @@ async fn remote_branch_list_create_merge_flow_works() {
     let merge = BranchMergeRequest {
         source: "feature".to_string(),
         target: Some("main".to_string()),
+        delete_branch: false,
     };
     let (merge_status, merge_body) = json_response(
         &app,
@@ -993,6 +2172,144 @@ async fn remote_branch_delete_flow_works() {
     .await;
     assert_eq!(list_status, StatusCode::OK);
     assert_eq!(list_body["branches"], json!(["main"]));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn branch_merge_delete_branch_deletes_source_after_merge() {
+    let (_temp, app) = app_for_loaded_graph().await;
+
+    let create = BranchCreateRequest {
+        from: Some("main".to_string()),
+        name: "feature".to_string(),
+    };
+    let (create_status, _) = json_response(
+        &app,
+        Request::builder()
+            .uri(g("/branches"))
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&create).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(create_status, StatusCode::OK);
+
+    let change = ChangeRequest {
+        query: MUTATION_QUERIES.to_string(),
+        name: Some("insert_person".to_string()),
+        params: Some(json!({ "name": "Zoe", "age": 33 })),
+        branch: Some("feature".to_string()),
+    };
+    let (change_status, _) = json_response(
+        &app,
+        Request::builder()
+            .uri(g("/change"))
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&change).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(change_status, StatusCode::OK);
+
+    let merge = BranchMergeRequest {
+        source: "feature".to_string(),
+        target: Some("main".to_string()),
+        delete_branch: true,
+    };
+    let (merge_status, merge_body) = json_response(
+        &app,
+        Request::builder()
+            .uri(g("/branches/merge"))
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&merge).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(merge_status, StatusCode::OK);
+    assert_eq!(merge_body["outcome"], "fast_forward");
+    assert_eq!(merge_body["branch_deleted"], true);
+    assert!(merge_body["branch_delete_error"].is_null());
+
+    let (list_status, list_body) = json_response(
+        &app,
+        Request::builder()
+            .uri(g("/branches"))
+            .method(Method::GET)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(list_status, StatusCode::OK);
+    assert_eq!(list_body["branches"], json!(["main"]));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn branch_merge_delete_branch_refusal_is_non_fatal() {
+    let (_temp, app) = app_for_loaded_graph().await;
+
+    for (from, name) in [("main", "feature"), ("feature", "feature-child")] {
+        let create = BranchCreateRequest {
+            from: Some(from.to_string()),
+            name: name.to_string(),
+        };
+        let (create_status, _) = json_response(
+            &app,
+            Request::builder()
+                .uri(g("/branches"))
+                .method(Method::POST)
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&create).unwrap()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(create_status, StatusCode::OK);
+    }
+
+    // No writes on `feature`, so the merge is `already_up_to_date` — the
+    // deletion must still be attempted (the "already merged, clean me up"
+    // case) and its refusal (a dependent descendant branch) must be reported
+    // without failing the request.
+    let merge = BranchMergeRequest {
+        source: "feature".to_string(),
+        target: Some("main".to_string()),
+        delete_branch: true,
+    };
+    let (merge_status, merge_body) = json_response(
+        &app,
+        Request::builder()
+            .uri(g("/branches/merge"))
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&merge).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(merge_status, StatusCode::OK);
+    assert_eq!(merge_body["outcome"], "already_up_to_date");
+    assert_eq!(merge_body["branch_deleted"], false);
+    assert!(
+        merge_body["branch_delete_error"]
+            .as_str()
+            .unwrap()
+            .contains("feature-child")
+    );
+
+    let (list_status, list_body) = json_response(
+        &app,
+        Request::builder()
+            .uri(g("/branches"))
+            .method(Method::GET)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(list_status, StatusCode::OK);
+    assert_eq!(
+        list_body["branches"],
+        json!(["feature", "feature-child", "main"])
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1099,18 +2416,15 @@ query vector_search_string($q: String) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn change_conflict_returns_manifest_conflict_409() {
-    // A write that races with another writer surfaces as HTTP 409 with
-    // a structured `manifest_conflict` body — `table_key`, `expected`,
-    // and `actual` — so clients can detect-and-retry without parsing
-    // the message.
+async fn change_long_lived_handle_refreshes_before_preparing_write() {
+    // A handle that merely predates another committed write is not stale
+    // authority: open_write_txn probes the manifest incarnation and prepares
+    // from the fresh head. ReadSetChanged is reserved for movement *during* an
+    // already-prepared attempt (covered by the concurrent test below).
     let temp = init_loaded_graph().await;
     let graph = graph_path(temp.path());
 
-    // Build the server first so its handle pins the pre-mutation manifest
-    // version. Then advance the manifest from outside the server. The
-    // server's next /change call will capture stale `expected_versions`
-    // (from its still-pinned snapshot) and the publisher's CAS rejects.
+    // Build the server first, then advance the graph through another handle.
     let state = AppState::open(graph.to_string_lossy().to_string())
         .await
         .unwrap();
@@ -1154,34 +2468,17 @@ async fn change_conflict_returns_manifest_conflict_409() {
     )
     .await;
 
-    assert_eq!(status, StatusCode::CONFLICT);
-    let error: ErrorOutput = serde_json::from_value(body).unwrap();
-    assert_eq!(error.code, Some(omnigraph_server::api::ErrorCode::Conflict));
-    let conflict = error
-        .manifest_conflict
-        .expect("publisher CAS rejection must populate manifest_conflict body");
-    assert_eq!(conflict.table_key, "node:Person");
-    assert!(
-        conflict.actual > conflict.expected,
-        "actual ({}) should be ahead of expected ({})",
-        conflict.actual,
-        conflict.expected,
-    );
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["affected_nodes"], 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn change_concurrent_inserts_same_key_serialize_without_409() {
-    // PR 2 Phase 2 (MR-686): pin the design fix for the same-key
-    // concurrency hazard. Pre-fix, in-process concurrent inserts on
-    // the same `(table, branch)` rejected with 409 manifest_conflict
-    // because `ensure_expected_version` fired before the per-table
-    // queue was acquired and saw Lance HEAD already advanced by a
-    // peer writer. Post-fix, Insert/Merge skip the strict pre-stage
-    // check (see `MutationOpKind::strict_pre_stage_version_check`);
-    // the queue serializes commit_staged; Lance's natural rebase
-    // handles the in-flight stage; the publisher's CAS on a fresh
-    // per-branch snapshot under the queue catches genuine cross-
-    // process drift.
+    // RFC-022 preservation guard: concurrent retryable inserts still all
+    // succeed, but not by rebasing an already-validated Lance transaction.
+    // The coarse branch gate serializes effects; a waiter whose authority
+    // token changed discards its complete attempt and reprepares from the
+    // winner's committed branch state.
     //
     // This test spawns N concurrent /change inserts on a single
     // node type and asserts: every request returns 200 (no 409),
@@ -1270,36 +2567,10 @@ async fn change_concurrent_inserts_same_key_serialize_without_409() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn change_concurrent_updates_same_key_serialize_via_publisher_cas() {
-    // Pin Update RYW semantics under in-process concurrency on the same
-    // `(table, branch)`. With per-table queue serialization and op-kind-aware
-    // drift detection at commit time, exactly one of N concurrent UPDATEs
-    // on the same row commits; the rest are rejected as 409 manifest_conflict.
-    //
-    // Pre-fix bug class: in `MutationStaging::commit_all`, after queue
-    // acquisition, the staged Lance transaction is handed straight to
-    // `commit_staged`. For a writer whose staged dataset is at V0 but
-    // Lance HEAD has advanced to V1 (because the queue's prior winner
-    // already published), Lance's transaction conflict resolver fires
-    // `RetryableCommitConflict` on Update vs Update on the same row.
-    // That error gets wrapped as `OmniError::Lance(<string>)` and the
-    // API surfaces it as **500 internal**, not 409. Users see "internal
-    // server error" instead of a retryable conflict, breaking the
-    // documented 409 contract for in-process drift.
-    //
-    // Post-fix invariant: `commit_all` does an op-kind-aware drift check
-    // before each `commit_staged`. For tables whose tracked op_kind has
-    // `strict_pre_stage_version_check() == true` (Update / Delete /
-    // SchemaRewrite), if the staged dataset's version doesn't match the
-    // fresh manifest pin, return `OmniError::manifest_expected_version_mismatch`
-    // → 409 ExpectedVersionMismatch. The N-1 losers see a clean 409
-    // before Lance's commit_staged ever runs.
-    //
-    // Why correct-by-design: closing the class "Lance internal conflict
-    // surfaces as 500 instead of 409" rather than mapping the specific
-    // Lance error variant. The drift check fires at the right architectural
-    // layer (engine boundary, under the queue) and respects the existing
-    // `MutationOpKind` policy.
+async fn change_concurrent_updates_same_key_return_typed_pre_effect_conflicts() {
+    // Strict read-modify-write attempts are never automatically reprepared.
+    // Exactly one concurrent UPDATE commits; once it changes branch authority,
+    // every waiter reports a typed 409 before any of its Lance effects begin.
     let temp = init_loaded_graph().await;
     let graph = graph_path(temp.path());
     let state = AppState::open(graph.to_string_lossy().to_string())
@@ -1373,27 +2644,37 @@ async fn change_concurrent_updates_same_key_serialize_via_publisher_cas() {
     assert_eq!(
         ok_count,
         1,
-        "expected exactly one update to commit and N-1 to receive 409 manifest_conflict \
-         (op-kind-aware drift check rejects stale-V0 staged datasets at commit_all entry). \
-         Got {} OK + {} 409 + {} other. \
-         Pre-fix symptom: 1 OK + (N-1) x 500 because Lance's RetryableCommitConflict for \
-         Update vs Update on the same row bubbles up as `OmniError::Lance(<string>)` and \
-         the API maps it to 500 internal, not 409. Statuses: {:?}",
+        "expected exactly one update to commit and N-1 to receive typed 409 conflicts \
+         before effects. Got {} OK + {} 409 + {} other. Statuses: {:?}",
         ok_count,
         conflict_count,
         statuses.len() - ok_count - conflict_count,
         statuses,
     );
+
+    for (status, bytes) in &results {
+        if *status != StatusCode::CONFLICT {
+            continue;
+        }
+        let error: ErrorOutput = serde_json::from_slice(bytes).unwrap();
+        assert_eq!(error.code, Some(omnigraph_server::api::ErrorCode::Conflict));
+        let conflict = error
+            .read_set_conflict
+            .expect("strict OCC loser must include structured read-set authority");
+        assert_eq!(conflict.member, "graph_head:main");
+        assert_ne!(conflict.actual, conflict.expected);
+        assert!(error.manifest_conflict.is_none());
+        assert!(error.recovery_required.is_none());
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn change_disjoint_table_concurrency_succeeds_at_http_level() {
-    // HTTP-level pin for MR-686's disjoint-table promise: concurrent /change
-    // requests touching different node types must coexist without admission
-    // rejection or publisher-CAS conflict. The bench harness measures
-    // throughput; this test is the regression sentinel that catches a
-    // future change which accidentally re-introduces graph-wide
-    // serialization on the disjoint path.
+async fn change_disjoint_table_concurrency_succeeds_under_branch_occ_gate() {
+    // RFC-022 intentionally serializes effect publication per branch because
+    // graph-head authority protects validation dependencies across tables.
+    // Disjoint retryable inserts must nevertheless all succeed through bounded
+    // full-attempt repreparation, without admission rejection or a user-visible
+    // publisher conflict.
     //
     // Setup: test.jsonl seeds 4 Persons + 2 Companies. Spawn N=4 concurrent
     // /change inserts on `node:Person` and N=4 concurrent inserts on
@@ -1650,4 +2931,318 @@ async fn ingest_per_actor_admission_cap_returns_429() {
             results[*i].1,
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mutate_graph_commit_precondition_issue_365() {
+    // GitHub #365: `Omnigraph-If-Graph-Commit: <commit_id>` makes `mutate` a
+    // single-round-trip compare-and-swap. A caller that read the branch at
+    // head X must be rejected atomically (412, structured
+    // `precondition_failure`, zero effect) once the head has advanced past
+    // X; a precondition naming the current head passes.
+    fn mutate_request(body: &Value, expected_commit: Option<&str>) -> Request<Body> {
+        let path = if expected_commit.is_some() {
+            "/mutate/if-graph-commit"
+        } else {
+            "/mutate"
+        };
+        let mut builder = Request::builder()
+            .uri(g(path))
+            .method(Method::POST)
+            .header("content-type", "application/json");
+        if let Some(commit_id) = expected_commit {
+            builder = builder.header("omnigraph-if-graph-commit", commit_id);
+        }
+        builder
+            .body(Body::from(serde_json::to_vec(body).unwrap()))
+            .unwrap()
+    }
+    async fn alice_age(app: &axum::Router) -> Value {
+        let (status, out) = json_response(
+            app,
+            Request::builder()
+                .uri(g("/query"))
+                .method(Method::POST)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "query": FIND_PERSON_GQ,
+                        "params": { "name": "Alice" },
+                        "branch": "main",
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        out["rows"][0]["p.age"].clone()
+    }
+    async fn head_commit_id(app: &axum::Router) -> String {
+        let (status, out) = json_response(
+            app,
+            Request::builder()
+                .uri(g("/commits?branch=main"))
+                .method(Method::GET)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        out["commits"]
+            .as_array()
+            .expect("commit list")
+            .iter()
+            .max_by_key(|commit| commit["manifest_version"].as_u64().unwrap())
+            .expect("loaded graph has at least one commit")["graph_commit_id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    let (_temp, app) = app_for_loaded_graph().await;
+    let stale_head = head_commit_id(&app).await;
+
+    let conditional_body = json!({
+        "query": MUTATION_QUERIES,
+        "name": "set_age",
+        "params": { "name": "Alice", "age": 77 },
+        "branch": "main",
+    });
+    let (status, _) = json_response(
+        &app,
+        Request::builder()
+            .uri(g("/mutate/if-graph-commit"))
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&conditional_body).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "the conditional capability route must require its header"
+    );
+    for invalid in ["W/\"weak\"", "\"quoted\"", "one,two"] {
+        let (status, _) = json_response(
+            &app,
+            Request::builder()
+                .uri(g("/mutate/if-graph-commit"))
+                .method(Method::POST)
+                .header("content-type", "application/json")
+                .header("omnigraph-if-graph-commit", invalid)
+                .body(Body::from(serde_json::to_vec(&conditional_body).unwrap()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "entity-tag/list syntax must be refused: {invalid}"
+        );
+    }
+    let mut duplicate = Request::builder()
+        .uri(g("/mutate/if-graph-commit"))
+        .method(Method::POST)
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&conditional_body).unwrap()))
+        .unwrap();
+    duplicate.headers_mut().append(
+        "omnigraph-if-graph-commit",
+        HeaderValue::from_static("first"),
+    );
+    duplicate.headers_mut().append(
+        "omnigraph-if-graph-commit",
+        HeaderValue::from_static("second"),
+    );
+    let (status, _) = json_response(&app, duplicate).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "duplicate graph-head preconditions must be refused"
+    );
+    let (status, _) = json_response(
+        &app,
+        Request::builder()
+            .uri(g("/mutate"))
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .header("omnigraph-if-graph-commit", &stale_head)
+            .body(Body::from(serde_json::to_vec(&conditional_body).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "the ordinary mutation route must refuse an unsafe optional CAS header"
+    );
+    assert_eq!(alice_age(&app).await, 30, "both refusals are pre-effect");
+
+    // Writer A claims first (plain mutate) — the head advances past the
+    // commit both writers read.
+    let (status, body) = json_response(
+        &app,
+        mutate_request(
+            &json!({
+                "query": MUTATION_QUERIES,
+                "name": "set_age",
+                "params": { "name": "Alice", "age": 31 },
+                "branch": "main",
+            }),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "writer A's plain mutate: {body}");
+
+    // Writer B lost the race: its precondition names the now-stale head, so
+    // the store must reject before any effect.
+    let (status, body) = json_response(
+        &app,
+        mutate_request(
+            &json!({
+                "query": MUTATION_QUERIES,
+                "name": "set_age",
+                "params": { "name": "Alice", "age": 52 },
+                "branch": "main",
+            }),
+            Some(&stale_head),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::PRECONDITION_FAILED,
+        "stale graph-commit precondition must be rejected with 412, got {status}: {body}"
+    );
+    let error: ErrorOutput = serde_json::from_value(body).unwrap();
+    // code stays None: closed wire contract (`recovery_required` precedent).
+    assert_eq!(error.code, None);
+    let failure = error
+        .precondition_failure
+        .expect("412 body must carry structured precondition_failure details");
+    assert_eq!(failure.expected, stale_head);
+    let current_head = head_commit_id(&app).await;
+    assert_eq!(failure.actual.as_deref(), Some(current_head.as_str()));
+    assert!(error.read_set_conflict.is_none());
+
+    // The rejected write had no effect: writer A's claim survives.
+    assert_eq!(alice_age(&app).await, 31);
+
+    // The read response itself carries the graph commit id of the snapshot
+    // the rows came from, so the caller needs no separate id fetch.
+    let (status, read_body) = json_response(
+        &app,
+        Request::builder()
+            .uri(g("/query"))
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "query": FIND_PERSON_GQ,
+                    "params": { "name": "Alice" },
+                    "branch": "main",
+                }))
+                .unwrap(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let welded_id = read_body["graph_commit_id"]
+        .as_str()
+        .expect("read response must carry the snapshot's graph_commit_id")
+        .to_string();
+    assert_eq!(
+        welded_id, current_head,
+        "the read's id must equal the branch head it was served from"
+    );
+
+    // A precondition naming the CURRENT head passes — the CAS succeeds in a
+    // single round trip, using the id the read itself supplied.
+    let (status, body) = json_response(
+        &app,
+        mutate_request(
+            &json!({
+                "query": MUTATION_QUERIES,
+                "name": "set_age",
+                "params": { "name": "Alice", "age": 33 },
+                "branch": "main",
+            }),
+            Some(&welded_id),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "graph-commit precondition naming the current head must pass: {body}"
+    );
+    assert_receipt_commit_matches_get(&app, &body).await;
+    assert_eq!(alice_age(&app).await, 33);
+
+    // A newly forked branch has no branch-owned graph-head row yet. Its read
+    // response must nevertheless expose main's inherited effective head — the
+    // same value the engine compares for the branch's conditional first write.
+    let inherited_head = head_commit_id(&app).await;
+    let create = BranchCreateRequest {
+        from: Some("main".to_string()),
+        name: "fresh-cas".to_string(),
+    };
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .uri(g("/branches"))
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&create).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "create fresh CAS branch: {body}");
+
+    let (status, fresh_read) = json_response(
+        &app,
+        Request::builder()
+            .uri(g("/query"))
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "query": FIND_PERSON_GQ,
+                    "params": { "name": "Alice" },
+                    "branch": "fresh-cas",
+                }))
+                .unwrap(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "read fresh CAS branch: {fresh_read}"
+    );
+    assert_eq!(fresh_read["graph_commit_id"], json!(inherited_head));
+
+    let (status, body) = json_response(
+        &app,
+        mutate_request(
+            &json!({
+                "query": MUTATION_QUERIES,
+                "name": "set_age",
+                "params": { "name": "Alice", "age": 35 },
+                "branch": "fresh-cas",
+            }),
+            Some(&inherited_head),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "fresh branch must accept its read token on the first write: {body}"
+    );
 }

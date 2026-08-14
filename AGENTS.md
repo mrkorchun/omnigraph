@@ -16,9 +16,9 @@ Tools that support `@`-imports (Claude Code) auto-include all three files via th
 
 `CLAUDE.md` is a symlink to this file — there is exactly one source of truth. Edit `AGENTS.md`.
 
-**Version surveyed:** 0.8.1
-**Workspace crates:** `omnigraph-compiler`, `omnigraph` (engine), `omnigraph-policy`, `omnigraph-api-types` (shared HTTP wire DTOs), `omnigraph-cluster`, `omnigraph-cli`, `omnigraph-server`
-**Storage substrate:** Lance 9.x (columnar, versioned, branchable; 9.0.0-beta.15 git-rev pin until 9.0.0 stable)
+**Version surveyed:** 0.10.0
+**Workspace crates:** `omnigraph-compiler`, `omnigraph-storage` (shared control-object storage), `omnigraph` (engine), `omnigraph-policy`, `omnigraph-api-types` (shared HTTP wire DTOs), `omnigraph-cluster`, `omnigraph-cli`, `omnigraph-server`
+**Storage substrate:** Lance 10.0.0 (columnar, versioned, branchable; crates.io release)
 **License:** MIT
 **Toolchain:** Rust stable, edition 2024
 
@@ -28,11 +28,25 @@ Tools that support `@`-imports (Claude Code) auto-include all three files via th
 
 OmniGraph is a typed property-graph engine built as a coordination layer over many Lance datasets. Highlights:
 
-- **Storage**: per node/edge type a separate Lance dataset; multi-dataset commits coordinated atomically through one `__manifest` table.
-- **Languages**: a `.pg` schema language and a `.gq` query language, both Pest-based, with a typed IR.
+- **Storage**: each node/edge table lifetime is a separate Lance dataset; one
+  internal `__manifest` schema-v6 publication makes every affected table
+  version visible atomically. V5 supplies immutable stable-table/incarnation
+  identity and identity-derived paths; v6 adds exact non-null physical `id`
+  fencing through Lance's unenforced primary-key metadata. `table_key` remains
+  only the current public alias.
+- **Languages**: a `.pg` schema language and a `.gq` query language, both Pest-based, with typed IR. Persisted accepted SchemaIR v2 owns one graph identity domain, one monotonic no-reuse allocator, rename-stable type/property IDs, and node/edge table-incarnation IDs.
 - **Multi-modal querying**: vector ANN (`nearest`), full-text (`search`/`fuzzy`/`match_text`/`bm25`), Reciprocal Rank Fusion (`rrf`), and graph traversal (`Expand`, anti-join `not { … }`) in one runtime.
 - **Branches and commits across the whole graph**: Git-style — every successful publish appends to a commit DAG; merges are three-way at the row level.
-- **Atomic per-query writes**: `mutate_as` and `load` accumulate insert/update batches into an in-memory `MutationStaging.pending` per touched table; one `stage_*` + `commit_staged` per table runs at end-of-query, then `ManifestBatchPublisher::publish` commits the manifest atomically with per-table `expected_table_versions` CAS. A mid-query failure leaves Lance HEAD untouched on staged tables — no drift, no run state machine, no staging branches. Deletes stage through the same path (MR-A: `stage_delete` via Lance 7.0 `DeleteBuilder::execute_uncommitted`), so they no longer advance Lance HEAD inline. D₂ at parse time is a deliberate boundary — one mutation query is constructive (insert/update) XOR destructive (delete) — so read-your-writes within a query stays unambiguous and each table commits at most one version; compose mixed operations via separate mutations, or a branch for single-commit atomicity.
+- **Atomic per-query writes**: `mutate_as` and `load` stage one exact Lance
+  transaction per touched table, arm an identity-bearing ordinary recovery-v9
+  sidecar, and publish all achieved table pointers plus graph lineage in one
+  manifest CAS. The request is acknowledged only after that graph commit is
+  durable and visible.
+- **High-rate ingestion**: bounded graph-level NDJSON is a thin transport
+  facade over the shared Load transaction. It accepts logical node/edge rows, never
+  physical datasets or per-table lanes. OmniGraph owns no MemWAL firehose,
+  token ledger, stream lifecycle, or durable-but-not-visible acknowledgement.
+  See [Streaming ingestion after RFC-026](docs/dev/wal-removal.md).
 - **HTTP server**: Axum + utoipa OpenAPI, bearer auth (SHA-256 hashed, optional AWS Secrets Manager). Cedar policy enforcement is engine-wide — every `_as` writer calls `Omnigraph::enforce(action, scope, actor)`, so HTTP, CLI, and embedded SDK consumers all hit the same gate. **Cluster-only boot** (RFC-011): the server always boots from a cluster directory (`--cluster <dir | s3://…>`, RFC-005) and serves N graphs (N ≥ 1) under multi-graph routes (`/graphs/{graph_id}/...` + read-only `GET /graphs` enumeration); there are no single-graph flat routes and no positional-URI boot. Per-graph + server-level Cedar policies. Runtime add/remove (`POST /graphs`, `DELETE /graphs/{id}`) is not exposed — operators run `cluster apply` and restart.
 - **CLI** with two-surface config (RFC-007/008): the team-owned cluster directory (`cluster.yaml`) plus the per-operator `~/.omnigraph/config.yaml` (servers, clusters, credentials, actor, profiles, aliases, defaults). Graphs are addressed via `--store`/`--server`/`--cluster`/`--profile`/operator defaults (RFC-011). Multi-format output (json/jsonl/csv/kv/table).
 
@@ -50,10 +64,10 @@ CLI (omnigraph)        HTTP Server (omnigraph-server, Axum)
            omnigraph-compiler  ── Pest grammars, catalog, IR, lowering, lint, migration plan
                       │
                       ▼
-           omnigraph (engine)  ── ManifestCoordinator, CommitGraph, RunRegistry, GraphIndex (CSR/CSC), exec
+           omnigraph (engine)  ── ManifestCoordinator, CommitGraph, GraphIndex (CSR/CSC), exec
                       │
                       ▼
-              Lance 7.x         ── columnar Arrow, fragments, per-dataset versions/branches, indexes
+              Lance 10.x        ── columnar Arrow, fragments, per-dataset versions/branches, indexes
                       │
                       ▼
         Object store (file / s3 / RustFS / MinIO / S3-compat)
@@ -72,6 +86,7 @@ Full diagram and concurrency model: [docs/dev/architecture.md](docs/dev/architec
 | **Architectural invariants & deny-list (read before any non-trivial proposal or review)** | **[docs/dev/invariants.md](docs/dev/invariants.md)** |
 | **Lance docs index — fetch upstream Lance docs by problem domain** | **[docs/dev/lance.md](docs/dev/lance.md)** |
 | **Test coverage map — what's covered, what helpers to reuse, before-every-task checklist** | **[docs/dev/testing.md](docs/dev/testing.md)** |
+| The canon — linear internal narrative of the whole system (philosophy, read/write/crash walkthroughs, exclusions, risk register, roadmap) | [docs/dev/canon.md](docs/dev/canon.md) |
 | Architecture, L1/L2 framing, concurrency model | [docs/dev/architecture.md](docs/dev/architecture.md) |
 | Storage layout, `__manifest` schema, URI schemes, S3 env vars | [docs/user/concepts/storage.md](docs/user/concepts/storage.md) |
 | `.pg` schema language, types, constraints, annotations, migration planning | [docs/user/schema/index.md](docs/user/schema/index.md) |
@@ -89,6 +104,8 @@ Full diagram and concurrency model: [docs/dev/architecture.md](docs/dev/architec
 | Transactions and atomicity (per-query atomic; branches as multi-query transactions) | [docs/user/branching/transactions.md](docs/user/branching/transactions.md) |
 | Direct-publish write path (staging, D2, recovery sidecars; the former Run state machine) | [docs/dev/writes.md](docs/dev/writes.md) |
 | Three-way merge and conflict kinds | [docs/dev/merge.md](docs/dev/merge.md) |
+| Branch-merge complexity / timeout diagnosis (OmniGraph + Lance) | [docs/dev/merge-complexity.md](docs/dev/merge-complexity.md) |
+| Merge latency L1–L3 implementation plan | [docs/dev/merge-l1-l3-plan.md](docs/dev/merge-l1-l3-plan.md) |
 | Diff / change feed (`diff_between`, `diff_commits`) | [docs/user/branching/changes.md](docs/user/branching/changes.md) |
 | Query execution, mutation execution, bulk loader, `load` vs `ingest` | [docs/dev/execution.md](docs/dev/execution.md) |
 | `optimize` (compaction) and `cleanup` (version GC) | [docs/user/operations/maintenance.md](docs/user/operations/maintenance.md) |
@@ -106,7 +123,7 @@ Full diagram and concurrency model: [docs/dev/architecture.md](docs/dev/architec
 | CI / release workflows | [docs/dev/ci.md](docs/dev/ci.md) |
 | Branch protection policy (declarative, applied via `scripts/apply-branch-protection.sh`) | [docs/dev/branch-protection.md](docs/dev/branch-protection.md) |
 | Constants & tunables cheat sheet | [docs/user/reference/constants.md](docs/user/reference/constants.md) |
-| RFC process — public contribution track (substantial / irreversible changes) | [docs/rfcs/README.md](docs/rfcs/README.md) |
+| RFC process — public contribution and maintainer design-series tracks | [docs/rfcs/README.md](docs/rfcs/README.md) |
 | Per-version release notes | [docs/releases/](docs/releases/) |
 
 ---
@@ -147,7 +164,7 @@ These are architectural rules that need to be in scope on every change. They're 
 3. **Mutations are atomic at the commit boundary.** Multi-statement change queries publish one commit. Don't commit per-statement.
 4. **Bearer-token plaintext never persists in process memory.** Tokens are hashed at startup; auth uses constant-time comparison; the actor id is server-resolved from the hash match and must not be settable by the client.
 5. **Reads always see the current index state for the branch they're reading.** Indexes track the branch head, not historical snapshots. If you change index lifecycle, preserve this guarantee.
-6. **Stable type IDs survive renames.** Schema migration relies on identity that's stable across rename — don't mint new IDs on rename.
+6. **Stable schema identity survives renames, not lifetimes.** Accepted SchemaIR v2 is the authority for graph-domain type/property IDs and node/edge table incarnations. A supported rename preserves those IDs, the dataset, path, and Lance history; drop/re-add mints a new declaration identity, incarnation, path, and version sequence. Never infer identity from an alias, path, Lance version, field ID, or branch ref.
 7. **Logical contract over physical state.** Physical state (index coverage, fragment layout, compaction versions, staged writes) is derived and rebuildable; it must never fail a logical operation. Check preconditions against logical state and let reconciliation converge the physical state idempotently — genuine logical conflicts still fail loudly. This is the rule rules 1–6 instantiate; full statement and applications in [docs/dev/invariants.md](docs/dev/invariants.md).
 8. **One source of truth, cheaply derived.** Lance and the manifest are the source of truth; runtime state is a derived view of them. Don't maintain a parallel copy that can drift, and don't re-derive a view from cold storage on every call (that makes cost grow with history). Hold it warm, refresh with a cheap probe.
 
@@ -184,7 +201,8 @@ Rust stable workspace (edition 2024). `protoc` is a build dependency (`brew inst
 
 ```bash
 cargo build --workspace --locked              # build everything
-cargo test  --workspace --locked              # the canonical CI gate (matches CI exactly)
+cargo test --workspace --locked --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints
+                                                # canonical CI test graph (one feature-superset build)
 cargo run -p omnigraph-cli -- <args>          # run the `omnigraph` CLI from source
 cargo run -p omnigraph-server -- --cluster <dir|s3://...> --bind 0.0.0.0:8080   # run the server from source
 
@@ -193,16 +211,14 @@ cargo test -p omnigraph-engine --test traversal           # one integration-test
 cargo test -p omnigraph-engine --test writes concurrent   # one test fn by name substring
 cargo test -p omnigraph-engine some_inline_test -- --nocapture   # show stdout
 
-# Feature-gated suites (each is its own job in CI, not part of the default run)
+# Focused feature-gated suites
 cargo test -p omnigraph-engine --features failpoints --test failpoints   # fault injection
-cargo build -p omnigraph-server --features aws   # AWS Secrets Manager bearer-token source
+cargo test -p omnigraph-server --features aws    # AWS Secrets Manager bearer-token source (CI runs this suite too)
 ```
 
 S3-backed tests (`s3_storage`, and the S3 paths in server/CLI system tests) **skip** unless `OMNIGRAPH_S3_TEST_BUCKET` + `AWS_*` (incl. `AWS_ENDPOINT_URL_S3` for non-AWS) are set; CI runs them against containerized RustFS. To run RustFS/MinIO yourself, see [docs/user/deployment.md](docs/user/deployment.md) → *Testing against S3 locally*.
 
-CI does **not** run `clippy` or `rustfmt` as gates — but `cargo test --workspace --locked` is the exact gate, so run it before pushing. Two non-test CI checks: `scripts/check-agents-md.sh` (doc cross-link integrity — run it after moving/renaming docs) and OpenAPI drift (`crates/omnigraph-server/tests/openapi.rs` regenerates `openapi.json`; set `OMNIGRAPH_UPDATE_OPENAPI=1` to update the checked-in copy when a server/API change is intentional).
-
----
+CI runs `cargo fmt --all --check` and `cargo clippy --workspace --all-targets --locked -- -D warnings -W clippy::dbg_macro` (default features, then the failpoints superset) as PR-time gates (`Format (rustfmt)` and `Lint (clippy)`); run both before pushing. Lint levels stay `warn` in the workspace table and only CI denies; toolchain-pin and cache mechanics are commented in `.github/workflows/ci.yml`. The workspace allows `collapsible_if` and `too_many_arguments` (root `Cargo.toml`). CI's canonical test graph is `cargo test --workspace --locked --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints`, which compiles the current tree once with failpoint hooks present but inert unless a test configures one; run it before pushing. The immediate-predecessor storage-format fence and the default/failpoint configured-RustFS graphs are separate parallel jobs. Two non-test CI checks are `scripts/check-agents-md.sh` (doc cross-link integrity — run it after moving/renaming docs) and OpenAPI drift (`crates/omnigraph-server/tests/openapi.rs` regenerates `openapi.json`; set `OMNIGRAPH_UPDATE_OPENAPI=1` to update the checked-in copy when a server/API change is intentional).
 
 ## Quick-reference flows
 
@@ -252,22 +268,25 @@ omnigraph policy explain --cluster ./company-brain --graph knowledge --actor act
 |---|---|---|
 | Columnar storage on object store | ✅ Arrow/Lance | URI normalization, S3 env-var plumbing |
 | Per-dataset versioning + time travel | ✅ | `snapshot_at_version`, `entity_at`, snapshot-pinned reads across many tables |
-| Per-dataset branches | ✅ | **Graph-level** branches (atomic across all sub-tables), lazy fork, system branch filtering |
-| Atomic single-dataset commits | ✅ | **Multi-table publish via three layers**, NOT a single Lance primitive: (1) per-table Lance `commit_staged` for the data write, (2) `__manifest` row-level CAS via `ManifestBatchPublisher` for cross-table ordering, (3) the open-time recovery sweep for the residual gap between (1) and (2). All three layers ship; the five migrated writers (`MutationStaging::finalize`, `schema_apply`, `branch_merge`, `ensure_indices`, `optimize_all_tables`) write a `__recovery/{ulid}.json` sidecar before Phase B and delete it after Phase C. The next `Omnigraph::open` (gated on `OpenMode::ReadWrite`) runs the sweep in `db/manifest/recovery.rs`: classify, decide all-or-nothing per sidecar, roll forward via single `ManifestBatchPublisher::publish` or roll back via `Dataset::restore` followed by a manifest publish of the restored version (so both directions converge to `manifest == HEAD` — no residual drift), and record an audit row in `_graph_commit_recoveries.lance` (queryable via `omnigraph commit list --filter actor=omnigraph:recovery`). The write entry points (`load_as`, `mutate_as`, `apply_schema_as`, `branch_merge_as`) and `refresh` additionally run an in-process roll-forward-only heal (serialized against live writers via the per-table write queues), so a long-lived server converges on its next write without restart; only rollback-eligible sidecars still defer to the next read-write open (a future background reconciler's goal). Engine writes route through a sealed `TableStorage` trait (`db.storage()`) exposing only `stage_*` + `commit_staged` + reads; the sole inline-commit residual (`create_vector_index`) is split onto a separate sealed `InlineCommitResidual` trait reached via `db.storage_inline_residual()` (MR-854), so the default surface cannot couple a write with a HEAD advance — §1 holds by construction. `delete` migrated to the staged path in MR-A (`stage_delete` via Lance 7.0 `DeleteBuilder::execute_uncommitted`, [#6658](https://github.com/lance-format/lance/issues/6658)); `create_vector_index` stays inline until upstream Lance ships a public two-phase API ([#6666](https://github.com/lance-format/lance/issues/6666)); `LoadMode::Overwrite` uses Lance `Overwrite` staged transactions. |
-| Compaction (`compact_files`) + reindex (`optimize_indices`) | ✅ | `omnigraph optimize` orchestrates over all node/edge tables, bounded concurrency; per table runs `compact_files` **then Lance `optimize_indices`** (folds appended/rewritten fragments back into existing indexes — incremental merge, not retrain) and **publishes the resulting version to `__manifest`** (so the manifest tracks the Lance HEAD — required for reads to observe the work and for schema apply / strict writes to pass their HEAD-vs-manifest precondition), under the per-`(table, main)` write queue with `SidecarKind::Optimize` recovery coverage spanning both ops; **commits even with no compaction work if index coverage is stale**; **refuses on an unrecovered graph**; **skips uncovered HEAD > manifest drift** with `DriftNeedsRepair`; **compacts blob-bearing tables** (the pre-9 `LANCE_SUPPORTS_BLOB_COMPACTION` skip was removed once Lance 8.0.0+ shipped blob-v2 compaction — see [docs/dev/invariants.md](docs/dev/invariants.md) Known Gaps) |
+| Blob-v2 cell access | ✅ Blob-v2 descriptors and range readers | `read_blob_at` selects one logical node/edge Blob cell at an exact branch or snapshot without exposing Lance placement. Managed readers are bounded and snapshot-pinned; HTTP GET/explicit HEAD adds ranges, conditionals, and a two-chunk backpressure envelope. CLI `blob get/stat` adds raw managed bytes and descriptor metadata: whole-object external stat is zero-I/O, GET never follows the reference, and ranged external delivery fails closed. Identity ambiguity and malformed state fail closed. See [RFC-033](docs/rfcs/0033-blob-management.md), [execution internals](docs/dev/execution.md), and the [CLI guide](docs/user/cli/index.md#reading-blob-cells). |
+| Stable schema + table identity | — | Persisted accepted SchemaIR v2 owns one graph identity domain and a shared monotonic no-reuse allocator for nonzero type, property, and table-incarnation IDs. Internal manifest schema v5 introduced identity-keyed registration, version, tombstone, OCC, recovery ownership, and identity-derived node/edge paths; v6 preserves that contract and adds exact non-null `id` fencing. `table_key` is a mutable alias: rename preserves identity/path/history, while drop/re-add mints a new lifetime. This binary serves exactly v6; released v4 graphs rebuild by export/init/load, and abandoned unreleased v7-v19 roots are refused as future formats. |
+| Per-dataset branches | ✅ | **Graph-level** refs are logically atomic through authoritative `__manifest` `BranchContents`; native create/delete crash gaps are classified and reclaimed under a single-writer-process boundary; live names are path-prefix-disjoint; data-table forks are lazy; system branches are filtered |
+| Atomic single-dataset commits | ✅ | **Multi-table publication has three layers:** each participant's Lance effect, one identity-aware `__manifest` CAS for graph visibility, and ordinary recovery-v9 for the gap. Mutation/Load, SchemaApply, BranchMerge, EnsureIndices, and Optimize arm identity-bearing sidecars before their first durable effect. Every pin, effect, registration, rename, tombstone, and output carries stable table/incarnation identity. Writers pre-mint exact Lance transactions where available, confirm complete outcomes before publication, and fail closed on ambiguous or foreign effects. Completed recovery is audited in `_graph_commit_recoveries.lance`. |
+| Compaction (`compact_files`) + reindex (`optimize_indices`) | ✅ | `omnigraph optimize` orchestrates over all node/edge tables with bounded physical concurrency and one graph visibility envelope. Under schema → main → every accepted-catalog table gate it loads one identity-bound catalog/snapshot, skips uncovered HEAD drift, and plans only productive tables. One identity-bearing recovery-v9 `SidecarKind::Optimize` envelope pins the complete set before any table HEAD movement; each productive task runs `compact_files`, Lance `optimize_indices` (incremental coverage merge, not retrain), and declared-missing index materialization, but no task publishes independently. After all tasks settle, one maintenance-class monotonic manifest CAS publishes every still-needed identity pointer plus one graph lineage commit; a pointer already at or beyond the achieved version is converged and omitted. Thus two changed tables become visible together, a no-work run creates no sidecar/lineage, and any post-arm error returns `RecoveryRequired`. Full v9 recovery rolls the complete set forward in one batch or compensates a partial set before visibility. Main remains held through final physical-only `__manifest` compaction. Optimize's bounded maintenance classifier carries stable table identity but has no exact caller-minted transaction/authority/fixed-lineage proof, so destructive recovery retains the documented single-writer-process boundary until Lance exposes a stable maintenance transaction API and OmniGraph has distributed fencing. It **commits even with no compaction work if index coverage is stale**; reports untrainable vector-only work as pending without pinning it; **refuses on an unrecovered graph**; **skips uncovered HEAD > manifest drift** with `DriftNeedsRepair`; and **compacts blob-bearing tables**. |
 | Repair uncovered drift | — | `omnigraph repair` explicitly classifies uncovered table `HEAD > manifest` drift: verified maintenance drift (`ReserveFragments`/`Rewrite`) can be published with `--confirm`; suspicious or unverifiable drift requires `--force --confirm`. Sidecar-covered crash residuals still recover automatically on open. |
-| Cleanup (`cleanup_old_versions`) | ✅ | `omnigraph cleanup` with `--keep` / `--older-than` policy |
-| BTREE / inverted (FTS) / vector indexes | ✅ | `@index`/`@key` declares intent; the physical index is derived state that never fails a logical op. Built per column through one chokepoint (`build_indices_on_dataset_for_catalog`, type-dispatched by `node_prop_index_kind`: enum + orderable scalar → BTREE, free-text String → FTS, Vector → vector); idempotent; lazy across branches. **Schema apply builds nothing** (records intent only); `load`/`mutate` build inline but **defer an untrainable Vector column** (no trainable vectors yet) as *pending* rather than aborting. `ensure_indices`/`optimize` is the reconciler that materializes declared-but-missing indexes and restores coverage of appended/rewritten fragments (`optimize_indices`), reporting still-pending columns (see Compaction row). |
-| `merge_insert` upsert | ✅ | `LoadMode::Merge`, mutation `update`/`insert`/`delete` lowering |
+| Cleanup (`cleanup_old_versions`) | ✅ | `omnigraph cleanup` derives requested `--keep` / `--older-than` cutoffs from each table's available versions; Lance refs plus OmniGraph's live-lazy-branch and recovery floors may retain additional versions. It fails closed on unopenable pins, recovery intent, or uncovered main-table HEAD drift. A process-local Blob reader is not a durable ref: operators quiesce readers before destructive GC; a raced read may return its captured bytes or fail loudly, but never retarget. |
+| BTREE / inverted (FTS) / vector indexes | ✅ | `@index`/`@key` declares intent; physical indexes are derived state and never fail a logical operation. One type-dispatched chokepoint builds BTREE, FTS, or vector indexes idempotently and lazily across branches. Schema apply and mutation/load publish only logical effects. `ensure_indices` first runs the roll-forward-only recovery barrier, then materializes declared-but-missing artifacts through one staged mixed CreateIndex transaction under ordinary recovery-v9 authority; untrainable vector columns remain pending. |
+| Strict insert / upsert ingestion | ✅ transaction conflict filters + uncommitted fragment staging | Internal schema v6 owns the explicit logical mode. Strict insert exact-probes its pinned parent, then stages a join-free exact-`id` filtered insertion-only Update; upsert uses the sealed exact-`id`, forced-v2 MergeInsert adapter. Mutation/Load remains one transaction per table, capped before arm at 8,192 rows / 32 MiB. BranchMerge's proven all-new route accepts only a complete certificate chain plus final source/target native-incarnation checks; ordered adopt fallback routes new rows through join-free StrictInsert and changed rows through a sealed update-only (`UpdateAll` + `DoNothing`) arm that fails closed unless every classified id updates. Raw Lance writers are outside the supported graph-writer topology. |
+| Bounded graph-batch ingestion | — | Raw graph-level NDJSON is parsed at a strict logical envelope and committed through the shared ordinary Load transaction. One request produces one graph commit and is acknowledged only after manifest visibility. The public shape names logical node/edge declarations, never physical datasets. There is no MemWAL, token ledger, lifecycle, hidden stream metadata, or stream-specific recovery path. |
 | Vector search | ✅ | `nearest()` query op; embedding pipeline (Gemini / OpenAI clients); `@embed` in schema |
 | Full-text search | ✅ | `search/fuzzy/match_text/bm25` query ops |
 | Hybrid ranking | — | `rrf(...)` Reciprocal Rank Fusion in one runtime |
 | Graph traversal | — | CSR/CSC topology index, `Expand` IR op, variable-length hops, `not { }` anti-join |
-| Schema language | — | `.pg` + Pest grammar + catalog + interfaces + constraints + annotations |
+| Schema language | — | `.pg` + Pest grammar + identity-free canonical `SchemaShape`; persisted accepted SchemaIR v2 + identity-bound catalog + interfaces + constraints + annotations. Source supplies shape and rename hints, never authoritative IDs. |
 | Query language | — | `.gq` + Pest grammar + IR + lowering + linter |
-| Schema migration planning | — | `plan_schema_migration` + `apply_schema` step types + `__schema_apply_lock__` |
+| Schema migration planning | — | ID-driven `plan_schema_migration` + `apply_schema` step types + `__schema_apply_lock__`. Exact-name matches retain identity; explicit supported renames preserve type/property IDs and table incarnation. Pure type rename is a manifest alias update over the same path/version; drop/re-add mints a new lifetime and cannot inherit the old tombstone or fencing authority. |
 | Commit graph (DAG) across whole graph | — | Lineage (linear + merge parents, ULID ids, actor) stored as `graph_commit`/`graph_head` rows in `__manifest`, written in the same publish CAS as the table-version rows (RFC-013 Phase 7 — atomic with the graph commit). The in-memory commit graph is a pure projection of those rows; the legacy `_graph_commits.lance` / `_graph_commit_actors.lance` tables are **retired** (a fresh graph creates neither) |
-| Per-query atomic writes | — | In-memory `MutationStaging.pending` accumulator + `stage_*` / `commit_staged` per touched table at end-of-query + publisher CAS via `commit_with_expected` (single manifest commit per `mutate_as` / `load`); D₂ parse-time rule keeps inserts/updates and deletes from mixing |
+| Per-query atomic writes | — | In-memory `MutationStaging.pending` accumulator + one exact staged Lance transaction per touched table + identity-bearing recovery-v9 confirmation + exact branch-head publisher CAS (single manifest commit per `mutate_as` / `load`); D₂ parse-time rule keeps inserts/updates and deletes from mixing |
 | Three-way row-level merge | — | `OrderedTableCursor` + `StagedTableWriter`, structured `MergeConflictKind` |
 | Change feeds | — | `diff_between` / `diff_commits` with manifest fast path + ID streaming |
 | Cedar policy | — | Per-graph actions plus server-scoped actions (see [docs/user/operations/policy.md](docs/user/operations/policy.md) for the current list), branch / target_branch / protected scopes, validate/test/explain CLI. **Engine-wide enforcement** (MR-722): every `_as` writer (`apply_schema_as`, `mutate_as`, `load_as` — the deprecated `ingest_as` shims route through it — `branch_create_as` / `branch_create_from_as`, `branch_delete_as`, `branch_merge_as`) calls `Omnigraph::enforce(action, scope, actor)` — HTTP, CLI, embedded SDK all hit the same gate. |
@@ -276,6 +295,22 @@ omnigraph policy explain --cluster ./company-brain --graph knowledge --actor act
 | Audit / actor tracking | — | `_as` write APIs + actor map in commit graph |
 | Local S3 testing | — | run RustFS/MinIO + the `AWS_*` env; see [docs/user/deployment.md](docs/user/deployment.md) → *Testing against S3 locally* |
 | Agent skill | — | `skills/omnigraph` — operational playbook for driving Omnigraph; install with `npx skills add ModernRelay/omnigraph@omnigraph` |
+
+The supported SDK graph-write set is closed primarily by Rust visibility: the
+raw storage, handle-cache, and coordinator modules are crate-private, while a
+public snapshot opens tables through a read-only facade whose scan builder
+executes reads without exposing Lance's raw `Scanner` or physical plan. The
+single-cell Blob facade follows the same rule: `BlobReader` is engine-owned and
+bounded; the retired `read_blob -> BlobFile` method has no compatibility shim.
+The defense-in-depth registry in
+`crates/omnigraph/tests/forbidden_apis.rs` classifies every public async inherent
+`Omnigraph` method and loader convenience, every crate-visible async coordinator
+method, and exact per-file occurrences of the registered durable-call shapes,
+including recovery. It also rejects known direct Lance open/mutation shapes
+outside exact gateway files. A new supported writer or durable gateway must
+update that registry and its protocol coverage. The source scanner is not a
+Rust macro-expansion or alias-analysis engine; visibility is the structural
+boundary.
 
 ---
 

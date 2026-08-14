@@ -1,34 +1,121 @@
 use arrow_array::{
-    Array, ArrayRef, RecordBatch, StringArray, StructArray, UInt8Array, UInt32Array, UInt64Array,
+    Array, ArrayRef, LargeBinaryArray, RecordBatch, StringArray, StructArray, UInt64Array,
+    builder::StringBuilder,
 };
 use arrow_schema::SchemaRef;
-use datafusion::physical_plan::SendableRecordBatchStream;
-use futures::TryStreamExt;
+use datafusion::physical_plan::{SendableRecordBatchStream, stream::RecordBatchStreamAdapter};
+use futures::{StreamExt, TryStreamExt};
 use lance::Dataset;
 use lance::blob::BlobArrayBuilder;
 use lance::dataset::scanner::{ColumnOrdering, DatasetRecordBatchStream, Scanner};
-use lance::dataset::transaction::{Operation, Transaction, TransactionBuilder};
-use lance::dataset::write::merge_insert::SourceDedupeBehavior;
+use lance::dataset::transaction::{Operation, Transaction, TransactionBuilder, UpdateMode};
+use lance::dataset::write::merge_insert::inserted_rows::{KeyExistenceFilterBuilder, KeyValue};
+use lance::dataset::write::merge_insert::{
+    MergeStats, SourceDedupeBehavior, UncommittedMergeInsert,
+};
 use lance::dataset::{
     CommitBuilder, DeleteBuilder, InsertBuilder, MergeInsertBuilder, WhenMatched, WhenNotMatched,
     WriteMode, WriteParams,
 };
-use lance::datatypes::{BlobKind, Schema as LanceSchema};
+use lance::datatypes::Schema as LanceSchema;
 use lance::index::DatasetIndexExt;
 use lance::index::scalar::IndexDetails;
-use lance_select::mask::RowAddrTreeMap;
 use lance_file::version::LanceFileVersion;
 use lance_index::scalar::{InvertedIndexParams, ScalarIndexParams};
 use lance_index::{IndexType, is_system_index};
 use lance_linalg::distance::MetricType;
+use lance_select::mask::RowAddrTreeMap;
 use lance_table::format::{Fragment, IndexMetadata, RowIdMeta};
 use lance_table::rowids::{RowIdSequence, write_row_ids};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+use crate::blob::{
+    BlobDescriptor, BlobDescriptorDecoder, ExternalBlobPolicy, NormalizedExternalBlobUri,
+};
 use crate::db::manifest::TableVersionMetadata;
 use crate::db::{Snapshot, SubTableEntry};
 use crate::error::{OmniError, Result};
-use crate::storage_layer::ForkOutcome;
+use crate::storage_layer::{
+    ForkOutcome, IndexBuildSpec, KEYED_WRITE_MAX_BYTES, KEYED_WRITE_MAX_ROWS, KeyedWriteSemantics,
+    PendingScanBudget, ProvenInsertChunk,
+};
+
+/// Durable proof carried by an OmniGraph insertion-only transaction.
+///
+/// `v1` means that every key encoded by the transaction's exact-id conflict
+/// filter was proven absent from the transaction's effective parent.  The
+/// branch-merge pure-insert adapter accepts the no-target-probe route only when
+/// every transaction in the complete source interval carries this exact
+/// certificate and independently passes the structural history proof. A
+/// strict insert may mint it after its exact preflight; an upsert may mint it
+/// only when Lance's completed merge statistics and transaction shape prove
+/// that the actual effect inserted every source row and updated nothing.
+pub(crate) const INSERT_ABSENCE_PROPERTY: &str = "omnigraph.insert_absence";
+pub(crate) const INSERT_ABSENCE_V1: &str = "v1";
+
+const EXTERNAL_BLOB_PROBE_CONCURRENCY: usize = 8;
+const EXTERNAL_BLOB_REFERENCE_RESOURCE: &str = "external Blob reference cells";
+const EXTERNAL_BLOB_URI_METADATA_RESOURCE: &str = "external Blob URI metadata bytes";
+
+pub(crate) fn has_insert_absence_certificate(transaction: &Transaction) -> bool {
+    transaction
+        .transaction_properties
+        .as_ref()
+        .and_then(|properties| properties.get(INSERT_ABSENCE_PROPERTY))
+        .is_some_and(|value| value == INSERT_ABSENCE_V1)
+}
+
+/// Verify one persisted link of the insertion-absence proof chain and return
+/// its exact physical row contribution. This is intentionally stricter than a
+/// property lookup: the caller must also supply the expected parent version,
+/// exact primary-key field, and complete schema preorder observed for the
+/// source interval.
+pub(crate) fn certified_insert_absence_rows(
+    transaction: &Transaction,
+    expected_read_version: u64,
+    id_field_id: i32,
+    expected_schema_preorder_ids: &[u32],
+) -> Option<u64> {
+    if transaction.read_version != expected_read_version
+        || transaction.uuid.is_empty()
+        || !has_insert_absence_certificate(transaction)
+    {
+        return None;
+    }
+    let Operation::Update {
+        removed_fragment_ids,
+        updated_fragments,
+        new_fragments,
+        fields_modified,
+        compacted_sstables,
+        fields_for_preserving_frag_bitmap,
+        update_mode,
+        inserted_rows_filter,
+        updated_fragment_offsets,
+    } = &transaction.operation
+    else {
+        return None;
+    };
+    if !removed_fragment_ids.is_empty()
+        || !updated_fragments.is_empty()
+        || new_fragments.is_empty()
+        || !fields_modified.is_empty()
+        || !compacted_sstables.is_empty()
+        || fields_for_preserving_frag_bitmap != expected_schema_preorder_ids
+        || update_mode != &Some(UpdateMode::RewriteRows)
+        || updated_fragment_offsets.is_some()
+        || inserted_rows_filter
+            .as_ref()
+            .is_none_or(|filter| filter.field_ids != vec![id_field_id])
+    {
+        return None;
+    }
+    new_fragments.iter().try_fold(0_u64, |rows, fragment| {
+        rows.checked_add(fragment.physical_rows? as u64)
+    })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableState {
@@ -48,6 +135,30 @@ pub enum IndexCoverage {
     Indexed,
     /// Lance will not use the scalar index for this scan (correct, full scan).
     Degraded { reason: String },
+}
+
+/// Stable identity of one Lance transaction.
+///
+/// Lance persists both fields in the transaction file referenced by the
+/// committed manifest. Recovery uses the pair, rather than a numeric table
+/// version alone, to prove that an observed HEAD was produced by the staged
+/// effect named in a recovery sidecar. The UUID distinguishes two writers that
+/// started from the same version. Lance may preserve both fields while
+/// rebasing, so enrolled callers must also require the achieved table version
+/// to be exactly `read_version + 1`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StagedTransactionIdentity {
+    pub read_version: u64,
+    pub uuid: String,
+}
+
+impl From<&Transaction> for StagedTransactionIdentity {
+    fn from(transaction: &Transaction) -> Self {
+        Self {
+            read_version: transaction.read_version,
+            uuid: transaction.uuid.clone(),
+        }
+    }
 }
 
 /// A Lance write that has produced fragment files on object storage but is
@@ -71,10 +182,17 @@ pub enum IndexCoverage {
 /// Without `removed_fragment_ids`, a `stage_merge_insert` that rewrites
 /// existing fragments would yield duplicate rows (the original fragment
 /// stays in the committed manifest while its rewrite shows up in `new_fragments`).
+// Sealed storage surface: `new_fragments`/`removed_fragment_ids` record the
+// read-your-writes fragment delta of a staged effect.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct StagedWrite {
     transaction: Transaction,
     commit_metadata: StagedCommitMetadata,
+    /// Exact ids carried by a production strict-insert batch. Kept only until
+    /// commit so an effect-free substrate conflict can be re-probed against
+    /// fresh manifest authority before it is normalized to `KeyConflict`.
+    strict_source_ids: Option<Vec<String>>,
     /// Fragments to surface alongside the committed manifest in
     /// `Scanner::with_fragments(committed - removed + new)`. For
     /// `Operation::Append` these are the freshly-appended fragments. For
@@ -102,6 +220,9 @@ impl StagedCommitMetadata {
     }
 }
 
+// Sealed storage surface: the `new_fragments`/`removed_fragment_ids`
+// accessors complete the staged-effect vocabulary.
+#[allow(dead_code)]
 impl StagedWrite {
     fn new(
         transaction: Transaction,
@@ -111,6 +232,7 @@ impl StagedWrite {
         Self {
             transaction,
             commit_metadata: StagedCommitMetadata::default(),
+            strict_source_ids: None,
             new_fragments,
             removed_fragment_ids,
         }
@@ -125,6 +247,7 @@ impl StagedWrite {
         Self {
             transaction,
             commit_metadata,
+            strict_source_ids: None,
             new_fragments,
             removed_fragment_ids,
         }
@@ -137,6 +260,356 @@ impl StagedWrite {
     pub fn removed_fragment_ids(&self) -> &[u64] {
         &self.removed_fragment_ids
     }
+
+    /// Identity Lance assigned when this effect was staged.
+    pub fn transaction_identity(&self) -> StagedTransactionIdentity {
+        StagedTransactionIdentity::from(&self.transaction)
+    }
+
+    fn set_strict_source_ids(&mut self, source_ids: Vec<String>) {
+        self.strict_source_ids = Some(source_ids);
+    }
+
+    pub(crate) fn take_strict_source_ids(&mut self) -> Option<Vec<String>> {
+        self.strict_source_ids.take()
+    }
+
+    /// Bind a pre-minted recovery identity to a transaction staged after a
+    /// deferred branch fork. The operation and read version still come from
+    /// Lance; only its otherwise-random UUID is replaced so the sidecar can be
+    /// durable before the target ref (and its branch-local fragment paths)
+    /// exist.
+    pub(crate) fn bind_transaction_identity(
+        &mut self,
+        planned: &StagedTransactionIdentity,
+    ) -> Result<()> {
+        if self.transaction.read_version != planned.read_version {
+            return Err(OmniError::manifest_internal(format!(
+                "staged transaction read version {} does not match pre-minted recovery pin {}",
+                self.transaction.read_version, planned.read_version
+            )));
+        }
+        self.transaction.uuid.clone_from(&planned.uuid);
+        Ok(())
+    }
+}
+
+struct PreflightedExternalBlob {
+    normalized_uri: NormalizedExternalBlobUri,
+    store: Arc<lance::io::ObjectStore>,
+    path: object_store::path::Path,
+    object_size: u64,
+}
+
+impl PreflightedExternalBlob {
+    fn range_size(&self, offset: u64, length: Option<u64>) -> Result<u64> {
+        let payload_size = match length {
+            Some(length) => length,
+            None => self.object_size.checked_sub(offset).ok_or_else(|| {
+                OmniError::external_blob_source(
+                    self.normalized_uri.as_str(),
+                    format!(
+                        "external Blob offset {offset} exceeds object size {}",
+                        self.object_size
+                    ),
+                )
+            })?,
+        };
+        let end = offset.checked_add(payload_size).ok_or_else(|| {
+            OmniError::external_blob_source(
+                self.normalized_uri.as_str(),
+                "external Blob range overflows u64",
+            )
+        })?;
+        if end > self.object_size {
+            return Err(OmniError::external_blob_source(
+                self.normalized_uri.as_str(),
+                format!(
+                    "external Blob range {offset}..{end} exceeds object size {}",
+                    self.object_size
+                ),
+            ));
+        }
+        Ok(payload_size)
+    }
+
+    async fn read_full(&self) -> Result<Arc<[u8]>> {
+        let uri = self.normalized_uri.as_str().to_string();
+        if self.object_size == 0 {
+            return Ok(Arc::<[u8]>::from([]));
+        }
+        let end = usize::try_from(self.object_size).map_err(|_| {
+            OmniError::resource_limit(
+                "external Blob object bytes",
+                usize::MAX as u64,
+                self.object_size,
+            )
+        })?;
+        let bytes = self
+            .store
+            .read_one_range(&self.path, 0..end)
+            .await
+            .map_err(|error| OmniError::external_blob_source(&uri, error.to_string()))?;
+        crate::instrumentation::record_blob_payload_read();
+        crate::instrumentation::record_external_blob_payload_read();
+        Ok(Arc::<[u8]>::from(bytes.as_ref()))
+    }
+
+    async fn read_range(&self, offset: u64, length: Option<u64>) -> Result<Arc<[u8]>> {
+        let payload_size = self.range_size(offset, length)?;
+        let end_u64 = offset.checked_add(payload_size).ok_or_else(|| {
+            OmniError::external_blob_source(
+                self.normalized_uri.as_str(),
+                "external Blob range overflows u64",
+            )
+        })?;
+        if end_u64 > self.object_size {
+            return Err(OmniError::external_blob_source(
+                self.normalized_uri.as_str(),
+                format!(
+                    "external Blob range {offset}..{end_u64} exceeds object size {}",
+                    self.object_size
+                ),
+            ));
+        }
+        if offset == 0 && end_u64 == self.object_size {
+            return self.read_full().await;
+        }
+        if payload_size == 0 {
+            return Ok(Arc::<[u8]>::from([]));
+        }
+        let start = usize::try_from(offset).map_err(|_| {
+            OmniError::external_blob_source(
+                self.normalized_uri.as_str(),
+                "external Blob range start does not fit usize",
+            )
+        })?;
+        let end = usize::try_from(end_u64).map_err(|_| {
+            OmniError::external_blob_source(
+                self.normalized_uri.as_str(),
+                "external Blob range end does not fit usize",
+            )
+        })?;
+        let bytes = self
+            .store
+            .read_one_range(&self.path, start..end)
+            .await
+            .map_err(|error| {
+                OmniError::external_blob_source(self.normalized_uri.as_str(), error.to_string())
+            })?;
+        crate::instrumentation::record_blob_payload_read();
+        crate::instrumentation::record_external_blob_payload_read();
+        Ok(Arc::<[u8]>::from(bytes.as_ref()))
+    }
+}
+
+/// Effect-free, operation-wide proof for every external Blob URI admitted by
+/// an input batch. Entries retain the shared object-store client and exact
+/// observed size so keyed materialization does not repeat setup or HEAD.
+#[derive(Clone, Default)]
+pub(crate) struct ExternalBlobPreflight {
+    // The proof is cloned into bounded lazy materialization streams. Share its
+    // admitted aliases instead of cloning up to 32 MiB of URI metadata for
+    // every planning/publish pass.
+    by_input: Arc<HashMap<String, Arc<PreflightedExternalBlob>>>,
+}
+
+pub(crate) type ExternalBlobPayloadCache = HashMap<(String, u64, Option<u64>), Arc<[u8]>>;
+
+#[derive(Debug, Clone)]
+struct ExternalBlobRangeRequest {
+    uri: String,
+    offset: u64,
+    length: Option<u64>,
+}
+
+/// Descriptor-only accounting for the exact persisted Blob cells a branch
+/// merge will carry. The first pass stores only bounded external requests and
+/// a scalar managed-byte total; it never retains source rows or payloads.
+#[derive(Debug, Default)]
+pub(crate) struct PersistedBlobSelection {
+    managed_payload_bytes: u64,
+    external: Vec<ExternalBlobRangeRequest>,
+    retained_uri_metadata_bytes: u64,
+}
+
+impl PersistedBlobSelection {
+    pub(crate) fn include_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        append_persisted_blob_selection(self, batch)
+    }
+
+    pub(crate) fn external_cell_count(&self) -> usize {
+        self.external.len()
+    }
+
+    fn push_external(&mut self, uri: String, offset: u64, length: Option<u64>) -> Result<()> {
+        let next_count = self.external.len().checked_add(1).ok_or_else(|| {
+            OmniError::manifest_internal("external Blob reference count overflow")
+        })?;
+        if next_count > KEYED_WRITE_MAX_ROWS {
+            return Err(OmniError::resource_limit(
+                EXTERNAL_BLOB_REFERENCE_RESOURCE,
+                KEYED_WRITE_MAX_ROWS as u64,
+                next_count as u64,
+            ));
+        }
+        let retained = retained_string_bytes(&uri)?;
+        let next_metadata = self
+            .retained_uri_metadata_bytes
+            .checked_add(retained)
+            .ok_or_else(|| {
+                OmniError::manifest_internal("external Blob URI metadata byte count overflow")
+            })?;
+        if next_metadata > KEYED_WRITE_MAX_BYTES {
+            return Err(OmniError::resource_limit(
+                EXTERNAL_BLOB_URI_METADATA_RESOURCE,
+                KEYED_WRITE_MAX_BYTES,
+                next_metadata,
+            ));
+        }
+        self.retained_uri_metadata_bytes = next_metadata;
+        self.external.push(ExternalBlobRangeRequest {
+            uri,
+            offset,
+            length,
+        });
+        Ok(())
+    }
+
+    fn add_managed_payload(&mut self, length: u64) -> Result<()> {
+        self.managed_payload_bytes =
+            self.managed_payload_bytes
+                .checked_add(length)
+                .ok_or_else(|| {
+                    OmniError::manifest_internal("materialized Blob payload byte count overflow")
+                })?;
+        Ok(())
+    }
+
+    pub(crate) fn materialized_payload_bytes(
+        &self,
+        preflight: &ExternalBlobPreflight,
+    ) -> Result<u64> {
+        self.external
+            .iter()
+            .try_fold(self.managed_payload_bytes, |total, request| {
+                total
+                    .checked_add(
+                        preflight
+                            .entry(&request.uri)?
+                            .range_size(request.offset, request.length)?,
+                    )
+                    .ok_or_else(|| {
+                        OmniError::manifest_internal(
+                            "materialized Blob payload byte count overflow",
+                        )
+                    })
+            })
+    }
+}
+
+#[derive(Default)]
+struct ExternalBlobMetadataBudget {
+    bytes: u64,
+}
+
+impl ExternalBlobMetadataBudget {
+    fn retain_string(&mut self, value: &str) -> Result<()> {
+        self.retain_bytes(retained_string_bytes(value)?)
+    }
+
+    fn retain_bytes(&mut self, bytes: u64) -> Result<()> {
+        let next = self.bytes.checked_add(bytes).ok_or_else(|| {
+            OmniError::manifest_internal("external Blob URI metadata byte count overflow")
+        })?;
+        if next > KEYED_WRITE_MAX_BYTES {
+            return Err(OmniError::resource_limit(
+                EXTERNAL_BLOB_URI_METADATA_RESOURCE,
+                KEYED_WRITE_MAX_BYTES,
+                next,
+            ));
+        }
+        self.bytes = next;
+        Ok(())
+    }
+}
+
+/// Bounded ownership for logical external-URI cells discovered after
+/// last-write-wins folding. The source Arrow batches keep the original
+/// strings; this collector charges its one retained copy before allocation so
+/// an operation cannot build an unbounded URI vector and reject only later in
+/// preflight.
+#[derive(Default)]
+pub(crate) struct ExternalBlobUriCollector {
+    uris: Vec<String>,
+    metadata: ExternalBlobMetadataBudget,
+}
+
+impl ExternalBlobUriCollector {
+    pub(crate) fn include_batch(&mut self, batch: &RecordBatch) -> Result<std::ops::Range<usize>> {
+        let start = self.uris.len();
+        visit_external_blob_uris(batch, |uri| {
+            let next_count = self.uris.len().checked_add(1).ok_or_else(|| {
+                OmniError::manifest_internal("external Blob reference count overflow")
+            })?;
+            if next_count > KEYED_WRITE_MAX_ROWS {
+                return Err(OmniError::resource_limit(
+                    EXTERNAL_BLOB_REFERENCE_RESOURCE,
+                    KEYED_WRITE_MAX_ROWS as u64,
+                    next_count as u64,
+                ));
+            }
+            self.metadata.retain_string(uri)?;
+            self.uris.push(uri.to_owned());
+            Ok(())
+        })?;
+        Ok(start..self.uris.len())
+    }
+
+    pub(crate) fn as_slice(&self) -> &[String] {
+        &self.uris
+    }
+
+    fn into_vec(self) -> Vec<String> {
+        self.uris
+    }
+}
+
+fn retained_string_bytes(value: &str) -> Result<u64> {
+    let bytes = value
+        .len()
+        .checked_add(std::mem::size_of::<String>())
+        .ok_or_else(|| {
+            OmniError::manifest_internal("external Blob URI metadata byte count overflow")
+        })?;
+    u64::try_from(bytes)
+        .map_err(|_| OmniError::manifest_internal("external Blob URI metadata does not fit u64"))
+}
+
+impl ExternalBlobPreflight {
+    fn entry(&self, uri: &str) -> Result<&Arc<PreflightedExternalBlob>> {
+        self.by_input.get(uri).ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "external Blob URI '{uri}' was not included in operation-wide preflight"
+            ))
+        })
+    }
+
+    /// Sum logical copied bytes with multiplicity. URI probes are deduplicated;
+    /// payload reuse is separately bounded to one materialization batch. Two
+    /// cells referencing the same object still become two managed values and
+    /// therefore consume the operation budget twice.
+    pub(crate) fn materialized_payload_bytes<T: AsRef<str>>(&self, uris: &[T]) -> Result<u64> {
+        uris.iter().try_fold(0_u64, |total, uri| {
+            total
+                .checked_add(self.entry(uri.as_ref())?.object_size)
+                .ok_or_else(|| {
+                    OmniError::manifest_internal(
+                        "materialized external Blob payload byte count overflow",
+                    )
+                })
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -147,6 +620,9 @@ pub struct TableStore {
     /// this store performs attaches it; the read path's handle cache shares
     /// the same instance via `ReadCaches`.
     session: Arc<lance::session::Session>,
+    /// Immutable graph-level resource policy. The default is deny; an engine
+    /// builder replaces it before exposing the handle to writers.
+    external_blob_policy: Arc<ExternalBlobPolicy>,
 }
 
 impl TableStore {
@@ -154,9 +630,125 @@ impl TableStore {
         Self {
             root_uri: root_uri.trim_end_matches('/').to_string(),
             session,
+            external_blob_policy: Arc::new(ExternalBlobPolicy::Deny),
         }
     }
 
+    pub(crate) fn with_external_blob_policy(mut self, policy: ExternalBlobPolicy) -> Result<Self> {
+        self.external_blob_policy = Arc::new(policy.validated()?);
+        Ok(self)
+    }
+
+    /// Authorize, normalize, deduplicate, and probe every URI before any
+    /// external payload read, recovery arm, target HEAD/ref movement, or
+    /// graph-visible effect. Scalar-only preparation may already have produced
+    /// temporary in-memory or staged inputs. The graph session supplies the
+    /// process-wide shared registry, so one operation does not create cold
+    /// clients per row.
+    pub(crate) async fn preflight_external_blob_uris(
+        &self,
+        uris: &[String],
+    ) -> Result<ExternalBlobPreflight> {
+        self.preflight_external_blob_uri_iter(uris.len(), uris.iter().map(String::as_str))
+            .await
+    }
+
+    pub(crate) async fn preflight_persisted_blob_selection(
+        &self,
+        selection: &PersistedBlobSelection,
+    ) -> Result<ExternalBlobPreflight> {
+        self.preflight_external_blob_uri_iter(
+            selection.external_cell_count(),
+            selection
+                .external
+                .iter()
+                .map(|request| request.uri.as_str()),
+        )
+        .await
+    }
+
+    async fn preflight_external_blob_uri_iter<'a>(
+        &self,
+        uri_count: usize,
+        uris: impl IntoIterator<Item = &'a str>,
+    ) -> Result<ExternalBlobPreflight> {
+        if uri_count > KEYED_WRITE_MAX_ROWS {
+            return Err(OmniError::resource_limit(
+                EXTERNAL_BLOB_REFERENCE_RESOURCE,
+                KEYED_WRITE_MAX_ROWS as u64,
+                uri_count as u64,
+            ));
+        }
+
+        // At peak the caller still retains its raw URI vector while this pass
+        // owns one alias key per occurrence and two normalized strings per
+        // distinct object (the grouping key and the eventual proof entry).
+        // Charge every retained String slot plus bytes before cloning it.
+        let mut metadata = ExternalBlobMetadataBudget::default();
+        let mut pending: BTreeMap<String, (NormalizedExternalBlobUri, Vec<String>)> =
+            BTreeMap::new();
+        for uri in uris {
+            // The caller's raw URI remains live and this pass retains one
+            // alias copy. Reserve both before normalization allocates.
+            metadata.retain_string(uri)?;
+            metadata.retain_string(uri)?;
+            let normalized = self.external_blob_policy.authorize(uri)?;
+            if let Some((_, aliases)) = pending.get_mut(normalized.as_str()) {
+                aliases.push(uri.to_string());
+            } else {
+                metadata.retain_string(normalized.as_str())?;
+                metadata.retain_string(normalized.as_str())?;
+                let normalized_uri = normalized.as_str().to_string();
+                pending.insert(normalized_uri, (normalized, vec![uri.to_string()]));
+            }
+        }
+
+        crate::instrumentation::record_external_blob_preflight_inputs(uri_count);
+        let registry = self.session.store_registry();
+        let entries = futures::stream::iter(pending.into_values().map(|(normalized, aliases)| {
+            let registry = Arc::clone(&registry);
+            async move {
+                let uri = normalized.as_str().to_string();
+                let (store, path) = lance::io::ObjectStore::from_uri_and_params(
+                    registry,
+                    &uri,
+                    &lance::io::ObjectStoreParams::default(),
+                )
+                .await
+                .map_err(|error| OmniError::external_blob_source(&uri, error.to_string()))?;
+                crate::instrumentation::record_external_blob_probe();
+                let object_size = store
+                    .size(&path)
+                    .await
+                    .map_err(|error| OmniError::external_blob_source(&uri, error.to_string()))?;
+                Ok::<_, OmniError>((
+                    aliases,
+                    Arc::new(PreflightedExternalBlob {
+                        normalized_uri: normalized,
+                        store,
+                        path,
+                        object_size,
+                    }),
+                ))
+            }
+        }))
+        .buffer_unordered(EXTERNAL_BLOB_PROBE_CONCURRENCY)
+        .try_collect::<Vec<_>>()
+        .await?;
+
+        let mut by_input = HashMap::with_capacity(uri_count);
+        for (aliases, entry) in entries {
+            for input in aliases {
+                by_input.insert(input, Arc::clone(&entry));
+            }
+        }
+        Ok(ExternalBlobPreflight {
+            by_input: Arc::new(by_input),
+        })
+    }
+
+    // Sealed storage surface, pinned by name in tests/forbidden_apis.rs; no
+    #[allow(dead_code)]
     pub fn root_uri(&self) -> &str {
         &self.root_uri
     }
@@ -196,7 +788,7 @@ impl TableStore {
         snapshot: &Snapshot,
         table_key: &str,
     ) -> Result<Dataset> {
-        snapshot.open(table_key).await
+        snapshot.open_dataset(table_key).await
     }
 
     pub async fn open_at_entry(&self, entry: &SubTableEntry) -> Result<Dataset> {
@@ -228,19 +820,6 @@ impl TableStore {
         }
     }
 
-    pub async fn delete_branch(&self, dataset_uri: &str, branch: &str) -> Result<()> {
-        let mut ds = crate::instrumentation::open_dataset(
-            dataset_uri,
-            crate::instrumentation::VersionResolution::Latest,
-            Some(&self.session),
-            crate::instrumentation::table_wrapper(),
-        )
-        .await?;
-        ds.delete_branch(branch)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))
-    }
-
     /// List the named Lance branches present on the dataset at `dataset_uri`.
     /// The `cleanup` orphan reconciler diffs this against the manifest branch
     /// set to find orphaned per-table forks. `main`/default is not a named
@@ -262,15 +841,16 @@ impl TableStore {
 
     /// Idempotently drop `branch` from the dataset at `dataset_uri`.
     ///
-    /// Unlike [`delete_branch`](Self::delete_branch), this tolerates an
-    /// already-absent branch — both a missing contents ref (Lance's
-    /// `force_delete_branch` handles that) and a missing `tree/{branch}/`
-    /// directory (the local-store `NotFound` quirk pinned by
-    /// `lance_surface_guards::force_delete_branch_semantics`). Safe to call on a
-    /// possibly-orphaned or already-reclaimed fork.
+    /// This tolerates an already-absent branch — pinned Lance's native
+    /// `force_delete_branch` treats both a missing contents ref and a missing
+    /// `tree/{branch}/` directory as success, while OmniGraph also normalizes a
+    /// raced `RefNotFound` / `NotFound` around the non-atomic contents delete.
+    /// Safe to call on a possibly-orphaned or already-reclaimed fork.
     ///
-    /// A branch that still has referencing descendants (`RefConflict`) is NOT
-    /// tolerated: that is a real ordering error and surfaces as `OmniError::Lance`.
+    /// A branch that still has referencing descendants (`RefConflict`) or a
+    /// live physical path-child is NOT tolerated: those are real ordering
+    /// errors. The graph namespace prevents new path-prefix overlaps; surfacing
+    /// legacy ones keeps cleanup from falsely reporting a reclaim Lance skipped.
     /// Used by the eager best-effort reclaim in `cleanup_deleted_branch_tables`
     /// and the `cleanup` orphan reconciler.
     pub async fn force_delete_branch(&self, dataset_uri: &str, branch: &str) -> Result<()> {
@@ -281,11 +861,7 @@ impl TableStore {
             crate::instrumentation::table_wrapper(),
         )
         .await?;
-        match ds.force_delete_branch(branch).await {
-            Ok(()) => Ok(()),
-            Err(lance::Error::RefNotFound { .. }) | Err(lance::Error::NotFound { .. }) => Ok(()),
-            Err(e) => Err(OmniError::Lance(e.to_string())),
-        }
+        crate::branch_control::force_delete_branch_idempotent(&mut ds, branch).await
     }
 
     pub fn ensure_expected_version(
@@ -338,44 +914,28 @@ impl TableStore {
             .map_err(|e| OmniError::Lance(e.to_string()))?;
         self.ensure_expected_version(&source_ds, table_key, source_version)?;
 
-        if let Err(create_err) = source_ds
-            .create_branch(target_branch, source_version, None)
-            .await
+        let created = match crate::branch_control::create_branch_recoverably(
+            &mut source_ds,
+            target_branch,
+            source_version,
+        )
+        .await?
         {
-            // Disambiguate the failure: only a genuinely pre-existing ref is a
-            // reclaim candidate. Mapping EVERY create_branch failure to
-            // `RefAlreadyExists` would route a transient I/O / version / Lance
-            // internal error into the destructive reclaim path. So check whether
-            // the ref actually exists; if not, the failure is real — propagate
-            // it (preserving error fidelity) rather than force-deleting.
-            //
-            // `list_branches` reads `_refs/branches/` from the store, so it sees
-            // a fully-formed manifest-unreferenced fork (our common case — a
-            // create_branch that completed but whose manifest publish did not).
-            // It does NOT see a phase-1-only Lance "zombie" (tree dir written,
-            // no BranchContents) — but neither does `cleanup`'s reconciler, also
-            // list_branches-based. A zombie only forms if create_branch is
-            // interrupted *between its two internal phases* (a far narrower
-            // window than the manifest-publish gap), and it surfaces here as the
-            // propagated create error requiring manual reclaim. We deliberately
-            // do NOT force-delete on a not-found-ref failure: it is
-            // indistinguishable from a transient error on a fresh create, and
-            // force-deleting there is the destructive overreach this guard
-            // removes. The caller holds the per-(table, branch) write queue, so
-            // no in-process writer races this fork; a cross-process create
-            // between our check and now is the documented one-winner-CAS gap and
-            // propagates as a retryable error.
-            let ref_exists = source_ds
-                .list_branches()
-                .await
-                .map(|b| b.contains_key(target_branch))
-                .unwrap_or(false);
-            if ref_exists {
+            crate::branch_control::BranchCreateOutcome::Created(dataset) => *dataset,
+            crate::branch_control::BranchCreateOutcome::RefAlreadyExists => {
                 return Ok(ForkOutcome::RefAlreadyExists);
             }
-            return Err(OmniError::Lance(create_err.to_string()));
-        }
+        };
 
+        // The ref is now independently durable. Any error from this point is an
+        // ambiguous/post-effect outcome to the caller and must retain an armed
+        // recovery intent rather than being treated as a safe pre-effect retry.
+        crate::failpoints::maybe_fail(crate::failpoints::names::FORK_POST_CREATE_PRE_OPEN)?;
+
+        // Re-open through the shared session for normal cache behavior. The
+        // returned handle above is used only as proof that the matching branch
+        // dataset was openable during classification.
+        drop(created);
         let ds = self
             .open_dataset_head(dataset_uri, Some(target_branch))
             .await?;
@@ -387,6 +947,8 @@ impl TableStore {
         self.scan(ds, None, None, None).await
     }
 
+    // Sealed storage surface, pinned by name in tests/forbidden_apis.rs; no
+    #[allow(dead_code)]
     pub async fn scan_batches_for_rewrite(&self, ds: &Dataset) -> Result<Vec<RecordBatch>> {
         let has_blob_columns = ds.schema().fields_pre_order().any(|field| field.is_blob());
         if !has_blob_columns {
@@ -400,35 +962,184 @@ impl TableStore {
             .map_err(|e| OmniError::Lance(e.to_string()))?;
         let mut materialized = Vec::with_capacity(batches.len());
         for batch in batches {
-            materialized.push(Self::materialize_blob_batch(ds, batch).await?);
+            materialized.push(self.materialize_blob_batch(ds, batch).await?);
         }
         Ok(materialized)
     }
 
     /// Streaming, blob-aware sibling of [`Self::scan_batches_for_rewrite`].
     /// Yields the dataset's rows lazily as a `SendableRecordBatchStream` so a
-    /// downstream writer (`stage_append_stream`) never materializes the whole
-    /// table in memory. Blob columns still need per-row rebuild, so those tables
-    /// fall back to the materialized path and are re-streamed from the `Vec`
-    /// (rare — only tables with a `Blob` property; bounded-memory blob streaming
-    /// is a follow-up). The non-blob path is a true lazy scan.
+    /// downstream writer never materializes the whole table in memory. Blob
+    /// columns are rebuilt asynchronously one scanner batch at a time; ordinary
+    /// columns pass through the native lazy scan.
+    // Sealed storage surface, pinned by name in tests/forbidden_apis.rs; no
+    #[allow(dead_code)]
     pub async fn scan_stream_for_rewrite(&self, ds: &Dataset) -> Result<SendableRecordBatchStream> {
         let has_blob_columns = ds.schema().fields_pre_order().any(|field| field.is_blob());
         if has_blob_columns {
             let arrow_schema: SchemaRef = Arc::new(ds.schema().into());
-            let batches = self.scan_batches_for_rewrite(ds).await?;
-            let reader =
-                arrow_array::RecordBatchIterator::new(batches.into_iter().map(Ok), arrow_schema);
-            return Ok(lance_datafusion::utils::reader_to_stream(Box::new(reader)));
+            let raw: SendableRecordBatchStream =
+                Self::scan_stream(ds, None, None, None, true).await?.into();
+            return Ok(self.materialize_blob_stream(ds.clone(), arrow_schema, raw, None));
         }
         // Non-blob: a true lazy scan. `DatasetRecordBatchStream` converts to the
         // `SendableRecordBatchStream` that `execute_uncommitted_stream` consumes.
         Ok(Self::scan_stream(ds, None, None, None, false).await?.into())
     }
 
+    /// Explicitly batch-bounded variant used by RFC-023's branch-adopt chain.
+    /// Unlike the environment-controlled default scanner size, this ceiling is
+    /// part of the recovery plan: one emitted batch becomes one pre-minted
+    /// strict keyed transaction.
+    pub async fn scan_stream_for_rewrite_bounded(
+        &self,
+        ds: &Dataset,
+        batch_rows: usize,
+        batch_bytes: u64,
+    ) -> Result<SendableRecordBatchStream> {
+        if batch_rows == 0 || batch_bytes == 0 {
+            return Err(OmniError::manifest_internal(
+                "bounded rewrite stream requires non-zero row and byte ceilings",
+            ));
+        }
+        let has_blob_columns = ds.schema().fields_pre_order().any(|field| field.is_blob());
+        if has_blob_columns {
+            let arrow_schema: SchemaRef = Arc::new(ds.schema().into());
+            let raw: SendableRecordBatchStream =
+                Self::scan_stream_with(ds, None, None, None, true, |scanner| {
+                    // The byte cap sees compact blob descriptors, not payload.
+                    // Materialize one descriptor row at a time; the downstream
+                    // chunk assembler combines only writer-proven bounded rows.
+                    scanner.batch_size(1);
+                    scanner.batch_size_bytes(batch_bytes);
+                    Ok(())
+                })
+                .await?
+                .into();
+            return Ok(self.materialize_blob_stream(
+                ds.clone(),
+                arrow_schema,
+                raw,
+                Some(batch_bytes),
+            ));
+        }
+        Ok(
+            Self::scan_stream_with(ds, None, None, None, false, |scanner| {
+                scanner.batch_size(batch_rows);
+                scanner.batch_size_bytes(batch_bytes);
+                Ok(())
+            })
+            .await?
+            .into(),
+        )
+    }
+
+    fn materialize_blob_stream(
+        &self,
+        ds: Dataset,
+        schema: SchemaRef,
+        raw: SendableRecordBatchStream,
+        max_blob_bytes: Option<u64>,
+    ) -> SendableRecordBatchStream {
+        if let Some(limit) = max_blob_bytes {
+            // `LANCE_DEFAULT_BATCH_SIZE` overrides Scanner::batch_size on the
+            // pinned Lance revision. Split descriptor batches ourselves so an
+            // environment setting cannot make one materialization read across
+            // writer-defined recovery chunks. `try_unfold` is sequential: at
+            // most one row's blob payload is read before downstream consumes it.
+            let materialized = futures::stream::try_unfold(
+                (raw, None::<RecordBatch>, 0_usize, ds, self.clone()),
+                move |(mut raw, mut current, mut offset, ds, store)| async move {
+                    loop {
+                        if let Some(batch) = current.as_ref()
+                            && offset < batch.num_rows()
+                        {
+                            let row = batch.slice(offset, 1);
+                            offset += 1;
+                            let materialized = store
+                                .materialize_blob_batch_with_limit(&ds, row, Some(limit))
+                                .await
+                                .map_err(|error| {
+                                    datafusion::error::DataFusionError::Execution(error.to_string())
+                                })?;
+                            return Ok(Some((materialized, (raw, current, offset, ds, store))));
+                        }
+
+                        match raw.try_next().await? {
+                            Some(batch) => {
+                                current = Some(batch);
+                                offset = 0;
+                            }
+                            None => return Ok(None),
+                        }
+                    }
+                },
+            );
+            return Box::pin(RecordBatchStreamAdapter::new(schema, materialized));
+        }
+
+        let store = self.clone();
+        let materialized = raw.and_then(move |batch| {
+            let ds = ds.clone();
+            let store = store.clone();
+            async move {
+                store
+                    .materialize_blob_batch_with_limit(&ds, batch, None)
+                    .await
+                    .map_err(|error| {
+                        datafusion::error::DataFusionError::Execution(error.to_string())
+                    })
+            }
+        });
+        Box::pin(RecordBatchStreamAdapter::new(schema, materialized))
+    }
+
+    // Sealed storage surface, pinned by name in tests/forbidden_apis.rs; its
+    // only caller is the equally-unused `scan_batches_for_rewrite`.
+    #[allow(dead_code)]
     pub(crate) async fn materialize_blob_batch(
+        &self,
         ds: &Dataset,
         batch: RecordBatch,
+    ) -> Result<RecordBatch> {
+        self.materialize_blob_batch_with_limit(ds, batch, None)
+            .await
+    }
+
+    /// Branch-merge sibling that reuses normalized external payloads only
+    /// within the caller's current bounded staging chunk.
+    pub(crate) async fn materialize_blob_batch_bounded_with_preflight_cache(
+        &self,
+        ds: &Dataset,
+        batch: RecordBatch,
+        max_blob_bytes: u64,
+        external_preflight: &ExternalBlobPreflight,
+        external_payloads: &mut ExternalBlobPayloadCache,
+    ) -> Result<RecordBatch> {
+        let row_ids = batch
+            .column_by_name("_rowid")
+            .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
+            .ok_or_else(|| {
+                OmniError::Lance("expected _rowid column when materializing Blobs".to_string())
+            })?
+            .values()
+            .to_vec();
+        self.materialize_blob_batch_with_row_ids(
+            ds,
+            batch,
+            &row_ids,
+            Some(max_blob_bytes),
+            Some(external_preflight),
+            Some(external_payloads),
+        )
+        .await
+    }
+
+    async fn materialize_blob_batch_with_limit(
+        &self,
+        ds: &Dataset,
+        batch: RecordBatch,
+        max_blob_bytes: Option<u64>,
     ) -> Result<RecordBatch> {
         let has_blob_columns = ds.schema().fields_pre_order().any(|field| field.is_blob());
         if !has_blob_columns {
@@ -446,7 +1157,60 @@ impl TableStore {
             .copied()
             .collect::<Vec<_>>();
 
+        self.materialize_blob_batch_with_row_ids(ds, batch, &row_ids, max_blob_bytes, None, None)
+            .await
+    }
+
+    /// Rebuild the blob columns in `batch` using explicit stable row ids.
+    ///
+    /// Most rewrite callers scan with `_rowid` and use
+    /// [`Self::materialize_blob_batch`]. A predicate-filtered blob mutation
+    /// cannot include blob descriptors in that scan on the pinned Lance
+    /// revision (the filter projection panics), so it first scans only
+    /// non-blob columns + `_rowid`, takes the full descriptor rows by id, and
+    /// calls this sibling with the ids captured by the safe scan.
+    async fn materialize_blob_batch_with_row_ids(
+        &self,
+        ds: &Dataset,
+        batch: RecordBatch,
+        row_ids: &[u64],
+        max_blob_bytes: Option<u64>,
+        supplied_external_preflight: Option<&ExternalBlobPreflight>,
+        supplied_external_payloads: Option<&mut ExternalBlobPayloadCache>,
+    ) -> Result<RecordBatch> {
+        if batch.num_rows() != row_ids.len() {
+            return Err(OmniError::Lance(format!(
+                "blob materialization row count {} does not match {} row ids",
+                batch.num_rows(),
+                row_ids.len()
+            )));
+        }
+
         let schema: SchemaRef = Arc::new(ds.schema().into());
+        let owned_external_preflight;
+        let external_preflight = match supplied_external_preflight {
+            Some(preflight) => {
+                self.validate_persisted_blob_batch_preflight(
+                    ds,
+                    &batch,
+                    max_blob_bytes,
+                    preflight,
+                )?;
+                preflight
+            }
+            None => {
+                owned_external_preflight = self
+                    .preflight_persisted_blob_batch(ds, &batch, max_blob_bytes)
+                    .await?;
+                &owned_external_preflight
+            }
+        };
+        // Payload reuse is scoped to this already-bounded materialized batch.
+        // Keeping it out of ExternalBlobPreflight prevents a long branch merge
+        // from retaining every distinct copied object for the operation's
+        // lifetime.
+        let mut owned_external_payloads = ExternalBlobPayloadCache::new();
+        let external_payloads = supplied_external_payloads.unwrap_or(&mut owned_external_payloads);
         let mut columns = Vec::with_capacity(schema.fields().len());
         for field in schema.fields() {
             let lance_field = lance::datatypes::Field::try_from(field.as_ref())
@@ -466,7 +1230,15 @@ impl TableStore {
                             ))
                         })?;
                 columns.push(
-                    Self::rebuild_blob_column(ds, field.name(), descriptions, &row_ids).await?,
+                    self.rebuild_blob_column(
+                        ds,
+                        field.name(),
+                        descriptions,
+                        row_ids,
+                        external_preflight,
+                        external_payloads,
+                    )
+                    .await?,
                 );
             } else {
                 columns.push(column.clone());
@@ -476,60 +1248,192 @@ impl TableStore {
         RecordBatch::try_new(schema, columns).map_err(|e| OmniError::Lance(e.to_string()))
     }
 
+    async fn preflight_persisted_blob_batch(
+        &self,
+        ds: &Dataset,
+        batch: &RecordBatch,
+        max_blob_bytes: Option<u64>,
+    ) -> Result<ExternalBlobPreflight> {
+        let mut selection = PersistedBlobSelection::default();
+        selection.include_batch(batch)?;
+        let external = self.preflight_persisted_blob_selection(&selection).await?;
+        self.validate_persisted_blob_batch_preflight(ds, batch, max_blob_bytes, &external)?;
+        Ok(external)
+    }
+
+    fn validate_persisted_blob_batch_preflight(
+        &self,
+        ds: &Dataset,
+        batch: &RecordBatch,
+        max_blob_bytes: Option<u64>,
+        external: &ExternalBlobPreflight,
+    ) -> Result<()> {
+        let total = self.persisted_blob_payload_bytes(ds, batch, external)?;
+        if let Some(limit) = max_blob_bytes
+            && total > limit
+        {
+            return Err(OmniError::resource_limit(
+                "materialized blob payload bytes",
+                limit,
+                total,
+            ));
+        }
+        Ok(())
+    }
+
+    fn persisted_blob_payload_bytes(
+        &self,
+        ds: &Dataset,
+        batch: &RecordBatch,
+        external: &ExternalBlobPreflight,
+    ) -> Result<u64> {
+        let mut total = 0_u64;
+        for field in ds
+            .schema()
+            .fields_pre_order()
+            .filter(|field| field.is_blob())
+        {
+            let descriptions = batch
+                .column_by_name(&field.name)
+                .and_then(|column| column.as_any().downcast_ref::<StructArray>())
+                .ok_or_else(|| {
+                    OmniError::Lance(format!("expected Blob descriptions for '{}'", field.name))
+                })?;
+            let decoder = BlobDescriptorDecoder::try_new(descriptions)?;
+            for row in 0..descriptions.len() {
+                let bytes = match decoder.classify(row)? {
+                    BlobDescriptor::Null => 0,
+                    BlobDescriptor::Managed { length } => length,
+                    BlobDescriptor::External {
+                        uri,
+                        offset,
+                        length,
+                    } => external.entry(&uri)?.range_size(offset, length)?,
+                };
+                total = total.checked_add(bytes).ok_or_else(|| {
+                    OmniError::manifest_internal("materialized Blob payload byte count overflow")
+                })?;
+            }
+        }
+        Ok(total)
+    }
+
+    /// Conservative pre-read size for a persisted descriptor batch. The raw
+    /// one-row Arrow allocation already accounts every ordinary column and
+    /// descriptor buffer; adding logical payload bytes may overestimate the
+    /// smaller logical Blob descriptor, but cannot understate retained memory.
+    pub(crate) fn predicted_materialized_blob_batch_bytes(
+        &self,
+        ds: &Dataset,
+        batch: &RecordBatch,
+        external: &ExternalBlobPreflight,
+        max_blob_bytes: u64,
+    ) -> Result<u64> {
+        let payload = self.persisted_blob_payload_bytes(ds, batch, external)?;
+        if payload > max_blob_bytes {
+            return Err(OmniError::resource_limit(
+                "materialized blob payload bytes",
+                max_blob_bytes,
+                payload,
+            ));
+        }
+        let retained = u64::try_from(batch.get_array_memory_size()).map_err(|_| {
+            OmniError::manifest_internal("persisted Blob batch memory size exceeds u64")
+        })?;
+        retained.checked_add(payload).ok_or_else(|| {
+            OmniError::manifest_internal("materialized Blob batch byte count overflow")
+        })
+    }
+
     async fn rebuild_blob_column(
+        &self,
         ds: &Dataset,
         column_name: &str,
         descriptions: &StructArray,
         row_ids: &[u64],
+        external_preflight: &ExternalBlobPreflight,
+        external_payloads: &mut ExternalBlobPayloadCache,
     ) -> Result<ArrayRef> {
         let mut builder = BlobArrayBuilder::new(row_ids.len());
-        let mut non_null_row_ids = Vec::new();
-        let mut row_has_blob = Vec::with_capacity(row_ids.len());
-
-        for row in 0..row_ids.len() {
-            let is_null = Self::blob_description_is_null(descriptions, row)?;
-            row_has_blob.push(!is_null);
-            if !is_null {
-                non_null_row_ids.push(row_ids[row]);
+        let decoder = BlobDescriptorDecoder::try_new(descriptions)?;
+        let mut descriptors = Vec::with_capacity(row_ids.len());
+        let mut managed_row_ids = Vec::new();
+        for (row, row_id) in row_ids.iter().enumerate() {
+            let descriptor = decoder.classify(row)?;
+            if matches!(descriptor, BlobDescriptor::Managed { .. }) {
+                managed_row_ids.push(*row_id);
             }
+            descriptors.push(descriptor);
         }
 
-        let blob_files = if non_null_row_ids.is_empty() {
+        let blob_files = if managed_row_ids.is_empty() {
             Vec::new()
         } else {
             Arc::new(ds.clone())
-                .take_blobs(&non_null_row_ids, column_name)
+                .take_blobs(&managed_row_ids, column_name)
                 .await
                 .map_err(|e| OmniError::Lance(e.to_string()))?
         };
 
-        let mut files = blob_files.into_iter();
-        for has_blob in row_has_blob {
-            if !has_blob {
-                builder
+        let mut managed_files = blob_files.into_iter();
+        for descriptor in descriptors {
+            match descriptor {
+                BlobDescriptor::Null => builder
                     .push_null()
-                    .map_err(|e| OmniError::Lance(e.to_string()))?;
-                continue;
+                    .map_err(|error| OmniError::Lance(error.to_string()))?,
+                BlobDescriptor::Managed { length } => {
+                    let blob = managed_files
+                        .next()
+                        .ok_or_else(|| {
+                            OmniError::Lance(format!(
+                                "Blob rewrite for '{column_name}' lost alignment with source rows"
+                            ))
+                        })?
+                        .ok_or_else(|| {
+                            OmniError::Lance(format!(
+                                "Blob rewrite for '{column_name}' returned null for a managed descriptor"
+                            ))
+                        })?;
+                    if blob.size() != length {
+                        return Err(OmniError::Lance(format!(
+                            "Blob rewrite for '{column_name}' observed managed length {}, descriptor recorded {length}",
+                            blob.size()
+                        )));
+                    }
+                    crate::instrumentation::record_blob_payload_read();
+                    builder
+                        .push_bytes(
+                            blob.read()
+                                .await
+                                .map_err(|error| OmniError::Lance(error.to_string()))?,
+                        )
+                        .map_err(|error| OmniError::Lance(error.to_string()))?;
+                }
+                BlobDescriptor::External {
+                    uri,
+                    offset,
+                    length,
+                } => {
+                    let entry = external_preflight.entry(&uri)?;
+                    let key = (entry.normalized_uri.as_str().to_string(), offset, length);
+                    let bytes = match external_payloads.get(&key) {
+                        Some(bytes) => Arc::clone(bytes),
+                        None => {
+                            let bytes = entry.read_range(offset, length).await?;
+                            external_payloads.insert(key, Arc::clone(&bytes));
+                            bytes
+                        }
+                    };
+                    builder
+                        .push_bytes(bytes.as_ref())
+                        .map_err(|error| OmniError::Lance(error.to_string()))?;
+                }
             }
-
-            let blob = files.next().ok_or_else(|| {
-                OmniError::Lance(format!(
-                    "blob rewrite for '{}' lost alignment with source rows",
-                    column_name
-                ))
-            })?;
-            builder
-                .push_bytes(
-                    blob.read()
-                        .await
-                        .map_err(|e| OmniError::Lance(e.to_string()))?,
-                )
-                .map_err(|e| OmniError::Lance(e.to_string()))?;
         }
 
-        if files.next().is_some() {
+        if managed_files.next().is_some() {
             return Err(OmniError::Lance(format!(
-                "blob rewrite for '{}' produced extra source blobs",
+                "Blob rewrite for '{}' produced extra managed source blobs",
                 column_name
             )));
         }
@@ -537,64 +1441,6 @@ impl TableStore {
         builder
             .finish()
             .map_err(|e| OmniError::Lance(e.to_string()))
-    }
-
-    fn blob_description_is_null(descriptions: &StructArray, row: usize) -> Result<bool> {
-        if descriptions.is_null(row) {
-            return Ok(true);
-        }
-
-        let position = descriptions
-            .column_by_name("position")
-            .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
-            .ok_or_else(|| {
-                OmniError::Lance(format!(
-                    "unrecognized blob description schema {:?}: missing UInt64 position field",
-                    descriptions.fields()
-                ))
-            })?;
-        let size = descriptions
-            .column_by_name("size")
-            .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
-            .ok_or_else(|| {
-                OmniError::Lance(format!(
-                    "unrecognized blob description schema {:?}: missing UInt64 size field",
-                    descriptions.fields()
-                ))
-            })?;
-
-        let Some(kind_column) = descriptions.column_by_name("kind") else {
-            return Ok(position.is_null(row) || size.is_null(row));
-        };
-        let kind = if let Some(kind) = kind_column.as_any().downcast_ref::<UInt8Array>() {
-            if kind.is_null(row) {
-                return Ok(true);
-            }
-            kind.value(row)
-        } else if let Some(kind) = kind_column.as_any().downcast_ref::<UInt32Array>() {
-            if kind.is_null(row) {
-                return Ok(true);
-            }
-            kind.value(row) as u8
-        } else {
-            return Err(OmniError::Lance(format!(
-                "unrecognized blob description schema {:?}: kind field must be UInt8 or UInt32",
-                descriptions.fields()
-            )));
-        };
-
-        let kind = BlobKind::try_from(kind).map_err(|e| OmniError::Lance(e.to_string()))?;
-        if kind != BlobKind::Inline {
-            return Ok(false);
-        }
-        let blob_uri = descriptions
-            .column_by_name("blob_uri")
-            .and_then(|col| col.as_any().downcast_ref::<StringArray>())
-            .and_then(|arr| (!arr.is_null(row)).then(|| arr.value(row)));
-
-        Ok((position.is_null(row) || position.value(row) == 0)
-            && (size.is_null(row) || size.value(row) == 0)
-            && blob_uri.unwrap_or("").is_empty())
     }
 
     pub async fn scan_stream(
@@ -605,6 +1451,34 @@ impl TableStore {
         with_row_id: bool,
     ) -> Result<DatasetRecordBatchStream> {
         Self::scan_stream_with(ds, projection, filter, order_by, with_row_id, |_| Ok(())).await
+    }
+
+    /// Streaming scan with an explicit initial row estimate and approximate
+    /// decoded-byte target. Lance's byte target overrides the row setting;
+    /// neither setting is a hard limit, and Lance may emit a larger batch.
+    /// Callers that retain or
+    /// transform batches must charge the actual batch against their own hard
+    /// budget instead of treating these scanner settings as admission.
+    pub async fn scan_stream_bounded(
+        ds: &Dataset,
+        projection: Option<&[&str]>,
+        filter: Option<&str>,
+        order_by: Option<Vec<ColumnOrdering>>,
+        with_row_id: bool,
+        batch_rows: usize,
+        batch_bytes: u64,
+    ) -> Result<DatasetRecordBatchStream> {
+        if batch_rows == 0 || batch_bytes == 0 {
+            return Err(OmniError::manifest_internal(
+                "bounded scan requires non-zero row estimate and byte target",
+            ));
+        }
+        Self::scan_stream_with(ds, projection, filter, order_by, with_row_id, |scanner| {
+            scanner.batch_size(batch_rows);
+            scanner.batch_size_bytes(batch_bytes);
+            Ok(())
+        })
+        .await
     }
 
     pub async fn scan_stream_with<F>(
@@ -698,17 +1572,34 @@ impl TableStore {
         opposite_col: &str,
         keys: &[String],
     ) -> Result<Vec<RecordBatch>> {
+        Self::scan_edges_by_endpoint_projected(ds, key_col, opposite_col, &[], keys).await
+    }
+
+    /// `scan_edges_by_endpoint` with extra projected columns beyond the two
+    /// endpoints. Consumed by the bound-edge expand, which carries the edge's
+    /// physical id and declared property columns alongside each matched row.
+    pub async fn scan_edges_by_endpoint_projected(
+        ds: &Dataset,
+        key_col: &str,
+        opposite_col: &str,
+        extra_cols: &[&str],
+        keys: &[String],
+    ) -> Result<Vec<RecordBatch>> {
         use datafusion::prelude::{col, lit};
 
         if keys.is_empty() {
             return Ok(Vec::new());
         }
+        let mut projection: Vec<&str> = Vec::with_capacity(2 + extra_cols.len());
+        projection.push(key_col);
+        projection.push(opposite_col);
+        projection.extend_from_slice(extra_cols);
         let key_list: Vec<datafusion::prelude::Expr> =
             keys.iter().map(|k| lit(k.clone())).collect();
         let filter_expr = col(key_col).in_list(key_list, false);
         Self::scan_stream_with(
             ds,
-            Some(&[key_col, opposite_col]),
+            Some(projection.as_slice()),
             None,
             None,
             false,
@@ -821,7 +1712,6 @@ impl TableStore {
     pub async fn count_rows(&self, ds: &Dataset, filter: Option<String>) -> Result<usize> {
         ds.count_rows(filter)
             .await
-            .map(|count| count as usize)
             .map_err(|e| OmniError::Lance(e.to_string()))
     }
 
@@ -839,12 +1729,13 @@ impl TableStore {
 
     /// Legacy inline-commit append: writes fragments AND commits in one
     /// call, advancing Lance HEAD as a side effect. Not on the
-    /// `TableStorage` trait surface — the staged primitive `stage_append`
-    /// + `commit_staged` is the engine write path. This inherent method
-    /// survives only for in-source recovery test setup, so it is
-    /// `#[cfg(test)]`-gated: engine code physically cannot call it (which
-    /// enforces "no new call sites" by construction and silences the
-    /// dead-code warning the non-test lib build would otherwise emit).
+    /// `TableStorage` trait surface — the staged primitive
+    /// `stage_append` + `commit_staged` is the engine write path. This
+    /// inherent method survives only for in-source recovery test setup,
+    /// so it is `#[cfg(test)]`-gated: engine code physically cannot call
+    /// it (which enforces "no new call sites" by construction and
+    /// silences the dead-code warning the non-test lib build would
+    /// otherwise emit).
     #[cfg(test)]
     pub(crate) async fn append_batch(
         &self,
@@ -891,6 +1782,7 @@ impl TableStore {
                 Ok(ds)
             }
             None => {
+                let control_session = crate::lance_access::control_session();
                 let params = WriteParams {
                     mode: WriteMode::Create,
                     enable_stable_row_ids: true,
@@ -898,6 +1790,7 @@ impl TableStore {
                     allow_external_blob_outside_bases: true,
                     auto_cleanup: None,
                     skip_auto_cleanup: true,
+                    session: Some(control_session),
                     ..Default::default()
                 };
                 Dataset::write(reader, dataset_uri, Some(params))
@@ -1007,6 +1900,7 @@ impl TableStore {
     /// rows. The engine's parse-time D₂′ check (per touched table: all
     /// stage_append OR exactly one stage_merge_insert) guarantees this
     /// upstream; on the primitive layer it's the caller's responsibility.
+    #[cfg(test)]
     pub async fn stage_append(
         &self,
         ds: &Dataset,
@@ -1074,19 +1968,11 @@ impl TableStore {
         ))
     }
 
-    /// Streaming variant of [`Self::stage_append`]: appends the rows of `source`
-    /// into `ds` without materializing them in memory. It scans `source` lazily
-    /// (`scan_stream_for_rewrite`) and hands the stream to Lance's
-    /// `execute_uncommitted_stream`, which rolls fragments at `max_rows_per_file`
-    /// — bounded memory, one Append transaction. This is the substrate-blessed
-    /// bulk-append path (the same one LanceDB's `Table::add` uses). Identical
-    /// fragment-id / stable-row-id staging as `stage_append`.
-    ///
-    /// TRANSITIONAL caller — its only caller is the row-level merge append
-    /// (`publish_adopted_delta`, see `AdoptDelta`), which the fragment-adopt work
-    /// (Lance #7263/#7185) removes: a fragment graft re-appends no rows. This
-    /// primitive and `scan_stream_for_rewrite` are then dead unless re-adopted as
-    /// a general bulk-append path (the `Table::add` shape makes that plausible).
+    /// Test-only streaming variant of [`Self::stage_append`]. It retains the old
+    /// substrate primitive for direct Lance-shape coverage, but production graph
+    /// writes cannot select it: RFC-023 branch adoption consumes a bounded rewrite
+    /// stream as exact-`id` keyed chunks instead.
+    #[cfg(test)]
     pub async fn stage_append_stream(
         &self,
         ds: &Dataset,
@@ -1135,6 +2021,815 @@ impl TableStore {
         Ok(StagedWrite::new(transaction, new_fragments, Vec::new()))
     }
 
+    /// Stage one RFC-023 keyed write from an in-memory batch.
+    ///
+    /// Unlike the legacy generic merge primitive below, this adapter fixes the
+    /// join key to `id` and derives Lance actions from a closed logical enum.
+    /// StrictInsert exact-probes its pinned parent, then stages the shared
+    /// join-free filter-bearing insertion-only `Update`; Upsert keeps Lance's
+    /// forced-v2 MergeInsert route. These are the only production
+    /// insertion-bearing routes for keyed graph tables.
+    pub async fn stage_keyed_write(
+        &self,
+        ds: Dataset,
+        table_key: &str,
+        batch: RecordBatch,
+        semantics: KeyedWriteSemantics,
+    ) -> Result<StagedWrite> {
+        if batch.num_rows() == 0 {
+            return Err(OmniError::manifest_internal(
+                "stage_keyed_write called with empty batch",
+            ));
+        }
+        let batch_bytes = u64::try_from(batch.get_array_memory_size())
+            .map_err(|_| OmniError::manifest_internal("keyed write batch bytes exceed u64"))?;
+        if batch.num_rows() > KEYED_WRITE_MAX_ROWS {
+            return Err(OmniError::resource_limit(
+                format!("keyed write rows for {table_key}"),
+                KEYED_WRITE_MAX_ROWS as u64,
+                batch.num_rows() as u64,
+            ));
+        }
+        if batch_bytes > KEYED_WRITE_MAX_BYTES {
+            return Err(OmniError::resource_limit(
+                format!("keyed write bytes for {table_key}"),
+                KEYED_WRITE_MAX_BYTES,
+                batch_bytes,
+            ));
+        }
+        let id_field_id = exact_id_primary_key_field_id(&ds, "stage_keyed_write")?;
+        let expected_read_version = ds.version().version;
+        let expected_schema_preorder_ids = schema_preorder_field_ids(&ds, "stage_keyed_write")?;
+        let source_ids = validate_keyed_write_batch_ids(&batch, table_key, "stage_keyed_write")?;
+        if semantics == KeyedWriteSemantics::StrictInsert {
+            Self::preflight_strict_insert_ids(&ds, table_key, &source_ids).await?;
+            return self
+                .stage_absence_proven_strict_insert(
+                    ds,
+                    table_key,
+                    batch,
+                    source_ids,
+                    id_field_id,
+                    &expected_schema_preorder_ids,
+                    "stage_keyed_write",
+                )
+                .await;
+        }
+
+        // MergeInsertBuilder does not expose WriteParams and therefore cannot
+        // opt into Lance's `allow_external_blob_outside_bases` reference
+        // policy. Materialize URI-bearing source cells under the same byte
+        // ceiling before handing the still-logical blob array to Lance. This
+        // retains keyed fencing without an Append side door; Overwrite keeps
+        // Lance's external-reference behavior because it accepts WriteParams.
+        let batch = self.prepare_keyed_write_batch(table_key, batch).await?;
+
+        let merged_rows = batch.num_rows() as u64;
+        let schema = batch.schema();
+        let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let stream = lance_datafusion::utils::reader_to_stream(Box::new(reader));
+        let (mut staged, stats) = self
+            .stage_keyed_write_from_stream(
+                ds,
+                stream,
+                merged_rows,
+                semantics,
+                id_field_id,
+                "stage_keyed_write",
+            )
+            .await?;
+        if merge_stats_prove_pure_insert(&stats, merged_rows)
+            && let Err(error) = certify_insert_absence(
+                &mut staged.transaction,
+                expected_read_version,
+                id_field_id,
+                &expected_schema_preorder_ids,
+                &source_ids,
+                "stage_keyed_write",
+            )
+        {
+            // The certificate is an optional optimization for Upsert. Lance's
+            // completed statistics prove this execution inserted every row,
+            // but an unfamiliar future transaction shape must disable the
+            // history shortcut rather than fail an otherwise valid logical
+            // write. StrictInsert keeps the same check mandatory because its
+            // exact filter is part of the requested conflict semantics.
+            tracing::debug!(
+                table_key,
+                error = %error,
+                "all-new upsert is not eligible for the insertion-absence certificate"
+            );
+        }
+        Ok(staged)
+    }
+
+    /// Stage the narrow RFC-023 pure-insert fast path.
+    ///
+    /// The complete source history carries a durable proof that every batch key
+    /// was absent from its effective parent. The caller's final authority and
+    /// physical-baseline gates establish that the pinned target still equals
+    /// that parent, so this adapter does not repeat the exact target probe. It
+    /// uses Lance's public insert writer for immutable data fragments and
+    /// replaces only its uncommitted `Append` operation with the same
+    /// filter-bearing, insert-only `Update` shape emitted by pinned Lance
+    /// merge-insert. The resulting transaction inherits the certificate, so
+    /// the proof composes across later branch generations without creating a
+    /// graph-visible Append side door.
+    pub async fn stage_proven_strict_insert(
+        &self,
+        ds: Dataset,
+        chunk: ProvenInsertChunk,
+    ) -> Result<StagedWrite> {
+        let (
+            table_key,
+            batch,
+            expected_target_version,
+            expected_schema_preorder_ids,
+            expected_stable_row_ids,
+            chunk_index,
+        ) = chunk.into_parts();
+        let table_key = table_key.as_str();
+        if ds.version().version != expected_target_version {
+            return Err(OmniError::manifest_read_set_changed(
+                format!("proven_insert_target:{table_key}:chunk:{chunk_index}"),
+                Some(expected_target_version.to_string()),
+                Some(ds.version().version.to_string()),
+            ));
+        }
+        if !expected_stable_row_ids || !ds.manifest.uses_stable_row_ids() {
+            return Err(OmniError::manifest_internal(format!(
+                "stage_proven_strict_insert requires stable target row ids for {table_key} chunk {chunk_index}"
+            )));
+        }
+        let id_field_id = exact_id_primary_key_field_id(&ds, "stage_proven_strict_insert")?;
+        let source_ids =
+            validate_keyed_write_batch_ids(&batch, table_key, "stage_proven_strict_insert")?;
+        self.stage_absence_proven_strict_insert(
+            ds,
+            table_key,
+            batch,
+            source_ids,
+            id_field_id,
+            &expected_schema_preorder_ids,
+            "stage_proven_strict_insert",
+        )
+        .await
+    }
+
+    /// Stage one strict insertion whose caller has already proved every source
+    /// id absent from this exact pinned parent.
+    ///
+    /// The proof authority stays outside this helper: ordinary StrictInsert
+    /// supplies an exact target preflight, while BranchMerge supplies an opaque
+    /// complete-history capability. Both authorities intentionally converge on
+    /// one filter-bearing insertion-only Lance transaction shape.
+    async fn stage_absence_proven_strict_insert(
+        &self,
+        ds: Dataset,
+        table_key: &str,
+        batch: RecordBatch,
+        source_ids: Vec<String>,
+        id_field_id: i32,
+        expected_schema_preorder_ids: &[u32],
+        context: &'static str,
+    ) -> Result<StagedWrite> {
+        if batch.num_rows() == 0 {
+            return Err(OmniError::manifest_internal(format!(
+                "{context} called with empty batch"
+            )));
+        }
+        let batch_bytes = u64::try_from(batch.get_array_memory_size()).map_err(|_| {
+            OmniError::manifest_internal(format!("{context} batch bytes exceed u64"))
+        })?;
+        if batch.num_rows() > KEYED_WRITE_MAX_ROWS {
+            return Err(OmniError::resource_limit(
+                format!("keyed write rows for {table_key}"),
+                KEYED_WRITE_MAX_ROWS as u64,
+                batch.num_rows() as u64,
+            ));
+        }
+        if batch_bytes > KEYED_WRITE_MAX_BYTES {
+            return Err(OmniError::resource_limit(
+                format!("keyed write bytes for {table_key}"),
+                KEYED_WRITE_MAX_BYTES,
+                batch_bytes,
+            ));
+        }
+
+        let batch = self.prepare_keyed_write_batch(table_key, batch).await?;
+        ensure_proven_insert_blobs_are_materialized(&batch, table_key)?;
+
+        let mut filter_builder = KeyExistenceFilterBuilder::new(vec![id_field_id]);
+        for id in &source_ids {
+            filter_builder
+                .insert(KeyValue::String(id.clone()))
+                .map_err(|error| OmniError::Lance(error.to_string()))?;
+        }
+        if filter_builder.len() != batch.num_rows()
+            || source_ids
+                .iter()
+                .any(|id| !filter_builder.contains(&KeyValue::String(id.clone())))
+        {
+            return Err(OmniError::manifest_internal(format!(
+                "{context} did not encode every source id in Lance's key filter"
+            )));
+        }
+        let inserted_rows_filter = filter_builder.build();
+
+        // This full pre-order field list is load-bearing. Lance's Update
+        // manifest builder uses it to keep every existing user index from
+        // claiming coverage of these newly written, not-yet-indexed fragments.
+        // An empty or top-level-only list can cause silent missing query rows.
+        let fields_for_preserving_frag_bitmap = schema_preorder_field_ids(&ds, context)?;
+        if fields_for_preserving_frag_bitmap != expected_schema_preorder_ids {
+            return Err(OmniError::manifest_internal(format!(
+                "{context} target schema changed for {table_key}"
+            )));
+        }
+        let expected_read_version = ds.version().version;
+        let ds = Arc::new(ds);
+        let params = WriteParams {
+            mode: WriteMode::Append,
+            allow_external_blob_outside_bases: false,
+            auto_cleanup: None,
+            skip_auto_cleanup: true,
+            ..Default::default()
+        };
+        let mut transaction = InsertBuilder::new(ds.clone())
+            .with_params(&params)
+            .execute_uncommitted(vec![batch])
+            .await
+            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        if transaction.read_version != expected_read_version {
+            return Err(OmniError::manifest_internal(format!(
+                "{context} wrote against version {}, expected {expected_read_version}",
+                transaction.read_version
+            )));
+        }
+        let transaction_fragments = match &transaction.operation {
+            Operation::Append { fragments } => fragments.clone(),
+            other => {
+                return Err(OmniError::manifest_internal(format!(
+                    "{context}: expected Lance Append staging operation, got {:?}",
+                    std::mem::discriminant(other)
+                )));
+            }
+        };
+        transaction.operation = Operation::Update {
+            removed_fragment_ids: Vec::new(),
+            updated_fragments: Vec::new(),
+            new_fragments: transaction_fragments.clone(),
+            fields_modified: Vec::new(),
+            compacted_sstables: Vec::new(),
+            fields_for_preserving_frag_bitmap,
+            update_mode: Some(UpdateMode::RewriteRows),
+            inserted_rows_filter: Some(inserted_rows_filter),
+            updated_fragment_offsets: None,
+        };
+        validate_transaction_exact_id_filter(&transaction, id_field_id, context)?;
+        certify_insert_absence(
+            &mut transaction,
+            expected_read_version,
+            id_field_id,
+            expected_schema_preorder_ids,
+            &source_ids,
+            context,
+        )?;
+
+        // The transaction keeps Lance's temporary fragment ids and lets commit
+        // assign target-local stable row ids. Only the read-your-writes copy is
+        // normalized now, exactly as in the test-only staged Append adapter.
+        let mut visible_fragments = transaction_fragments;
+        let next_id_base = ds.manifest.max_fragment_id.unwrap_or(0) as u64 + 1;
+        assign_fragment_ids(&mut visible_fragments, next_id_base);
+        if ds.manifest.uses_stable_row_ids() {
+            assign_row_id_meta(&mut visible_fragments, ds.manifest.next_row_id)?;
+        }
+
+        crate::instrumentation::record_stage_fenced_insert(source_ids.len() as u64);
+        let mut staged = StagedWrite::with_commit_metadata(
+            transaction,
+            StagedCommitMetadata::affected_rows(Some(RowAddrTreeMap::new())),
+            visible_fragments,
+            Vec::new(),
+        );
+        staged.set_strict_source_ids(source_ids);
+        Ok(staged)
+    }
+
+    /// Resolve any URI-bearing logical blobs into a bounded in-memory keyed
+    /// source batch without writing Lance files or advancing HEAD.
+    ///
+    /// Deferred first-touch writes invoke this before arming recovery because
+    /// their actual `MergeInsertBuilder` stage must wait until the target ref
+    /// exists. Existing-table writes reach the same helper from
+    /// [`Self::stage_keyed_write`].
+    pub async fn prepare_keyed_write_batch(
+        &self,
+        table_key: &str,
+        batch: RecordBatch,
+    ) -> Result<RecordBatch> {
+        let external_uris = collect_external_blob_uris(&batch)?;
+        let preflight = self.preflight_external_blob_uris(&external_uris).await?;
+        self.prepare_keyed_write_batch_with_preflight(table_key, batch, &preflight)
+            .await
+    }
+
+    /// Operation-wide sibling of [`Self::prepare_keyed_write_batch`]. The
+    /// caller has already admitted and probed every URI across all pending
+    /// tables, so this method must not repeat policy checks or HEAD requests.
+    pub(crate) async fn prepare_keyed_write_batch_with_preflight(
+        &self,
+        table_key: &str,
+        batch: RecordBatch,
+        preflight: &ExternalBlobPreflight,
+    ) -> Result<RecordBatch> {
+        self.validate_keyed_write_batch(table_key, &batch)?;
+        let external_uris = collect_external_blob_uris(&batch)?;
+        let payload_bytes = preflight.materialized_payload_bytes(&external_uris)?;
+        if payload_bytes > KEYED_WRITE_MAX_BYTES {
+            return Err(OmniError::resource_limit(
+                "materialized external blob payload bytes",
+                KEYED_WRITE_MAX_BYTES,
+                payload_bytes,
+            ));
+        }
+        let retained_bytes = u64::try_from(batch.get_array_memory_size()).map_err(|_| {
+            OmniError::manifest_internal("keyed write input batch bytes exceed u64")
+        })?;
+        let predicted_bytes = retained_bytes.checked_add(payload_bytes).ok_or_else(|| {
+            OmniError::manifest_internal("materialized keyed Blob byte count overflow")
+        })?;
+        if predicted_bytes > KEYED_WRITE_MAX_BYTES {
+            return Err(OmniError::resource_limit(
+                format!("keyed write bytes for {table_key}"),
+                KEYED_WRITE_MAX_BYTES,
+                predicted_bytes,
+            ));
+        }
+        let batch =
+            materialize_external_blob_inputs(batch, KEYED_WRITE_MAX_BYTES, preflight).await?;
+        let materialized_bytes = u64::try_from(batch.get_array_memory_size()).map_err(|_| {
+            OmniError::manifest_internal("materialized keyed write batch bytes exceed u64")
+        })?;
+        if materialized_bytes > KEYED_WRITE_MAX_BYTES {
+            return Err(OmniError::resource_limit(
+                format!("keyed write bytes for {table_key}"),
+                KEYED_WRITE_MAX_BYTES,
+                materialized_bytes,
+            ));
+        }
+        Ok(batch)
+    }
+
+    /// Rewrite retained external references to the exact canonical URI proven
+    /// by the operation-wide preflight, without reading payload bytes.
+    ///
+    /// Overwrite deliberately retains external descriptors. Persisting the
+    /// caller's lexical spelling would be unsafe for `file://`: a symlink
+    /// admitted inside a base could later be retargeted outside it. The
+    /// preflight has already resolved that spelling to one canonical regular
+    /// file, so the durable descriptor must carry the same proof target.
+    pub(crate) fn prepare_overwrite_blob_references_with_preflight(
+        &self,
+        table_key: &str,
+        batch: RecordBatch,
+        preflight: &ExternalBlobPreflight,
+    ) -> Result<RecordBatch> {
+        self.validate_keyed_write_batch(table_key, &batch)?;
+        canonicalize_external_blob_inputs(batch, preflight)
+    }
+
+    /// Validate one physical v6 graph-table batch without staging files or
+    /// touching any Lance/manifest authority. This is deliberately separate
+    /// from [`Self::stage_keyed_write`]: Overwrite and deferred first-touch
+    /// plans must fail before recovery arm / native-ref creation too.
+    pub fn validate_keyed_write_batch(&self, table_key: &str, batch: &RecordBatch) -> Result<()> {
+        validate_keyed_write_batch_ids(batch, table_key, "prepare keyed write batch")?;
+        Ok(())
+    }
+
+    /// Test-only streaming-source sibling of [`Self::stage_keyed_write`].
+    ///
+    /// The source must itself be an already-valid keyed graph table with exact
+    /// `id` PK metadata.  Its narrow `id` projection is walked one record batch
+    /// at a time; strict inserts probe the pinned target with a structured
+    /// batch-sized `IN` predicate.  A non-blob full source is then scanned lazily
+    /// into Lance's merge job, so vectors and other wide ordinary columns remain
+    /// bounded by record-batch width rather than delta width. Blob tables are
+    /// materialized one scanner batch at a time by `scan_stream_for_rewrite`.
+    /// Cross-batch source uniqueness comes from the trusted keyed graph-table
+    /// invariant; this sealed primitive does not accept an arbitrary external
+    /// dataset as its source.
+    #[cfg(test)]
+    pub async fn stage_keyed_write_stream(
+        &self,
+        ds: Dataset,
+        table_key: &str,
+        source: &Dataset,
+        semantics: KeyedWriteSemantics,
+    ) -> Result<StagedWrite> {
+        let id_field_id = exact_id_primary_key_field_id(&ds, "stage_keyed_write_stream")?;
+        exact_id_primary_key_field_id(source, "stage_keyed_write_stream source")?;
+        let mut id_stream = Self::scan_stream(source, Some(&["id"]), None, None, false).await?;
+        let mut merged_rows = 0_u64;
+        while let Some(batch) = id_stream
+            .try_next()
+            .await
+            .map_err(|error| OmniError::Lance(error.to_string()))?
+        {
+            merged_rows = merged_rows
+                .checked_add(batch.num_rows() as u64)
+                .ok_or_else(|| {
+                    OmniError::manifest_internal(
+                        "stage_keyed_write_stream source row count overflow",
+                    )
+                })?;
+            let source_ids =
+                validate_keyed_write_batch_ids(&batch, table_key, "stage_keyed_write_stream")?;
+            if semantics == KeyedWriteSemantics::StrictInsert {
+                Self::preflight_strict_insert_ids(&ds, table_key, &source_ids).await?;
+            }
+        }
+        if merged_rows == 0 {
+            return Err(OmniError::manifest_internal(
+                "stage_keyed_write_stream called with empty source dataset",
+            ));
+        }
+        let stream = self.scan_stream_for_rewrite(source).await?;
+        self.stage_keyed_write_from_stream(
+            ds,
+            stream,
+            merged_rows,
+            semantics,
+            id_field_id,
+            "stage_keyed_write_stream",
+        )
+        .await
+        .map(|(staged, _stats)| staged)
+    }
+
+    /// Exact existing-id check for one bounded source batch.  This probes the
+    /// same pinned `Dataset` later handed to `MergeInsertBuilder`; it neither
+    /// opens HEAD nor parses Lance/DataFusion error strings.  A structured
+    /// expression lets Lance use covered scalar-index fragments while retaining
+    /// its correctness fallback over uncovered fragments.
+    async fn preflight_strict_insert_ids(
+        ds: &Dataset,
+        table_key: &str,
+        source_ids: &[String],
+    ) -> Result<()> {
+        crate::instrumentation::record_strict_insert_preflight();
+        if let Some(id) = Self::first_existing_id(ds, source_ids).await? {
+            return Err(OmniError::key_conflict(table_key, id));
+        }
+        Ok(())
+    }
+
+    /// Probe a manifest-pinned table image for one exact member of
+    /// `source_ids`. This is shared by strict preflight and the post-conflict
+    /// fresh-authority discriminator; both paths therefore use the same
+    /// structured, scalar-index-eligible predicate and uncovered-fragment
+    /// fallback.
+    pub async fn first_existing_id(ds: &Dataset, source_ids: &[String]) -> Result<Option<String>> {
+        use datafusion::prelude::{col, lit};
+
+        exact_id_primary_key_field_id(ds, "first_existing_id")?;
+        if source_ids.is_empty() {
+            return Ok(None);
+        }
+        let filter =
+            col("id").in_list(source_ids.iter().map(|id| lit(id.clone())).collect(), false);
+        let mut target_ids =
+            Self::scan_stream_with(ds, Some(&["id"]), None, None, false, |scanner| {
+                scanner.filter_expr(filter);
+                Ok(())
+            })
+            .await?;
+        while let Some(batch) = target_ids
+            .try_next()
+            .await
+            .map_err(|error| OmniError::Lance(error.to_string()))?
+        {
+            let ids = string_id_column(&batch, "stage_keyed_write strict preflight")?;
+            for row in 0..ids.len() {
+                if ids.is_valid(row) {
+                    return Ok(Some(ids.value(row).to_string()));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    async fn stage_keyed_write_from_stream(
+        &self,
+        ds: Dataset,
+        stream: SendableRecordBatchStream,
+        merged_rows: u64,
+        semantics: KeyedWriteSemantics,
+        id_field_id: i32,
+        context: &'static str,
+    ) -> Result<(StagedWrite, MergeStats)> {
+        let mut builder = MergeInsertBuilder::try_new(Arc::new(ds), vec!["id".to_string()])
+            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        builder.when_matched(match semantics {
+            KeyedWriteSemantics::StrictInsert => WhenMatched::Fail,
+            KeyedWriteSemantics::Upsert | KeyedWriteSemantics::KnownPresentUpdate => {
+                WhenMatched::UpdateAll
+            }
+        });
+        builder.when_not_matched(match semantics {
+            KeyedWriteSemantics::KnownPresentUpdate => WhenNotMatched::DoNothing,
+            KeyedWriteSemantics::StrictInsert | KeyedWriteSemantics::Upsert => {
+                WhenNotMatched::InsertAll
+            }
+        });
+        if semantics != KeyedWriteSemantics::KnownPresentUpdate {
+            // Lance's scalar-index v1 route omits the inserted-row key filter.
+            // Every insertion-capable path therefore forces v2 and validates
+            // the exact-id filter below. Update-only staging may use v1 because
+            // DoNothing closes the insertion action and affected_rows owns OCC.
+            builder.use_index(false);
+        }
+        builder.conflict_retries(0);
+        // FirstSeen works around Lance #6877.  The batch entry point proves
+        // source-id uniqueness; the streaming entry point accepts only a
+        // trusted exact-id-PK graph dataset and also rejects duplicates within
+        // each physical record batch.
+        builder.source_dedupe_behavior(SourceDedupeBehavior::FirstSeen);
+        let uncommitted = builder
+            .try_build()
+            .map_err(|error| OmniError::Lance(error.to_string()))?
+            .execute_uncommitted(stream)
+            .await
+            .map_err(|error| OmniError::Lance(error.to_string()))?;
+
+        match semantics {
+            KeyedWriteSemantics::StrictInsert => {
+                validate_exact_id_filter(&uncommitted, id_field_id, context)?;
+                validate_strict_insert_merge_stats(&uncommitted, merged_rows, context)?;
+            }
+            KeyedWriteSemantics::Upsert => {
+                validate_exact_id_filter(&uncommitted, id_field_id, context)?;
+            }
+            KeyedWriteSemantics::KnownPresentUpdate => {
+                validate_known_present_update(&uncommitted, id_field_id, merged_rows, context)?;
+            }
+        }
+        let stats = uncommitted.stats.clone();
+        if semantics == KeyedWriteSemantics::KnownPresentUpdate {
+            crate::instrumentation::record_stage_known_present_update(merged_rows);
+        } else {
+            crate::instrumentation::record_stage_merge_insert(merged_rows);
+        }
+        Ok((staged_keyed_merge_result(uncommitted, context)?, stats))
+    }
+
+    /// Stream a provenance-proven pure-insert source interval in the same
+    /// 8,192-row / 32-MiB chunks accepted by [`Self::stage_keyed_write`].
+    ///
+    /// The caller proves from Lance transaction history that every version in
+    /// `(begin_version, end_version]` is insertion-only. This adapter evaluates
+    /// the row-version predicate against the pinned source and exposes only
+    /// those rows; it neither writes files nor advances HEAD. Every emitted
+    /// batch is compacted away from a retained parent allocation when needed
+    /// and rechecked against both hard ceilings before it reaches the per-chunk
+    /// strict keyed writer.
+    pub async fn scan_proven_insert_delta_bounded(
+        &self,
+        source: &Dataset,
+        table_key: &str,
+        begin_version: u64,
+        end_version: u64,
+        external_preflight: &ExternalBlobPreflight,
+    ) -> Result<SendableRecordBatchStream> {
+        use datafusion::prelude::{col, lit};
+
+        if begin_version >= end_version {
+            return Err(OmniError::manifest_internal(format!(
+                "scan_proven_insert_delta_bounded for {table_key} requires begin_version < end_version, got {begin_version}..={end_version}"
+            )));
+        }
+        if source.version().version != end_version {
+            return Err(OmniError::manifest_internal(format!(
+                "scan_proven_insert_delta_bounded for {table_key} received source version {}, expected pinned end version {end_version}",
+                source.version().version
+            )));
+        }
+        exact_id_primary_key_field_id(source, "scan_proven_insert_delta_bounded source")?;
+
+        let created_in_interval = col("_row_created_at_version")
+            .gt(lit(begin_version))
+            .and(col("_row_created_at_version").lt_eq(lit(end_version)));
+        let output_schema: SchemaRef = Arc::new(source.schema().into());
+        let has_blob_columns = source
+            .schema()
+            .fields_pre_order()
+            .any(|field| field.is_blob());
+
+        if !has_blob_columns {
+            let raw: SendableRecordBatchStream =
+                Self::scan_stream_with(source, None, None, None, false, move |scanner| {
+                    scanner.filter_expr(created_in_interval);
+                    scanner.batch_size(KEYED_WRITE_MAX_ROWS);
+                    scanner.batch_size_bytes(KEYED_WRITE_MAX_BYTES);
+                    Ok(())
+                })
+                .await?
+                .into();
+            let raw = observe_proven_insert_raw_stream(raw);
+            return Ok(bounded_proven_insert_stream(
+                output_schema,
+                raw,
+                table_key.to_string(),
+            ));
+        }
+
+        // Beta.21 cannot safely combine a predicate with a full blob-v2
+        // descriptor projection. Select the interval using only ordinary
+        // columns plus stable row ids, then take and materialize each exact
+        // matched row. The one-row materialization shape is intentionally
+        // conservative for blobs: it bounds payload allocation; the stream
+        // normalizer below then coalesces those rows into ordinary bounded
+        // recovery-transaction chunks.
+        let raw = Self::scan_proven_insert_blob_row_ids(source, begin_version, end_version).await?;
+        let materialized = futures::stream::try_unfold(
+            (
+                raw,
+                None::<RecordBatch>,
+                0_usize,
+                source.clone(),
+                self.clone(),
+                external_preflight.clone(),
+            ),
+            |(mut raw, mut current, mut offset, source, store, external_preflight)| async move {
+                loop {
+                    if let Some(batch) = current.as_ref()
+                        && offset < batch.num_rows()
+                    {
+                        let row = batch.slice(offset, 1);
+                        offset += 1;
+                        let row_id = row
+                                .column_by_name("_rowid")
+                                .and_then(|column| {
+                                    column.as_any().downcast_ref::<UInt64Array>()
+                                })
+                                .ok_or_else(|| {
+                                    datafusion::error::DataFusionError::Execution(
+                                        "scan_proven_insert_delta_bounded expected stable _rowid in blob source scan"
+                                            .to_string(),
+                                    )
+                                })?
+                                .value(0);
+                        let descriptors = source
+                            .take_rows(&[row_id], source.schema().clone())
+                            .await
+                            .map_err(|error| {
+                                datafusion::error::DataFusionError::Execution(error.to_string())
+                            })?;
+                        let materialized = store
+                            .materialize_blob_batch_with_row_ids(
+                                &source,
+                                descriptors,
+                                &[row_id],
+                                Some(KEYED_WRITE_MAX_BYTES),
+                                Some(&external_preflight),
+                                None,
+                            )
+                            .await
+                            .map_err(|error| {
+                                datafusion::error::DataFusionError::Execution(error.to_string())
+                            })?;
+                        return Ok(Some((
+                            materialized,
+                            (raw, current, offset, source, store, external_preflight),
+                        )));
+                    }
+
+                    match raw.try_next().await? {
+                        Some(batch) => {
+                            current = Some(batch);
+                            offset = 0;
+                        }
+                        None => return Ok(None),
+                    }
+                }
+            },
+        );
+        let materialized: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            output_schema.clone(),
+            materialized,
+        ));
+        Ok(bounded_proven_insert_stream(
+            output_schema,
+            materialized,
+            table_key.to_string(),
+        ))
+    }
+
+    /// Add only the Blob descriptors created in a provenance-proven source
+    /// interval to branch merge's operation-wide admission plan.
+    ///
+    /// The proof has already established that every logical change in the
+    /// interval is a new row, so a base/source ordered diff would repeat work
+    /// and defeat the certified path. Lance cannot safely combine the version
+    /// predicate with a Blob-v2 descriptor projection on the pinned release;
+    /// select stable row ids through ordinary columns, then take one exact
+    /// descriptor row at a time. The one-row shape is deliberate: URI limits
+    /// are charged before the selection retains a copy, and no payload or
+    /// external object is read here.
+    pub(crate) async fn include_proven_insert_blob_selection(
+        &self,
+        source: &Dataset,
+        table_key: &str,
+        begin_version: u64,
+        end_version: u64,
+        expected_rows: u64,
+        selection: &mut PersistedBlobSelection,
+    ) -> Result<()> {
+        if begin_version >= end_version {
+            return Err(OmniError::manifest_internal(format!(
+                "include_proven_insert_blob_selection for {table_key} requires begin_version < end_version, got {begin_version}..={end_version}"
+            )));
+        }
+        if source.version().version != end_version {
+            return Err(OmniError::manifest_internal(format!(
+                "include_proven_insert_blob_selection for {table_key} received source version {}, expected pinned end version {end_version}",
+                source.version().version
+            )));
+        }
+        exact_id_primary_key_field_id(source, "include_proven_insert_blob_selection source")?;
+
+        let mut raw =
+            Self::scan_proven_insert_blob_row_ids(source, begin_version, end_version).await?;
+        let mut observed_rows = 0_u64;
+        while let Some(batch) = raw
+            .try_next()
+            .await
+            .map_err(|error| OmniError::Lance(error.to_string()))?
+        {
+            let row_ids = batch
+                .column_by_name("_rowid")
+                .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
+                .ok_or_else(|| {
+                    OmniError::manifest_internal(format!(
+                        "proven insert descriptor selection for {table_key} expected stable _rowid"
+                    ))
+                })?;
+            for row in 0..batch.num_rows() {
+                let descriptors = source
+                    .take_rows(&[row_ids.value(row)], source.schema().clone())
+                    .await
+                    .map_err(|error| OmniError::Lance(error.to_string()))?;
+                selection.include_batch(&descriptors)?;
+                observed_rows = observed_rows.checked_add(1).ok_or_else(|| {
+                    OmniError::manifest_internal(
+                        "branch merge proven-insert descriptor row count overflow",
+                    )
+                })?;
+            }
+        }
+        if observed_rows != expected_rows {
+            return Err(OmniError::manifest_internal(format!(
+                "branch merge proven-insert descriptor selection for '{table_key}' observed {observed_rows} rows against a provenance proof for {expected_rows}"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn scan_proven_insert_blob_row_ids(
+        source: &Dataset,
+        begin_version: u64,
+        end_version: u64,
+    ) -> Result<SendableRecordBatchStream> {
+        use datafusion::prelude::{col, lit};
+
+        let created_in_interval = col("_row_created_at_version")
+            .gt(lit(begin_version))
+            .and(col("_row_created_at_version").lt_eq(lit(end_version)));
+        // The interval predicate and stable row id are sufficient to identify
+        // the exact descriptor rows. Keep vectors and unrelated scalar values
+        // out of this planning scan; `take_rows` below fetches the selected
+        // full row only when descriptor classification/materialization needs it.
+        let selector_columns = ["id"];
+        let raw: SendableRecordBatchStream = Self::scan_stream_with(
+            source,
+            Some(&selector_columns),
+            None,
+            None,
+            true,
+            move |scanner| {
+                scanner.filter_expr(created_in_interval);
+                scanner.batch_size(KEYED_WRITE_MAX_ROWS);
+                scanner.batch_size_bytes(KEYED_WRITE_MAX_BYTES);
+                Ok(())
+            },
+        )
+        .await?
+        .into();
+        Ok(observe_proven_insert_raw_stream(raw))
+    }
+
     /// Stage a merge_insert (upsert): write fragment files describing the
     /// merge result, return the uncommitted transaction plus the new
     /// fragments. The transaction's `Operation::Update` carries the
@@ -1163,6 +2858,7 @@ impl TableStore {
     /// `MergeInsertBuilder` accept additional staged fragments, or an
     /// in-memory pre-merge here that folds prior staged batches into the
     /// input stream. See `docs/dev/writes.md`.
+    #[cfg(test)]
     pub async fn stage_merge_insert(
         &self,
         ds: Dataset,
@@ -1263,6 +2959,94 @@ impl TableStore {
     /// the publisher at end-of-query to materialize all staged writes before
     /// the meta-manifest commit.
     pub async fn commit_staged(&self, ds: Arc<Dataset>, staged: StagedWrite) -> Result<Dataset> {
+        self.commit_staged_with_retry_budget(ds, staged, None)
+            .await
+            .map(|(dataset, _)| dataset)
+    }
+
+    /// Commit an RFC-022-enrolled staged effect with no commit-conflict retry.
+    ///
+    /// `CommitBuilder::with_max_retries(0)` gives Lance one commit attempt. It
+    /// can still perform its initial conflict-resolution pass before that
+    /// attempt, so this method also reads back and returns the identity of the
+    /// transaction that actually landed. Callers must compare it with
+    /// [`StagedWrite::transaction_identity`] AND require the returned dataset
+    /// version to equal `read_version + 1`: Lance's preflight rebase can
+    /// preserve the transaction fields while committing at a later version.
+    /// Either mismatch is a post-effect recovery case, not permission to widen
+    /// the prepared plan.
+    pub async fn commit_staged_exact(
+        &self,
+        ds: Arc<Dataset>,
+        staged: StagedWrite,
+    ) -> Result<(Dataset, StagedTransactionIdentity)> {
+        let (dataset, committed_identity) = self
+            .commit_staged_with_retry_budget(ds, staged, Some(0))
+            .await?;
+        let committed_identity = committed_identity.ok_or_else(|| {
+            OmniError::manifest_internal(
+                "Lance committed a staged effect without a readable transaction identity",
+            )
+        })?;
+        Ok((dataset, committed_identity))
+    }
+
+    /// Commit a staged first-touch dataset creation with no conflict retry.
+    ///
+    /// A create transaction is Lance's `Operation::Overwrite` at
+    /// `read_version = 0`. `with_max_retries(0)` selects Lance's strict
+    /// overwrite path: if another writer created the dataset after this
+    /// transaction was staged, Lance refuses the stale read-version-0 commit
+    /// instead of rebasing it over the winner. If both writers still observe
+    /// absence, the object store's atomic manifest create admits exactly one.
+    pub async fn commit_staged_create_exact(
+        &self,
+        dataset_uri: &str,
+        staged: StagedWrite,
+    ) -> Result<(Dataset, StagedTransactionIdentity)> {
+        if staged.transaction.read_version != 0
+            || !matches!(staged.transaction.operation, Operation::Overwrite { .. })
+        {
+            return Err(OmniError::manifest_internal(
+                "staged dataset creation must be an Overwrite transaction at read version 0",
+            ));
+        }
+        if staged.commit_metadata.affected_rows.is_some() {
+            return Err(OmniError::manifest_internal(
+                "staged dataset creation cannot carry affected-row metadata",
+            ));
+        }
+
+        let dataset = CommitBuilder::new(dataset_uri)
+            .use_stable_row_ids(true)
+            .with_storage_format(LanceFileVersion::V2_2)
+            .enable_v2_manifest_paths(true)
+            .with_session(self.session.clone())
+            .with_skip_auto_cleanup(true)
+            .with_max_retries(0)
+            .execute(staged.transaction)
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let committed_identity = dataset
+            .read_transaction()
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?
+            .as_ref()
+            .map(StagedTransactionIdentity::from)
+            .ok_or_else(|| {
+                OmniError::manifest_internal(
+                    "Lance created a dataset without a readable transaction identity",
+                )
+            })?;
+        Ok((dataset, committed_identity))
+    }
+
+    async fn commit_staged_with_retry_budget(
+        &self,
+        ds: Arc<Dataset>,
+        staged: StagedWrite,
+        max_retries: Option<u32>,
+    ) -> Result<(Dataset, Option<StagedTransactionIdentity>)> {
         // Skip Lance's auto-cleanup hook on every commit. OmniGraph owns version
         // GC explicitly (optimize.rs::cleanup_all_tables); Lance's hook fires off
         // the *dataset's stored* `lance.auto_cleanup.*` config, which graphs
@@ -1272,13 +3056,68 @@ impl TableStore {
         // data path) for new and legacy datasets alike, preventing Lance from
         // GC'ing versions the __manifest still pins for snapshots/time-travel.
         let mut builder = CommitBuilder::new(ds).with_skip_auto_cleanup(true);
+        if let Some(max_retries) = max_retries {
+            builder = builder.with_max_retries(max_retries);
+        }
         if let Some(affected_rows) = staged.commit_metadata.affected_rows {
             builder = builder.with_affected_rows(affected_rows);
         }
-        builder
+        let dataset = builder
             .execute(staged.transaction)
             .await
-            .map_err(|e| OmniError::Lance(e.to_string()))
+            .map_err(map_lance_commit_error)?;
+        let committed_identity = if max_retries.is_some() {
+            dataset
+                .read_transaction()
+                .await
+                .map_err(|e| OmniError::Lance(e.to_string()))?
+                .as_ref()
+                .map(StagedTransactionIdentity::from)
+        } else {
+            None
+        };
+        Ok((dataset, committed_identity))
+    }
+
+    /// Stage creation of a new dataset without publishing its first manifest.
+    ///
+    /// Lance models creation as an `Operation::Overwrite` transaction based on
+    /// version 0. Data files may be written by this call, but the dataset is not
+    /// readable until [`Self::commit_staged_create_exact`] atomically creates
+    /// version 1. The transaction UUID can therefore be bound to a recovery
+    /// identity before that first visible effect.
+    pub async fn stage_create(&self, dataset_uri: &str, batch: RecordBatch) -> Result<StagedWrite> {
+        let params = WriteParams {
+            mode: WriteMode::Create,
+            enable_stable_row_ids: true,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            allow_external_blob_outside_bases: true,
+            session: Some(self.session.clone()),
+            auto_cleanup: None,
+            skip_auto_cleanup: true,
+            ..Default::default()
+        };
+        let transaction = InsertBuilder::new(dataset_uri)
+            .with_params(&params)
+            .execute_uncommitted(vec![batch])
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        if transaction.read_version != 0 {
+            return Err(OmniError::manifest_internal(format!(
+                "stage_create resolved '{}' at existing version {}; expected an absent dataset",
+                dataset_uri, transaction.read_version
+            )));
+        }
+        let new_fragments = match &transaction.operation {
+            Operation::Overwrite { fragments, .. } => fragments.clone(),
+            other => {
+                return Err(OmniError::manifest_internal(format!(
+                    "stage_create: unexpected Lance operation {:?}",
+                    std::mem::discriminant(other)
+                )));
+            }
+        };
+        Ok(StagedWrite::new(transaction, new_fragments, Vec::new()))
     }
 
     /// Stage an overwrite (write_fragments + Operation::Overwrite { schema, fragments }).
@@ -1292,12 +3131,11 @@ impl TableStore {
     /// `stage_append`).
     ///
     /// MR-793 Phase 2: introduces this for the schema_apply rewrite path.
-    /// Lance API verified in `.context/mr-793-design.md` Appendix A.1.
     pub async fn stage_overwrite(&self, ds: &Dataset, batch: RecordBatch) -> Result<StagedWrite> {
         // `enable_stable_row_ids: true` is defensive — empirically Lance 6.0.1
         // preserves the source dataset's flag through `Operation::Overwrite`
         // when WriteParams omits it (pinned by
-        // `stage_overwrite_preserves_stable_row_ids` in tests/staged_writes.rs),
+        // `stage_overwrite_preserves_stable_row_ids` in table_store/staged_tests.rs),
         // but setting it explicitly keeps the invariant documented at every Overwrite site
         // (see docs/storage.md "Stable row IDs"). Setting it on an existing
         // dataset that was created without stable row IDs is a no-op per
@@ -1370,87 +3208,128 @@ impl TableStore {
         ))
     }
 
-    /// Stage a BTREE scalar index build. Returns a StagedWrite whose
-    /// transaction commits via `commit_staged`. HEAD does NOT advance.
+    /// Stage a batch of full-table index builds as one Lance transaction.
     ///
-    /// Lance shape: `CreateIndexBuilder::execute_uncommitted` returns
-    /// `IndexMetadata`; we manually wrap it in `Operation::CreateIndex
-    /// { new_indices, removed_indices }` via the public `TransactionBuilder`,
-    /// replicating the simple (non-segment-commit-path) branch of Lance's
-    /// `CreateIndexBuilder::execute` (lance-6.0.1 `src/index/create.rs:502-512`).
+    /// Each builder writes its immutable index artifact and returns complete
+    /// `IndexMetadata` through pinned Lance's public `execute_uncommitted` surface.
+    /// All metadata is based on the same pinned dataset version and is wrapped
+    /// in one `Operation::CreateIndex`, so committing any number of requested
+    /// BTREE, FTS, and vector indexes advances the table exactly once. HEAD does
+    /// not move during this method.
     ///
-    /// `removed_indices` mirrors `execute()` lines 466-476: when the
-    /// build replaces an existing same-named index, those entries are
-    /// listed for tombstoning by the manifest commit.
-    ///
-    /// MR-793 Phase 2: scalar index types (BTree, Inverted) are
-    /// stage-able. Vector indices are NOT (segment-commit-path requires
-    /// `build_index_metadata_from_segments` which is `pub(crate)` in
-    /// lance-6.0.1); see `create_vector_index` and Appendix A.3.
-    pub async fn stage_create_btree_index(
+    /// This intentionally covers OmniGraph's current one-segment full-table
+    /// vector shape. Lance's generic multi-segment commit helper remains an
+    /// inline-commit API and is not used here.
+    pub async fn stage_create_indices(
         &self,
         ds: &Dataset,
-        columns: &[&str],
+        specs: &[IndexBuildSpec],
     ) -> Result<StagedWrite> {
-        let params = ScalarIndexParams::default();
-        let mut ds_clone = ds.clone();
-        let new_idx = ds_clone
-            .create_index_builder(columns, IndexType::BTree, &params)
-            .replace(true)
-            .execute_uncommitted()
-            .await
-            .map_err(|e| OmniError::Lance(format!("stage_create_btree_index: {}", e)))?;
-        let removed_indices: Vec<IndexMetadata> = ds
-            .load_indices()
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?
-            .iter()
-            .filter(|idx| idx.name == new_idx.name)
-            .cloned()
-            .collect();
-        let transaction = TransactionBuilder::new(
-            new_idx.dataset_version,
-            Operation::CreateIndex {
-                new_indices: vec![new_idx],
-                removed_indices,
-            },
-        )
-        .build();
-        Ok(StagedWrite::new(transaction, Vec::new(), Vec::new()))
-    }
+        if specs.is_empty() {
+            return Err(OmniError::manifest_internal(
+                "stage_create_indices requires at least one index specification",
+            ));
+        }
 
-    /// Stage an INVERTED (FTS) scalar index build. Same shape as
-    /// `stage_create_btree_index`; see its docs for the Lance API
-    /// citation and contract notes.
-    pub async fn stage_create_inverted_index(
-        &self,
-        ds: &Dataset,
-        column: &str,
-    ) -> Result<StagedWrite> {
-        let params = InvertedIndexParams::default();
-        let mut ds_clone = ds.clone();
-        let new_idx = ds_clone
-            .create_index_builder(&[column], IndexType::Inverted, &params)
-            .replace(true)
-            .execute_uncommitted()
-            .await
-            .map_err(|e| OmniError::Lance(format!("stage_create_inverted_index: {}", e)))?;
-        let removed_indices: Vec<IndexMetadata> = ds
+        let read_version = ds.manifest.version;
+        let existing_indices = ds
             .load_indices()
             .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?
+            .map_err(|e| OmniError::Lance(format!("stage_create_indices: {e}")))?;
+        let mut new_indices = Vec::with_capacity(specs.len());
+        let mut new_names = std::collections::HashSet::with_capacity(specs.len());
+        let mut vector_builds = 0usize;
+
+        for spec in specs {
+            let (column, index_type) = match spec {
+                IndexBuildSpec::BTree { column, .. } => (column, "BTREE"),
+                IndexBuildSpec::FullText { column } => (column, "FTS"),
+                IndexBuildSpec::Vector { column } => (column, "Vector"),
+            };
+            if column.is_empty() {
+                return Err(OmniError::manifest_internal(format!(
+                    "stage_create_indices received an empty {index_type} column name"
+                )));
+            }
+
+            let mut ds_clone = ds.clone();
+            let new_idx = match spec {
+                IndexBuildSpec::BTree { column, name } => {
+                    let params = ScalarIndexParams::default();
+                    let columns = [column.as_str()];
+                    let mut builder =
+                        ds_clone.create_index_builder(&columns, IndexType::BTree, &params);
+                    // An explicit name keeps this BTREE from replacing a
+                    // same-column index of another kind under Lance's shared
+                    // default name (see `IndexBuildSpec::BTree`).
+                    if let Some(name) = name {
+                        builder = builder.name(name.clone());
+                    }
+                    builder.replace(true).execute_uncommitted().await
+                }
+                IndexBuildSpec::FullText { column } => {
+                    let params = InvertedIndexParams::default();
+                    ds_clone
+                        .create_index_builder(&[column.as_str()], IndexType::Inverted, &params)
+                        .replace(true)
+                        .execute_uncommitted()
+                        .await
+                }
+                IndexBuildSpec::Vector { column } => {
+                    let params =
+                        lance::index::vector::VectorIndexParams::ivf_flat(1, MetricType::L2);
+                    let new_idx = ds_clone
+                        .create_index_builder(&[column.as_str()], IndexType::Vector, &params)
+                        .replace(true)
+                        .execute_uncommitted()
+                        .await;
+                    if new_idx.is_ok() {
+                        vector_builds += 1;
+                    }
+                    new_idx
+                }
+            }
+            .map_err(|e| {
+                OmniError::Lance(format!(
+                    "stage_create_indices: build {index_type} index on '{column}': {e}"
+                ))
+            })?;
+
+            if new_idx.dataset_version != read_version {
+                return Err(OmniError::manifest_internal(format!(
+                    "staged index '{}' was built from dataset version {}, expected {}",
+                    new_idx.name, new_idx.dataset_version, read_version
+                )));
+            }
+            if !new_names.insert(new_idx.name.clone()) {
+                return Err(OmniError::manifest_internal(format!(
+                    "stage_create_indices produced duplicate index name '{}'",
+                    new_idx.name
+                )));
+            }
+            new_indices.push(new_idx);
+        }
+
+        let removed_indices: Vec<IndexMetadata> = existing_indices
             .iter()
-            .filter(|idx| idx.name == new_idx.name)
+            .filter(|idx| new_names.contains(&idx.name))
             .cloned()
             .collect();
         let transaction = TransactionBuilder::new(
-            new_idx.dataset_version,
+            read_version,
             Operation::CreateIndex {
-                new_indices: vec![new_idx],
+                new_indices,
                 removed_indices,
             },
         )
         .build();
+
+        // Preserve the existing build-count probe while moving the vector
+        // operation from inline commit to staged publication. Record only once
+        // the entire batch staged successfully.
+        for _ in 0..vector_builds {
+            crate::instrumentation::record_stage_vector_index();
+        }
         Ok(StagedWrite::new(transaction, Vec::new(), Vec::new()))
     }
 
@@ -1466,22 +3345,23 @@ impl TableStore {
     /// surface twice — once via the original committed fragment, once via
     /// the rewrite in `new_fragments`.
     ///
-    /// **Filter contract is incomplete on staged fragments.** When `filter`
-    /// is `Some(...)`, Lance pushes the predicate to per-fragment scans
-    /// with stats-based pruning. Uncommitted fragments produced by
-    /// `write_fragments_internal` lack the per-column statistics that
-    /// committed fragments carry; Lance's optimizer drops them from the
-    /// filtered scan even when their data would match. Staged-fragment
-    /// rows are silently absent from the result. `scanner.use_stats(false)`
-    /// does not fix this in lance 6.0.1. Callers needing correct filtered
-    /// reads against staged data should use a different strategy — the
-    /// engine's `MutationStaging` accumulator unions in-memory pending
-    /// batches with the committed scan via DataFusion `MemTable` (see
-    /// `scan_with_pending`).
+    /// **Filtered staged reads were incomplete before Lance 9.0.0.** Through
+    /// 9.0.0-rc.1, a `Some(filter)` scan pushed the predicate to per-fragment
+    /// scans with stats-based pruning, and uncommitted fragments produced by
+    /// `write_fragments_internal` lack the per-column statistics committed
+    /// fragments carry — so Lance's optimizer dropped them from the filtered
+    /// scan even when their data matched, and `scanner.use_stats(false)` did
+    /// not bypass it. Lance 9.0.0 closed that gap: matching staged rows are
+    /// now returned. `staged_tests::scan_with_staged_with_filter_returns_
+    /// matching_staged_rows` pins the current behavior.
     ///
-    /// This method remains on the surface for primitive-level testing
-    /// (basic stage + scan correctness without filters works) and for
-    /// callers that don't need filter pushdown.
+    /// Production never depended on either side of this. The engine's
+    /// `MutationStaging` accumulator unions in-memory pending batches with
+    /// the committed scan via DataFusion `MemTable` for read-your-writes
+    /// (see `scan_with_pending`), and no production caller passes a filter
+    /// here. This method remains on the surface for primitive-level testing.
+    // Sealed storage surface, pinned by name in tests/forbidden_apis.rs; no
+    #[allow(dead_code)]
     pub async fn scan_with_staged(
         &self,
         ds: &Dataset,
@@ -1551,8 +3431,9 @@ impl TableStore {
     ///   like `where age > 30` can match a row that an earlier
     ///   `set age = 20` already moved out of range.
     ///
-    /// When `pending_batches` is empty this delegates to the regular
-    /// scan path.
+    /// The committed side is always streamed so this mutation-only helper can
+    /// enforce its resource budget incrementally, including when there are no
+    /// pending batches.
     pub async fn scan_with_pending(
         &self,
         committed_ds: &Dataset,
@@ -1561,6 +3442,7 @@ impl TableStore {
         projection: Option<&[&str]>,
         filter: Option<&str>,
         key_column: Option<&str>,
+        budget: PendingScanBudget,
     ) -> Result<Vec<RecordBatch>> {
         // Contract: when merge-shadow semantics are requested via
         // `key_column`, the committed-side projection MUST include that
@@ -1571,7 +3453,7 @@ impl TableStore {
         // either (a) include the key in projection or (b) drop
         // `key_column` if union is what they wanted.
         if let (Some(key_col), Some(cols)) = (key_column, projection) {
-            if !cols.iter().any(|c| *c == key_col) {
+            if !cols.contains(&key_col) {
                 return Err(OmniError::Lance(format!(
                     "scan_with_pending: key_column '{}' must appear in projection \
                      when merge-shadow semantics are requested (got projection = {:?})",
@@ -1580,40 +3462,242 @@ impl TableStore {
             }
         }
 
-        let committed = self.scan(committed_ds, projection, filter, None).await?;
-        if pending_batches.is_empty() {
-            return Ok(committed);
+        // Pending is already bounded by MutationStaging, so evaluate its
+        // predicate first. Its complete key set (including pending rows that
+        // do not match this predicate) is retained separately and shadows the
+        // committed side before that side is charged to the output budget.
+        let pending_keys = match key_column {
+            Some(key_col) => collect_string_column_values(pending_batches, key_col)?,
+            None => std::collections::HashSet::new(),
+        };
+        let pending = if pending_batches.is_empty() {
+            Vec::new()
+        } else {
+            scan_pending_batches(pending_batches, pending_schema, projection, filter).await?
+        };
+        let mut account = PendingScanAccount::new(budget)?;
+        account.add_batches(&pending)?;
+
+        let scan_rows = account.next_scan_rows();
+        let scan_bytes = account.next_scan_bytes();
+        let mut stream =
+            Self::scan_stream_with(committed_ds, projection, filter, None, false, |scanner| {
+                // Scanner byte batches are approximate, so correctness comes
+                // from the per-emission accounting below. These values keep a
+                // normal scan from decoding the entire match set before that
+                // accounting can return the typed limit.
+                scanner.batch_size(scan_rows);
+                scanner.batch_size_bytes(scan_bytes);
+                Ok(())
+            })
+            .await?;
+
+        let mut committed = Vec::new();
+        while let Some(batch) = stream
+            .try_next()
+            .await
+            .map_err(|error| OmniError::Lance(error.to_string()))?
+        {
+            let batch = if let Some(key_col) = key_column
+                && !pending_keys.is_empty()
+            {
+                filter_out_rows_where_string_in(vec![batch], key_col, &pending_keys)?
+                    .into_iter()
+                    .next()
+                    .expect("one committed input batch produces one shadow-filtered batch")
+            } else {
+                batch
+            };
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            account.add_batch(&batch)?;
+            committed.push(batch);
         }
 
-        // Shadow committed rows whose key value also appears in pending.
-        // This makes scan_with_pending implement merge semantics rather
-        // than naive union: any row that has a pending update is
-        // represented ONLY by its pending value, never by both its
-        // (stale) committed value and its (current) pending value.
-        let committed = match key_column {
-            Some(key_col) => {
-                let pending_keys = collect_string_column_values(pending_batches, key_col)?;
-                if pending_keys.is_empty() {
-                    committed
-                } else {
-                    filter_out_rows_where_string_in(committed, key_col, &pending_keys)?
-                }
-            }
-            None => committed,
+        committed.extend(pending);
+        Ok(committed)
+    }
+
+    /// Read a blob-bearing table as a full logical merge source while retaining
+    /// [`Self::scan_with_pending`]'s merge-shadow semantics.
+    ///
+    /// Lance normally scans blob-v2 columns as physical descriptor structs.
+    /// Those descriptors are a read representation, not valid writer input: a
+    /// full-row merge sends them through the blob writer, which requires the
+    /// logical `Struct<data, uri>` shape and fails with `Blob struct missing
+    /// data field`. This remained hidden while an `id` BTREE forced Lance's
+    /// partial-column merge plan; once index creation became reconciler-owned,
+    /// an index-absent table correctly selected the full-scan plan and exposed
+    /// the representation mismatch.
+    ///
+    /// A first scan evaluates `filter` with blob columns excluded and retains
+    /// stable row ids. Full descriptor rows are then taken by those ids without
+    /// a filter, and only their payloads are rebuilt as logical
+    /// [`BlobArrayBuilder`] columns. Pending rows already carry logical blob
+    /// arrays; both sides have the dataset's full logical schema before the
+    /// existing shadow union. The resulting batch is therefore valid for either
+    /// of Lance's merge plans, making physical index presence a performance
+    /// detail rather than a correctness precondition.
+    pub async fn scan_with_pending_materialized_blobs(
+        &self,
+        committed_ds: &Dataset,
+        pending_batches: &[RecordBatch],
+        pending_schema: Option<SchemaRef>,
+        filter: Option<&str>,
+        key_column: Option<&str>,
+        budget: PendingScanBudget,
+    ) -> Result<Vec<RecordBatch>> {
+        let blob_columns = committed_ds
+            .schema()
+            .fields
+            .iter()
+            .filter(|field| field.is_blob())
+            .map(|field| field.name.clone())
+            .collect::<Vec<_>>();
+        if blob_columns.is_empty() {
+            return self
+                .scan_with_pending(
+                    committed_ds,
+                    pending_batches,
+                    pending_schema,
+                    None,
+                    filter,
+                    key_column,
+                    budget,
+                )
+                .await;
+        }
+
+        // The pinned Lance revision cannot combine a predicate filter with a
+        // full blob-v2 projection: `FilteredReadExec` applies the descriptor
+        // child projection to the logical blob field and panics. Select the
+        // matched rows without blob columns, retaining stable `_rowid`, then
+        // take exactly those full descriptor rows without a filter and rebuild
+        // their logical blobs. Thus payload I/O remains proportional to matched
+        // rows while avoiding any dependence on which merge/index plan Lance
+        // selects later.
+        let non_blob_columns = committed_ds
+            .schema()
+            .fields
+            .iter()
+            .filter(|field| !field.is_blob())
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>();
+        let pending_keys = match key_column {
+            Some(key_col) => collect_string_column_values(pending_batches, key_col)?,
+            None => std::collections::HashSet::new(),
         };
+        let pending = if pending_batches.is_empty() {
+            Vec::new()
+        } else {
+            scan_pending_batches(pending_batches, pending_schema, None, filter).await?
+        };
+        let mut account = PendingScanAccount::new(budget)?;
+        account.add_batches(&pending)?;
 
-        let pending =
-            scan_pending_batches(pending_batches, pending_schema, projection, filter).await?;
+        let scan_rows = account.next_scan_rows();
+        let scan_bytes = account.next_scan_bytes();
+        let mut matched = Self::scan_stream_with(
+            committed_ds,
+            Some(&non_blob_columns),
+            filter,
+            None,
+            true,
+            |scanner| {
+                scanner.batch_size(scan_rows);
+                scanner.batch_size_bytes(scan_bytes);
+                Ok(())
+            },
+        )
+        .await?;
 
-        let mut out = committed;
-        out.extend(pending);
-        Ok(out)
+        let mut committed = Vec::new();
+        while let Some(batch) = matched
+            .try_next()
+            .await
+            .map_err(|error| OmniError::Lance(error.to_string()))?
+        {
+            // Shadow before row charging and before any blob handle/read. A
+            // prior pending row owns the logical id even when it no longer
+            // matches this update predicate.
+            let batch = if let Some(key_col) = key_column
+                && !pending_keys.is_empty()
+            {
+                filter_out_rows_where_string_in(vec![batch], key_col, &pending_keys)?
+                    .into_iter()
+                    .next()
+                    .expect("one committed input batch produces one shadow-filtered batch")
+            } else {
+                batch
+            };
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            account.ensure_additional_rows(batch.num_rows())?;
+            // This predicate scan contains every logical non-blob column and
+            // `_rowid`, but no blob descriptors/payloads. Charge the logical
+            // columns now so an already-overwide match fails before
+            // `take_rows` performs the second full-row read.
+            let non_blob_bytes = non_blob_column_bytes(committed_ds, &batch)?;
+            let payload_budget = account.remaining_bytes_after(non_blob_bytes)?;
+
+            let row_ids = batch
+                .column_by_name("_rowid")
+                .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
+                .ok_or_else(|| {
+                    OmniError::Lance("expected _rowid in predicate-matched blob scan".to_string())
+                })?
+                .values()
+                .to_vec();
+            if row_ids.is_empty() {
+                continue;
+            }
+            let descriptors = committed_ds
+                .take_rows(&row_ids, committed_ds.schema().clone())
+                .await
+                .map_err(|error| OmniError::Lance(error.to_string()))?;
+            let materialized = match self
+                .materialize_blob_batch_with_row_ids(
+                    committed_ds,
+                    descriptors,
+                    &row_ids,
+                    Some(payload_budget),
+                    None,
+                    None,
+                )
+                .await
+            {
+                Err(OmniError::ResourceLimitExceeded { actual, .. }) => {
+                    let actual = account
+                        .bytes_with(non_blob_bytes)?
+                        .checked_add(actual)
+                        .ok_or_else(|| {
+                            OmniError::manifest_internal("pending scan byte count overflow")
+                        })?;
+                    return Err(OmniError::resource_limit(
+                        format!("keyed bytes for {}", account.table_key()),
+                        KEYED_WRITE_MAX_BYTES,
+                        actual,
+                    ));
+                }
+                Err(error) => return Err(error),
+                Ok(materialized) => materialized,
+            };
+            account.add_batch(&materialized)?;
+            committed.push(materialized);
+        }
+
+        committed.extend(pending);
+        Ok(committed)
     }
 
     /// `count_rows` variant that respects staged writes. Used for
     /// edge-cardinality validation that needs to see staged edges before
     /// commit. Same `committed - removed + new` composition as
     /// `scan_with_staged`.
+    // Sealed storage surface, pinned by name in tests/forbidden_apis.rs; no
+    #[allow(dead_code)]
     pub async fn count_rows_with_staged(
         &self,
         ds: &Dataset,
@@ -1637,11 +3721,7 @@ impl TableStore {
         Ok(count as usize)
     }
 
-    async fn user_indices_for_column(
-        &self,
-        ds: &Dataset,
-        column: &str,
-    ) -> Result<Vec<IndexMetadata>> {
+    async fn user_indices_for_column(ds: &Dataset, column: &str) -> Result<Vec<IndexMetadata>> {
         let field_id = ds
             .schema()
             .field(column)
@@ -1665,7 +3745,11 @@ impl TableStore {
     }
 
     pub async fn has_btree_index(&self, ds: &Dataset, column: &str) -> Result<bool> {
-        let indices = self.user_indices_for_column(ds, column).await?;
+        Self::has_btree_index_on(ds, column).await
+    }
+
+    pub(crate) async fn has_btree_index_on(ds: &Dataset, column: &str) -> Result<bool> {
+        let indices = Self::user_indices_for_column(ds, column).await?;
         Ok(indices.iter().any(|index| {
             index
                 .index_details
@@ -1676,7 +3760,11 @@ impl TableStore {
     }
 
     pub async fn has_fts_index(&self, ds: &Dataset, column: &str) -> Result<bool> {
-        let indices = self.user_indices_for_column(ds, column).await?;
+        Self::has_fts_index_on(ds, column).await
+    }
+
+    pub(crate) async fn has_fts_index_on(ds: &Dataset, column: &str) -> Result<bool> {
+        let indices = Self::user_indices_for_column(ds, column).await?;
         Ok(indices.iter().any(|index| {
             index
                 .index_details
@@ -1687,7 +3775,11 @@ impl TableStore {
     }
 
     pub async fn has_vector_index(&self, ds: &Dataset, column: &str) -> Result<bool> {
-        let indices = self.user_indices_for_column(ds, column).await?;
+        Self::has_vector_index_on(ds, column).await
+    }
+
+    pub(crate) async fn has_vector_index_on(ds: &Dataset, column: &str) -> Result<bool> {
+        let indices = Self::user_indices_for_column(ds, column).await?;
         Ok(indices.iter().any(|index| {
             index
                 .index_details
@@ -1695,18 +3787,6 @@ impl TableStore {
                 .map(|details| IndexDetails(details.clone()).is_vector())
                 .unwrap_or(false)
         }))
-    }
-
-    pub(crate) async fn create_vector_index(&self, ds: &mut Dataset, column: &str) -> Result<()> {
-        let params = lance::index::vector::VectorIndexParams::ivf_flat(1, MetricType::L2);
-        ds.create_index_builder(&[column], IndexType::Vector, &params)
-            .replace(true)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-        // Record only after the index build succeeds, so a failed build does not
-        // inflate the probe (matches the `stage_*` probes).
-        crate::instrumentation::record_create_vector_index();
-        Ok(())
     }
 
     pub async fn create_empty_dataset(dataset_uri: &str, schema: &SchemaRef) -> Result<Dataset> {
@@ -1724,12 +3804,13 @@ impl TableStore {
             batch
                 .column_by_name("_rowid")
                 .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
-                .and_then(|arr| (arr.len() > 0).then(|| arr.value(0)))
+                .and_then(|arr| (!arr.is_empty()).then(|| arr.value(0)))
         }))
     }
 
     pub async fn write_dataset(dataset_uri: &str, batch: RecordBatch) -> Result<Dataset> {
         let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let control_session = crate::lance_access::control_session();
         let params = WriteParams {
             mode: WriteMode::Create,
             enable_stable_row_ids: true,
@@ -1737,11 +3818,22 @@ impl TableStore {
             allow_external_blob_outside_bases: true,
             auto_cleanup: None,
             skip_auto_cleanup: true,
+            session: Some(control_session),
             ..Default::default()
         };
         Dataset::write(reader, dataset_uri, Some(params))
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))
+    }
+}
+
+fn map_lance_commit_error(error: lance::Error) -> OmniError {
+    match error {
+        error @ (lance::Error::RetryableCommitConflict { .. }
+        | lance::Error::TooMuchWriteContention { .. }) => {
+            OmniError::RetryableCommitConflict(error.to_string())
+        }
+        error => OmniError::Lance(error.to_string()),
     }
 }
 
@@ -1778,6 +3870,8 @@ impl TableStore {
 /// `stage_append`'s D₂′ contract. For `stage_merge_insert` results the
 /// `new_fragments` include rewrites that don't add new rows, so this
 /// would over-count.
+// Staged-write helper retained alongside the sealed storage surface; no
+#[allow(dead_code)]
 fn prior_stages_fragment_count(prior_stages: &[StagedWrite]) -> u64 {
     prior_stages
         .iter()
@@ -1800,6 +3894,8 @@ fn assign_fragment_ids(fragments: &mut [Fragment], start_id: u64) {
     }
 }
 
+// Staged-write helper retained alongside the sealed storage surface; no
+#[allow(dead_code)]
 fn prior_stages_row_count(prior_stages: &[StagedWrite]) -> Result<u64> {
     let mut total: u64 = 0;
     for stage in prior_stages {
@@ -1842,6 +3938,146 @@ fn assign_row_id_meta(fragments: &mut [Fragment], start_row_id: u64) -> Result<(
         next_row_id += physical_rows;
     }
     Ok(())
+}
+
+/// Incremental resource accounting for a pending-aware update scan.
+///
+/// The retained `Vec<RecordBatch>` never grows past this account: pending
+/// results are charged first, and each committed scanner emission is charged
+/// only after pending-key shadowing. `initial_rows` represents this table's
+/// retained batches, while `initial_bytes` represents every table retained by
+/// `MutationStaging`, so a chained cross-table update receives only the
+/// remaining graph-operation byte budget.
+struct PendingScanAccount {
+    table_key: String,
+    rows: u64,
+    bytes: u64,
+}
+
+impl PendingScanAccount {
+    fn new(budget: PendingScanBudget) -> Result<Self> {
+        let mut account = Self {
+            table_key: budget.table_key,
+            rows: 0,
+            bytes: 0,
+        };
+        account.add_usage(budget.initial_rows, budget.initial_bytes)?;
+        Ok(account)
+    }
+
+    fn table_key(&self) -> &str {
+        &self.table_key
+    }
+
+    fn add_batches(&mut self, batches: &[RecordBatch]) -> Result<()> {
+        for batch in batches {
+            self.add_batch(batch)?;
+        }
+        Ok(())
+    }
+
+    fn add_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        let rows = u64::try_from(batch.num_rows())
+            .map_err(|_| OmniError::manifest_internal("pending scan row count exceeds u64"))?;
+        let bytes = u64::try_from(batch.get_array_memory_size())
+            .map_err(|_| OmniError::manifest_internal("pending scan bytes exceed u64"))?;
+        self.add_usage(rows, bytes)
+    }
+
+    fn add_usage(&mut self, rows: u64, bytes: u64) -> Result<()> {
+        let next_rows = self
+            .rows
+            .checked_add(rows)
+            .ok_or_else(|| OmniError::manifest_internal("pending scan row count overflow"))?;
+        if next_rows > KEYED_WRITE_MAX_ROWS as u64 {
+            return Err(OmniError::resource_limit(
+                format!("keyed rows for {}", self.table_key),
+                KEYED_WRITE_MAX_ROWS as u64,
+                next_rows,
+            ));
+        }
+        let next_bytes = self
+            .bytes
+            .checked_add(bytes)
+            .ok_or_else(|| OmniError::manifest_internal("pending scan byte count overflow"))?;
+        if next_bytes > KEYED_WRITE_MAX_BYTES {
+            return Err(OmniError::resource_limit(
+                format!("keyed bytes for {}", self.table_key),
+                KEYED_WRITE_MAX_BYTES,
+                next_bytes,
+            ));
+        }
+        self.rows = next_rows;
+        self.bytes = next_bytes;
+        Ok(())
+    }
+
+    fn ensure_additional_rows(&self, rows: usize) -> Result<()> {
+        let rows = u64::try_from(rows)
+            .map_err(|_| OmniError::manifest_internal("pending scan row count exceeds u64"))?;
+        let actual = self
+            .rows
+            .checked_add(rows)
+            .ok_or_else(|| OmniError::manifest_internal("pending scan row count overflow"))?;
+        if actual > KEYED_WRITE_MAX_ROWS as u64 {
+            return Err(OmniError::resource_limit(
+                format!("keyed rows for {}", self.table_key),
+                KEYED_WRITE_MAX_ROWS as u64,
+                actual,
+            ));
+        }
+        Ok(())
+    }
+
+    fn bytes_with(&self, bytes: u64) -> Result<u64> {
+        self.bytes
+            .checked_add(bytes)
+            .ok_or_else(|| OmniError::manifest_internal("pending scan byte count overflow"))
+    }
+
+    fn remaining_bytes_after(&self, bytes: u64) -> Result<u64> {
+        let actual = self.bytes_with(bytes)?;
+        if actual > KEYED_WRITE_MAX_BYTES {
+            return Err(OmniError::resource_limit(
+                format!("keyed bytes for {}", self.table_key),
+                KEYED_WRITE_MAX_BYTES,
+                actual,
+            ));
+        }
+        Ok(KEYED_WRITE_MAX_BYTES - actual)
+    }
+
+    fn next_scan_rows(&self) -> usize {
+        let remaining = (KEYED_WRITE_MAX_ROWS as u64).saturating_sub(self.rows);
+        usize::try_from(remaining.saturating_add(1).min(KEYED_WRITE_MAX_ROWS as u64))
+            .unwrap_or(KEYED_WRITE_MAX_ROWS)
+            .max(1)
+    }
+
+    fn next_scan_bytes(&self) -> u64 {
+        KEYED_WRITE_MAX_BYTES.saturating_sub(self.bytes).max(1)
+    }
+}
+
+/// Exact Arrow bytes already present in the eventual logical output before
+/// blob payload arrays are rebuilt. This lets the blob-size preflight consume
+/// only the true remaining table budget before any `BlobFile::read`.
+fn non_blob_column_bytes(ds: &Dataset, batch: &RecordBatch) -> Result<u64> {
+    ds.schema()
+        .fields
+        .iter()
+        .filter(|field| !field.is_blob())
+        .try_fold(0_u64, |total, field| {
+            let column = batch.column_by_name(&field.name).ok_or_else(|| {
+                OmniError::Lance(format!("batch missing column '{}'", field.name))
+            })?;
+            let bytes = u64::try_from(column.get_array_memory_size()).map_err(|_| {
+                OmniError::manifest_internal("non-blob pending scan bytes exceed u64")
+            })?;
+            total.checked_add(bytes).ok_or_else(|| {
+                OmniError::manifest_internal("non-blob pending scan byte count overflow")
+            })
+        })
 }
 
 /// Collect the set of values in a Utf8 column across multiple batches.
@@ -1980,6 +4216,9 @@ async fn scan_pending_batches(
         .map_err(|e| OmniError::Lance(e.to_string()))
 }
 
+// Staged-write helper retained alongside the sealed storage surface; its
+// only callers are the equally-unused `*_with_staged` methods.
+#[allow(dead_code)]
 fn combine_committed_with_staged(ds: &Dataset, staged: &[StagedWrite]) -> Vec<Fragment> {
     let removed: std::collections::HashSet<u64> = staged
         .iter()
@@ -1998,6 +4237,1052 @@ fn combine_committed_with_staged(ds: &Dataset, staged: &[StagedWrite]) -> Vec<Fr
     combined
 }
 
+struct LogicalBlobInput<'a> {
+    data: &'a LargeBinaryArray,
+    uris: &'a StringArray,
+}
+
+fn logical_blob_input<'a>(
+    descriptions: &'a StructArray,
+    field_name: &str,
+) -> Result<LogicalBlobInput<'a>> {
+    let fields = descriptions.fields();
+    let exact_shape = fields.len() == 2
+        && fields[0].name() == "data"
+        && fields[0].data_type() == &arrow_schema::DataType::LargeBinary
+        && fields[0].is_nullable()
+        && fields[1].name() == "uri"
+        && fields[1].data_type() == &arrow_schema::DataType::Utf8
+        && fields[1].is_nullable();
+    if !exact_shape {
+        return Err(OmniError::manifest(format!(
+            "logical Blob input '{field_name}' must have exact nullable children data:LargeBinary and uri:Utf8; prepared storage descriptors are not accepted"
+        )));
+    }
+    let data = descriptions
+        .column(0)
+        .as_any()
+        .downcast_ref::<LargeBinaryArray>()
+        .ok_or_else(|| {
+            OmniError::manifest(format!(
+                "logical Blob input '{field_name}' has a non-LargeBinary data child"
+            ))
+        })?;
+    let uris = descriptions
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            OmniError::manifest(format!(
+                "logical Blob input '{field_name}' has a non-Utf8 uri child"
+            ))
+        })?;
+    Ok(LogicalBlobInput { data, uris })
+}
+
+/// Add persisted Blob-v2 descriptors to a bounded, descriptor-only operation
+/// selection without opening a target object. Managed lengths and exact
+/// external ranges survive this pass so branch merge neither undercounts
+/// carried bytes nor charges a small range as the whole external object.
+fn append_persisted_blob_selection(
+    selection: &mut PersistedBlobSelection,
+    batch: &RecordBatch,
+) -> Result<()> {
+    for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
+        let lance_field = lance::datatypes::Field::try_from(field.as_ref())
+            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        if !lance_field.is_blob() {
+            continue;
+        }
+        let descriptions = column
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| {
+                OmniError::Lance(format!(
+                    "persisted Blob descriptor '{}' is not a struct",
+                    field.name()
+                ))
+            })?;
+        let decoder = BlobDescriptorDecoder::try_new(descriptions)?;
+        for row in 0..descriptions.len() {
+            match decoder.classify(row)? {
+                BlobDescriptor::Null => {}
+                BlobDescriptor::Managed { length } => {
+                    selection.add_managed_payload(length)?;
+                }
+                BlobDescriptor::External {
+                    uri,
+                    offset,
+                    length,
+                } => {
+                    selection.push_external(uri, offset, length)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate the exact logical Blob input shape and visit URI cells with
+/// multiplicity. Raw length is checked before the visitor can retain a copy.
+/// This function performs no object-store I/O.
+fn visit_external_blob_uris<'a>(
+    batch: &'a RecordBatch,
+    mut visit: impl FnMut(&'a str) -> Result<()>,
+) -> Result<()> {
+    for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
+        let lance_field = lance::datatypes::Field::try_from(field.as_ref())
+            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        if !lance_field.is_blob() {
+            continue;
+        }
+        let descriptions = column
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| {
+                OmniError::manifest(format!(
+                    "logical Blob input '{}' is not a struct",
+                    field.name()
+                ))
+            })?;
+        let input = logical_blob_input(descriptions, field.name())?;
+        for row in 0..descriptions.len() {
+            if descriptions.is_null(row) {
+                continue;
+            }
+            let has_data = input.data.is_valid(row);
+            let has_uri = input.uris.is_valid(row) && !input.uris.value(row).is_empty();
+            match (has_data, has_uri) {
+                (true, false) => {}
+                (false, true) => {
+                    let uri = input.uris.value(row);
+                    crate::blob::validate_external_blob_uri_raw_limit(uri)?;
+                    visit(uri)?;
+                }
+                (true, true) => {
+                    return Err(OmniError::manifest(format!(
+                        "Blob '{}' row {row} cannot contain both inline data and a URI",
+                        field.name()
+                    )));
+                }
+                (false, false) => {
+                    return Err(OmniError::manifest(format!(
+                        "non-null Blob '{}' row {row} contains neither data nor a URI",
+                        field.name()
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate and collect one batch's external URI cells under the same bounded
+/// ownership contract used by graph-operation staging.
+pub(crate) fn collect_external_blob_uris(batch: &RecordBatch) -> Result<Vec<String>> {
+    let mut collector = ExternalBlobUriCollector::default();
+    collector.include_batch(batch)?;
+    Ok(collector.into_vec())
+}
+
+/// Replace each logical URI cell with the canonical spelling admitted by the
+/// preflight while preserving parent validity and the original data child.
+/// This is descriptor-only: no external payload is read and inline values are
+/// not copied into a new binary buffer.
+fn canonicalize_external_blob_inputs(
+    batch: RecordBatch,
+    preflight: &ExternalBlobPreflight,
+) -> Result<RecordBatch> {
+    let external_uris = collect_external_blob_uris(&batch)?;
+    if external_uris.is_empty() {
+        return Ok(batch);
+    }
+
+    let schema = batch.schema();
+    let mut columns = Vec::with_capacity(batch.num_columns());
+    for (field, column) in schema.fields().iter().zip(batch.columns()) {
+        let lance_field = lance::datatypes::Field::try_from(field.as_ref())
+            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        if !lance_field.is_blob() {
+            columns.push(column.clone());
+            continue;
+        }
+        let descriptions = column
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| OmniError::manifest("logical Blob input is not a struct"))?;
+        let input = logical_blob_input(descriptions, field.name())?;
+        let mut uris = StringBuilder::with_capacity(descriptions.len(), 0);
+        for row in 0..descriptions.len() {
+            if input.uris.is_null(row) {
+                uris.append_null();
+            } else if descriptions.is_null(row) {
+                // Parent validity is the sole null signal. Preserve ignored
+                // child state exactly instead of consulting policy for it.
+                uris.append_value(input.uris.value(row));
+            } else {
+                let raw = input.uris.value(row);
+                let entry = preflight.entry(raw)?;
+                uris.append_value(entry.normalized_uri.as_str());
+            }
+        }
+        columns.push(Arc::new(StructArray::new(
+            descriptions.fields().clone(),
+            vec![Arc::new(input.data.clone()), Arc::new(uris.finish())],
+            descriptions.nulls().cloned(),
+        )) as ArrayRef);
+    }
+    RecordBatch::try_new(schema, columns).map_err(|error| OmniError::Lance(error.to_string()))
+}
+
+/// Materialize logical external-URI Blob cells before keyed merge-insert.
+/// Preflight owns policy, normalization, shared-client setup, and HEAD. This
+/// pass charges every URI occurrence before its first payload read.
+async fn materialize_external_blob_inputs(
+    batch: RecordBatch,
+    max_payload_bytes: u64,
+    preflight: &ExternalBlobPreflight,
+) -> Result<RecordBatch> {
+    let external_uris = collect_external_blob_uris(&batch)?;
+    let materialized_payload_bytes = preflight.materialized_payload_bytes(&external_uris)?;
+    if materialized_payload_bytes > max_payload_bytes {
+        return Err(OmniError::resource_limit(
+            "materialized external blob payload bytes",
+            max_payload_bytes,
+            materialized_payload_bytes,
+        ));
+    }
+    if external_uris.is_empty() {
+        return Ok(batch);
+    }
+
+    let schema = batch.schema();
+    let mut columns = Vec::with_capacity(batch.num_columns());
+    let mut external_payloads: HashMap<String, Arc<[u8]>> = HashMap::new();
+    for (field, column) in schema.fields().iter().zip(batch.columns()) {
+        let lance_field = lance::datatypes::Field::try_from(field.as_ref())
+            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        if !lance_field.is_blob() {
+            columns.push(column.clone());
+            continue;
+        }
+        let descriptions = column
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| OmniError::manifest("logical Blob input is not a struct"))?;
+        let input = logical_blob_input(descriptions, field.name())?;
+        let mut builder = BlobArrayBuilder::new(descriptions.len());
+        for row in 0..descriptions.len() {
+            if descriptions.is_null(row) {
+                builder
+                    .push_null()
+                    .map_err(|error| OmniError::Lance(error.to_string()))?;
+            } else if input.data.is_valid(row) {
+                builder
+                    .push_bytes(input.data.value(row))
+                    .map_err(|error| OmniError::Lance(error.to_string()))?;
+            } else {
+                let uri = input.uris.value(row);
+                let entry = preflight.entry(uri)?;
+                let normalized = entry.normalized_uri.as_str();
+                let bytes = match external_payloads.get(normalized) {
+                    Some(bytes) => Arc::clone(bytes),
+                    None => {
+                        let bytes = entry.read_full().await?;
+                        external_payloads.insert(normalized.to_string(), Arc::clone(&bytes));
+                        bytes
+                    }
+                };
+                builder
+                    .push_bytes(bytes.as_ref())
+                    .map_err(|error| OmniError::Lance(error.to_string()))?;
+            }
+        }
+        columns.push(
+            builder
+                .finish()
+                .map_err(|error| OmniError::Lance(error.to_string()))?,
+        );
+    }
+    RecordBatch::try_new(schema, columns).map_err(|error| OmniError::Lance(error.to_string()))
+}
+
+/// The provenance scanner copies every source blob into a logical in-memory
+/// value before the proof-only adapter is selected. Refuse any prepared blob-v2
+/// descriptor or remaining URI here: Lance treats prepared descriptors as a
+/// passthrough, so `allow_external_blob_outside_bases = false` alone would not
+/// stop a future caller from smuggling a source-branch file reference into the
+/// target dataset.
+fn ensure_proven_insert_blobs_are_materialized(batch: &RecordBatch, table_key: &str) -> Result<()> {
+    for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
+        let lance_field = lance::datatypes::Field::try_from(field.as_ref())
+            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        if !lance_field.is_blob() {
+            continue;
+        }
+        let descriptions = column
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "proven insert blob '{}' on {table_key} is not a logical blob struct",
+                    field.name()
+                ))
+            })?;
+        if descriptions.column_by_name("kind").is_some() {
+            return Err(OmniError::manifest_internal(format!(
+                "proven insert blob '{}' on {table_key} retained a prepared descriptor",
+                field.name()
+            )));
+        }
+        let data = descriptions
+            .column_by_name("data")
+            .and_then(|array| array.as_any().downcast_ref::<LargeBinaryArray>())
+            .ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "proven insert blob '{}' on {table_key} is missing materialized data",
+                    field.name()
+                ))
+            })?;
+        let uris = descriptions
+            .column_by_name("uri")
+            .and_then(|array| array.as_any().downcast_ref::<StringArray>())
+            .ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "proven insert blob '{}' on {table_key} is missing its logical URI field",
+                    field.name()
+                ))
+            })?;
+        for row in 0..descriptions.len() {
+            if descriptions.is_null(row) {
+                continue;
+            }
+            if !data.is_valid(row) {
+                return Err(OmniError::manifest_internal(format!(
+                    "proven insert blob '{}' on {table_key} row {row} has no materialized bytes",
+                    field.name()
+                )));
+            }
+            if uris.is_valid(row) && !uris.value(row).is_empty() {
+                return Err(OmniError::manifest_internal(format!(
+                    "proven insert blob '{}' on {table_key} row {row} still references an external URI",
+                    field.name()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn exact_id_primary_key_field_id(ds: &Dataset, context: &'static str) -> Result<i32> {
+    let primary_key = ds.schema().unenforced_primary_key();
+    if primary_key.len() == 1
+        && primary_key[0].name == "id"
+        && !primary_key[0].nullable
+        && primary_key[0].data_type() == arrow_schema::DataType::Utf8
+    {
+        return Ok(primary_key[0].id);
+    }
+    let actual: Vec<&str> = primary_key
+        .iter()
+        .map(|field| field.name.as_str())
+        .collect();
+    Err(OmniError::manifest_internal(format!(
+        "{context}: dataset must declare exactly ['id'] as a non-null Utf8 Lance unenforced \
+         primary key, got {actual:?}"
+    )))
+}
+
+fn schema_preorder_field_ids(ds: &Dataset, context: &'static str) -> Result<Vec<u32>> {
+    ds.schema()
+        .fields_pre_order()
+        .map(|field| {
+            u32::try_from(field.id).map_err(|_| {
+                OmniError::manifest_internal(format!(
+                    "{context}: dataset schema contains negative field id {}",
+                    field.id
+                ))
+            })
+        })
+        .collect()
+}
+
+fn string_id_column<'a>(batch: &'a RecordBatch, context: &'static str) -> Result<&'a StringArray> {
+    let column = batch.column_by_name("id").ok_or_else(|| {
+        OmniError::manifest_internal(format!("{context}: source batch missing 'id' column"))
+    })?;
+    column
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "{context}: 'id' column is not Utf8 (got {:?})",
+                column.data_type()
+            ))
+        })
+}
+
+fn validate_keyed_write_batch_ids(
+    batch: &RecordBatch,
+    table_key: &str,
+    context: &'static str,
+) -> Result<Vec<String>> {
+    let ids = string_id_column(batch, context)?;
+    let mut seen = std::collections::HashSet::with_capacity(ids.len());
+    let mut source_ids = Vec::with_capacity(ids.len());
+    for row in 0..ids.len() {
+        if !ids.is_valid(row) {
+            return Err(OmniError::manifest(format!(
+                "{context}: source row has a null 'id'"
+            )));
+        }
+        let id = ids.value(row);
+        if !seen.insert(id) {
+            return Err(OmniError::key_conflict(table_key, id));
+        }
+        source_ids.push(id.to_string());
+    }
+    Ok(source_ids)
+}
+
+/// Assert the exact RFC-023 substrate proof carried by pinned Lance's v2
+/// merge-insert route.  Checking both public copies makes a future Lance
+/// refactor that drops the transaction-level conflict filter fail closed.
+fn validate_exact_id_filter(
+    uncommitted: &UncommittedMergeInsert,
+    id_field_id: i32,
+    context: &'static str,
+) -> Result<()> {
+    let transaction_filter =
+        transaction_exact_id_filter(&uncommitted.transaction, id_field_id, context)?;
+    if uncommitted.inserted_rows_filter.as_ref() != Some(transaction_filter) {
+        return Err(OmniError::manifest_internal(format!(
+            "{context}: Lance uncommitted result and transaction disagree on the inserted-row key filter"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_strict_insert_merge_stats(
+    uncommitted: &UncommittedMergeInsert,
+    expected_rows: u64,
+    context: &'static str,
+) -> Result<()> {
+    let stats = &uncommitted.stats;
+    if !merge_stats_prove_pure_insert(stats, expected_rows) {
+        return Err(OmniError::manifest_internal(format!(
+            "{context}: strict insert merge stats were inserted={}, updated={}, deleted={}, skipped={}, attempts={}; expected inserted={expected_rows}, updated=0, deleted=0, skipped=0, attempts=1",
+            stats.num_inserted_rows,
+            stats.num_updated_rows,
+            stats.num_deleted_rows,
+            stats.num_skipped_duplicates,
+            stats.num_attempts,
+        )));
+    }
+    Ok(())
+}
+
+fn validate_known_present_update(
+    uncommitted: &UncommittedMergeInsert,
+    id_field_id: i32,
+    expected_rows: u64,
+    context: &'static str,
+) -> Result<()> {
+    let stats = &uncommitted.stats;
+    if stats.num_inserted_rows != 0
+        || stats.num_updated_rows != expected_rows
+        || stats.num_deleted_rows != 0
+        || stats.num_skipped_duplicates != 0
+    {
+        return Err(OmniError::manifest_read_set_changed(
+            format!("{context}:known_present_ids"),
+            Some(format!(
+                "updated={expected_rows}, inserted=0, deleted=0, skipped=0"
+            )),
+            Some(format!(
+                "updated={}, inserted={}, deleted={}, skipped={}",
+                stats.num_updated_rows,
+                stats.num_inserted_rows,
+                stats.num_deleted_rows,
+                stats.num_skipped_duplicates
+            )),
+        ));
+    }
+    if uncommitted.affected_rows.is_none() {
+        return Err(OmniError::manifest_internal(format!(
+            "{context}: known-present update omitted affected-row conflict metadata"
+        )));
+    }
+    let Operation::Update {
+        update_mode,
+        inserted_rows_filter,
+        ..
+    } = &uncommitted.transaction.operation
+    else {
+        return Err(OmniError::manifest_internal(format!(
+            "{context}: known-present update did not stage Lance Operation::Update"
+        )));
+    };
+    if update_mode != &Some(UpdateMode::RewriteRows) {
+        return Err(OmniError::manifest_internal(format!(
+            "{context}: known-present update used {update_mode:?}, expected RewriteRows"
+        )));
+    }
+    if let Some(filter) = inserted_rows_filter {
+        let empty_filter = KeyExistenceFilterBuilder::new(vec![id_field_id]).build();
+        if filter != &empty_filter {
+            return Err(OmniError::manifest_internal(format!(
+                "{context}: update-only transaction carried a non-empty inserted-row filter"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn merge_stats_prove_pure_insert(stats: &MergeStats, expected_rows: u64) -> bool {
+    stats.num_inserted_rows == expected_rows
+        && stats.num_updated_rows == 0
+        && stats.num_deleted_rows == 0
+        && stats.num_skipped_duplicates == 0
+        && stats.num_attempts == 1
+}
+
+fn validate_transaction_exact_id_filter(
+    transaction: &Transaction,
+    id_field_id: i32,
+    context: &'static str,
+) -> Result<()> {
+    transaction_exact_id_filter(transaction, id_field_id, context).map(|_| ())
+}
+
+/// Validate and mint the inductive insertion-absence certificate.
+///
+/// A strict preflight or an all-new MergeInsert result proves absence at the
+/// transaction's pinned parent. This post-stage check binds that proof to the
+/// exact transaction that can later be observed in Lance history: it must be a
+/// pure insertion-only `Update`, carry an exact-id filter containing precisely
+/// every source key, and describe the same number of physical rows. The proven
+/// branch-merge adapter invokes the same validator from an inherited history
+/// proof. We preserve any unrelated Lance properties.
+fn certify_insert_absence(
+    transaction: &mut Transaction,
+    expected_read_version: u64,
+    id_field_id: i32,
+    expected_schema_preorder_ids: &[u32],
+    source_ids: &[String],
+    context: &'static str,
+) -> Result<()> {
+    if source_ids.is_empty() {
+        return Err(OmniError::manifest_internal(format!(
+            "{context}: cannot certify an empty strict insert"
+        )));
+    }
+
+    if transaction.read_version != expected_read_version {
+        return Err(OmniError::manifest_internal(format!(
+            "{context}: strict insert read version {} does not match pinned parent {expected_read_version}",
+            transaction.read_version
+        )));
+    }
+
+    let (new_fragments, filter) = match &transaction.operation {
+        Operation::Update {
+            removed_fragment_ids,
+            updated_fragments,
+            new_fragments,
+            fields_modified,
+            compacted_sstables,
+            fields_for_preserving_frag_bitmap,
+            update_mode,
+            inserted_rows_filter,
+            updated_fragment_offsets,
+            ..
+        } if removed_fragment_ids.is_empty()
+            && updated_fragments.is_empty()
+            && !new_fragments.is_empty()
+            && fields_modified.is_empty()
+            && compacted_sstables.is_empty()
+            && fields_for_preserving_frag_bitmap == expected_schema_preorder_ids
+            && update_mode == &Some(UpdateMode::RewriteRows)
+            && updated_fragment_offsets.is_none() =>
+        {
+            let filter = inserted_rows_filter.as_ref().ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "{context}: insertion-only effect cannot be certified without an exact-id filter"
+                ))
+            })?;
+            (new_fragments, filter)
+        }
+        _ => {
+            return Err(OmniError::manifest_internal(format!(
+                "{context}: strict insert did not stage a pure insertion-only Update"
+            )));
+        }
+    };
+
+    let mut expected_filter = KeyExistenceFilterBuilder::new(vec![id_field_id]);
+    for id in source_ids {
+        expected_filter
+            .insert(KeyValue::String(id.clone()))
+            .map_err(|error| OmniError::Lance(error.to_string()))?;
+    }
+    if expected_filter.len() != source_ids.len()
+        || source_ids
+            .iter()
+            .any(|id| !expected_filter.contains(&KeyValue::String(id.clone())))
+        || filter != &expected_filter.build()
+    {
+        return Err(OmniError::manifest_internal(format!(
+            "{context}: strict-insert filter does not encode exactly every source id"
+        )));
+    }
+
+    let physical_rows = new_fragments.iter().try_fold(0_u64, |rows, fragment| {
+        let fragment_rows = fragment.physical_rows.ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "{context}: strict-insert fragment is missing physical_rows"
+            ))
+        })?;
+        rows.checked_add(fragment_rows as u64).ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "{context}: strict-insert physical row count overflow"
+            ))
+        })
+    })?;
+    if physical_rows != source_ids.len() as u64 {
+        return Err(OmniError::manifest_internal(format!(
+            "{context}: strict-insert transaction describes {physical_rows} physical rows for {} source ids",
+            source_ids.len()
+        )));
+    }
+
+    if transaction
+        .transaction_properties
+        .as_ref()
+        .and_then(|properties| properties.get(INSERT_ABSENCE_PROPERTY))
+        .is_some_and(|value| value != INSERT_ABSENCE_V1)
+    {
+        return Err(OmniError::manifest_internal(format!(
+            "{context}: insertion-absence certificate property already contains an unsupported value"
+        )));
+    }
+    let properties = transaction
+        .transaction_properties
+        .get_or_insert_with(|| Arc::new(HashMap::new()));
+    Arc::make_mut(properties).insert(
+        INSERT_ABSENCE_PROPERTY.to_string(),
+        INSERT_ABSENCE_V1.to_string(),
+    );
+    Ok(())
+}
+
+fn transaction_exact_id_filter<'a>(
+    transaction: &'a Transaction,
+    id_field_id: i32,
+    context: &'static str,
+) -> Result<&'a lance::dataset::write::merge_insert::inserted_rows::KeyExistenceFilter> {
+    let transaction_filter = match &transaction.operation {
+        Operation::Update {
+            inserted_rows_filter,
+            ..
+        } => inserted_rows_filter.as_ref(),
+        other => {
+            return Err(OmniError::manifest_internal(format!(
+                "{context}: keyed merge produced unexpected Lance operation {:?}",
+                std::mem::discriminant(other)
+            )));
+        }
+    };
+    let filter = transaction_filter.ok_or_else(|| {
+        OmniError::manifest_internal(format!(
+            "{context}: exact-id keyed merge did not produce an inserted-row key filter"
+        ))
+    })?;
+    if filter.field_ids != vec![id_field_id] {
+        return Err(OmniError::manifest_internal(format!(
+            "{context}: keyed merge filter covers field ids {:?}, expected exact id field [{id_field_id}]",
+            filter.field_ids
+        )));
+    }
+    Ok(filter)
+}
+
+/// Normalize scanner output into the exact per-transaction boundaries accepted
+/// by the keyed writer. Lance's byte target is approximate, strict row sizing
+/// can be overridden by process configuration, and blob materialization emits
+/// one safe row at a time. This layer therefore splits oversized emissions,
+/// compacts retained-parent slices, and coalesces small emissions before the
+/// recovery planner observes any boundary.
+fn bounded_proven_insert_stream(
+    schema: SchemaRef,
+    raw: SendableRecordBatchStream,
+    table_key: String,
+) -> SendableRecordBatchStream {
+    let output_schema = schema.clone();
+    let bounded = futures::stream::try_unfold(
+        (
+            raw,
+            None::<RecordBatch>,
+            0_usize,
+            None::<(RecordBatch, usize)>,
+            Vec::<RecordBatch>::new(),
+            0_usize,
+            0_u64,
+            schema,
+            table_key,
+        ),
+        |(
+            mut raw,
+            mut current,
+            mut current_offset,
+            mut pending,
+            mut accumulated,
+            mut accumulated_rows,
+            mut accumulated_bytes,
+            schema,
+            table_key,
+        )| async move {
+            loop {
+                if let Some((batch, consumed_rows)) = pending.take() {
+                    let batch_rows = batch.num_rows();
+                    let batch_bytes =
+                        u64::try_from(batch.get_array_memory_size()).map_err(|_| {
+                            datafusion::error::DataFusionError::Execution(
+                                "proven insert delta batch bytes exceed u64".to_string(),
+                            )
+                        })?;
+                    let fits = accumulated_rows
+                        .checked_add(batch_rows)
+                        .is_some_and(|rows| rows <= KEYED_WRITE_MAX_ROWS)
+                        && accumulated_bytes
+                            .checked_add(batch_bytes)
+                            .is_some_and(|bytes| bytes <= KEYED_WRITE_MAX_BYTES);
+                    if accumulated.is_empty() || fits {
+                        accumulated_rows += batch_rows;
+                        accumulated_bytes += batch_bytes;
+                        accumulated.push(batch);
+                        current_offset += consumed_rows;
+                        if current
+                            .as_ref()
+                            .is_some_and(|batch| current_offset == batch.num_rows())
+                        {
+                            current = None;
+                            current_offset = 0;
+                        }
+                        if accumulated_rows == KEYED_WRITE_MAX_ROWS
+                            || accumulated_bytes == KEYED_WRITE_MAX_BYTES
+                        {
+                            let output = finish_proven_insert_batch(
+                                &schema,
+                                std::mem::take(&mut accumulated),
+                                &table_key,
+                            )
+                            .map_err(|error| {
+                                datafusion::error::DataFusionError::Execution(error.to_string())
+                            })?;
+                            return Ok(Some((
+                                output,
+                                (
+                                    raw,
+                                    current,
+                                    current_offset,
+                                    None,
+                                    Vec::new(),
+                                    0,
+                                    0,
+                                    schema,
+                                    table_key,
+                                ),
+                            )));
+                        }
+                        continue;
+                    }
+
+                    pending = Some((batch, consumed_rows));
+                    let output = finish_proven_insert_batch(
+                        &schema,
+                        std::mem::take(&mut accumulated),
+                        &table_key,
+                    )
+                    .map_err(|error| {
+                        datafusion::error::DataFusionError::Execution(error.to_string())
+                    })?;
+                    return Ok(Some((
+                        output,
+                        (
+                            raw,
+                            current,
+                            current_offset,
+                            pending,
+                            Vec::new(),
+                            0,
+                            0,
+                            schema,
+                            table_key,
+                        ),
+                    )));
+                }
+
+                if let Some(batch) = current.as_ref() {
+                    if current_offset < batch.num_rows() {
+                        pending = Some(
+                            next_proven_insert_batch(batch, current_offset, &table_key).map_err(
+                                |error| {
+                                    datafusion::error::DataFusionError::Execution(error.to_string())
+                                },
+                            )?,
+                        );
+                        continue;
+                    }
+                    current = None;
+                    current_offset = 0;
+                    continue;
+                }
+
+                match raw.try_next().await? {
+                    Some(batch) => {
+                        if batch.num_rows() != 0 {
+                            current = Some(batch);
+                        }
+                    }
+                    None if accumulated.is_empty() => return Ok(None),
+                    None => {
+                        let output = finish_proven_insert_batch(
+                            &schema,
+                            std::mem::take(&mut accumulated),
+                            &table_key,
+                        )
+                        .map_err(|error| {
+                            datafusion::error::DataFusionError::Execution(error.to_string())
+                        })?;
+                        return Ok(Some((
+                            output,
+                            (
+                                raw,
+                                current,
+                                current_offset,
+                                pending,
+                                Vec::new(),
+                                0,
+                                0,
+                                schema,
+                                table_key,
+                            ),
+                        )));
+                    }
+                }
+            }
+        },
+    );
+    Box::pin(RecordBatchStreamAdapter::new(output_schema, bounded))
+}
+
+fn observe_proven_insert_raw_stream(raw: SendableRecordBatchStream) -> SendableRecordBatchStream {
+    let schema = raw.schema();
+    let observed = raw.map_ok(|batch| {
+        crate::instrumentation::record_proven_insert_raw_batch(
+            u64::try_from(batch.get_array_memory_size()).unwrap_or(u64::MAX),
+        );
+        batch
+    });
+    Box::pin(RecordBatchStreamAdapter::new(schema, observed))
+}
+
+/// Produce only the next bounded candidate from one scanner emission.
+///
+/// A scanner batch can be wider than either hard writer boundary, and an Arrow
+/// slice can retain every buffer owned by its parent. Copy partial ranges as
+/// they are requested so downstream retention keeps only the selected rows.
+/// Crucially, the caller holds at most this one copied candidate: it never
+/// materializes a queue containing every split of a large source batch.
+fn next_proven_insert_batch(
+    batch: &RecordBatch,
+    offset: usize,
+    table_key: &str,
+) -> Result<(RecordBatch, usize)> {
+    if offset >= batch.num_rows() {
+        return Err(OmniError::manifest_internal(format!(
+            "proven insert delta offset {offset} is outside {table_key} batch with {} rows",
+            batch.num_rows()
+        )));
+    }
+
+    let max_rows = (batch.num_rows() - offset).min(KEYED_WRITE_MAX_ROWS);
+    let (mut rows, mut logical_bytes) = largest_proven_insert_prefix(batch, offset, max_rows)?;
+    loop {
+        let is_whole_batch = offset == 0 && rows == batch.num_rows();
+        let retained_bytes = u64::try_from(batch.get_array_memory_size()).unwrap_or(u64::MAX);
+        // ArrayData's logical slice measure excludes the backing capacity held
+        // by an Arrow slice. Preserve an already-compact whole scanner batch,
+        // but copy any selected prefix or obvious retained-parent emission.
+        let retained_parent_slop = 64_u64 * 1024;
+        let keeps_only_logical_slice =
+            retained_bytes <= logical_bytes.saturating_add(retained_parent_slop);
+        let candidate = if is_whole_batch
+            && retained_bytes <= KEYED_WRITE_MAX_BYTES
+            && keeps_only_logical_slice
+        {
+            batch.clone()
+        } else {
+            copy_proven_insert_batch_range(batch, offset, rows)?
+        };
+        let bytes = u64::try_from(candidate.get_array_memory_size()).map_err(|_| {
+            OmniError::manifest_internal("proven insert delta batch bytes exceed u64")
+        })?;
+        if bytes <= KEYED_WRITE_MAX_BYTES {
+            validate_proven_insert_source_batch(&candidate, table_key)?;
+            return Ok((candidate, rows));
+        }
+        if rows == 1 {
+            return Err(OmniError::resource_limit(
+                format!("proven insert delta bytes for {table_key}"),
+                KEYED_WRITE_MAX_BYTES,
+                bytes,
+            ));
+        }
+        drop(candidate);
+        rows = ((u128::try_from(rows).unwrap() * u128::from(KEYED_WRITE_MAX_BYTES))
+            / u128::from(bytes))
+        .try_into()
+        .unwrap_or(1_usize)
+        .clamp(1, rows - 1);
+        logical_bytes = proven_insert_slice_memory_size(batch, offset, rows)?;
+    }
+}
+
+/// Select the largest row prefix whose logical Arrow buffers fit the byte
+/// ceiling without copying it first. Physical `get_array_memory_size` counts a
+/// sliced array's complete backing buffers; `ArrayData::get_slice_memory_size`
+/// instead approximates the compact buffers for just the selected rows.
+fn largest_proven_insert_prefix(
+    batch: &RecordBatch,
+    offset: usize,
+    max_rows: usize,
+) -> Result<(usize, u64)> {
+    let one_row_bytes = proven_insert_slice_memory_size(batch, offset, 1)?;
+    if max_rows == 1 || one_row_bytes > KEYED_WRITE_MAX_BYTES {
+        return Ok((1, one_row_bytes));
+    }
+
+    let max_bytes = proven_insert_slice_memory_size(batch, offset, max_rows)?;
+    if max_bytes <= KEYED_WRITE_MAX_BYTES {
+        return Ok((max_rows, max_bytes));
+    }
+
+    let mut low = 1_usize;
+    let mut high = max_rows - 1;
+    while low < high {
+        let middle = low + (high - low).div_ceil(2);
+        if proven_insert_slice_memory_size(batch, offset, middle)? <= KEYED_WRITE_MAX_BYTES {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    Ok((low, proven_insert_slice_memory_size(batch, offset, low)?))
+}
+
+fn proven_insert_slice_memory_size(batch: &RecordBatch, offset: usize, rows: usize) -> Result<u64> {
+    batch.columns().iter().try_fold(0_u64, |total, column| {
+        let bytes = column
+            .slice(offset, rows)
+            .to_data()
+            .get_slice_memory_size()
+            .map_err(|error| OmniError::Lance(error.to_string()))?;
+        total
+            .checked_add(u64::try_from(bytes).map_err(|_| {
+                OmniError::manifest_internal("proven insert logical slice bytes exceed u64")
+            })?)
+            .ok_or_else(|| {
+                OmniError::manifest_internal("proven insert logical slice bytes overflow")
+            })
+    })
+}
+
+fn finish_proven_insert_batch(
+    schema: &SchemaRef,
+    mut batches: Vec<RecordBatch>,
+    table_key: &str,
+) -> Result<RecordBatch> {
+    let batch = if batches.len() == 1 {
+        batches.pop().expect("length checked")
+    } else {
+        arrow_select::concat::concat_batches(schema, &batches)
+            .map_err(|error| OmniError::Lance(error.to_string()))?
+    };
+    validate_proven_insert_source_batch(&batch, table_key)?;
+    Ok(batch)
+}
+
+fn copy_proven_insert_batch_range(
+    batch: &RecordBatch,
+    offset: usize,
+    rows: usize,
+) -> Result<RecordBatch> {
+    let end = offset
+        .checked_add(rows)
+        .ok_or_else(|| OmniError::manifest_internal("proven insert delta range overflow"))?;
+    let offset = u64::try_from(offset)
+        .map_err(|_| OmniError::manifest_internal("proven insert delta offset exceeds u64"))?;
+    let end = u64::try_from(end)
+        .map_err(|_| OmniError::manifest_internal("proven insert delta end exceeds u64"))?;
+    let indices = UInt64Array::from_iter_values(offset..end);
+    arrow_select::take::take_record_batch(batch, &indices)
+        .map_err(|error| OmniError::Lance(error.to_string()))
+}
+
+fn validate_proven_insert_source_batch(batch: &RecordBatch, table_key: &str) -> Result<()> {
+    if batch.num_rows() > KEYED_WRITE_MAX_ROWS {
+        return Err(OmniError::resource_limit(
+            format!("proven insert delta rows for {table_key}"),
+            KEYED_WRITE_MAX_ROWS as u64,
+            batch.num_rows() as u64,
+        ));
+    }
+    let bytes = u64::try_from(batch.get_array_memory_size())
+        .map_err(|_| OmniError::manifest_internal("proven insert delta batch bytes exceed u64"))?;
+    if bytes > KEYED_WRITE_MAX_BYTES {
+        return Err(OmniError::resource_limit(
+            format!("proven insert delta bytes for {table_key}"),
+            KEYED_WRITE_MAX_BYTES,
+            bytes,
+        ));
+    }
+    Ok(())
+}
+
+/// Preserve all conflict metadata Lance returned while exposing the physical
+/// fragment delta needed by read-your-writes scans.
+fn staged_keyed_merge_result(
+    uncommitted: UncommittedMergeInsert,
+    context: &'static str,
+) -> Result<StagedWrite> {
+    let (new_fragments, removed_fragment_ids) = match &uncommitted.transaction.operation {
+        Operation::Update {
+            new_fragments,
+            updated_fragments,
+            removed_fragment_ids,
+            ..
+        } => {
+            let mut all = updated_fragments.clone();
+            all.extend(new_fragments.iter().cloned());
+            (all, removed_fragment_ids.clone())
+        }
+        other => {
+            return Err(OmniError::manifest_internal(format!(
+                "{context}: keyed merge produced unexpected Lance operation {:?}",
+                std::mem::discriminant(other)
+            )));
+        }
+    };
+    Ok(StagedWrite::with_commit_metadata(
+        uncommitted.transaction,
+        StagedCommitMetadata::affected_rows(uncommitted.affected_rows),
+        new_fragments,
+        removed_fragment_ids,
+    ))
+}
+
 /// Precondition guard for `stage_merge_insert`.
 /// Both opt into `SourceDedupeBehavior::FirstSeen` to suppress the Lance
 /// `processed_row_ids` bug (MR-957). FirstSeen would *also* silently
@@ -2009,6 +5294,8 @@ fn combine_committed_with_staged(ds: &Dataset, staged: &[StagedWrite]) -> Vec<Fr
 /// (`vec!["id".to_string()]`). The check restricts itself to that shape
 /// and surfaces an internal error if a future caller passes anything
 /// else — keeping the assumption explicit instead of silently degrading.
+// Staged-write helper retained alongside the sealed storage surface; no
+#[allow(dead_code)]
 fn check_batch_unique_by_keys(
     batch: &RecordBatch,
     key_columns: &[String],
@@ -2049,8 +5336,7 @@ fn check_batch_unique_by_keys(
         if !seen.insert(v) {
             return Err(OmniError::manifest(format!(
                 "{}: duplicate source row for key '{}' (column '{}'); \
-                 callers must hand in a batch unique by `key_columns` \
-                 — see MR-957",
+                 callers must hand in a batch unique by `key_columns`",
                 context, v, key_col_name
             )));
         }
@@ -2061,13 +5347,213 @@ fn check_batch_unique_by_keys(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::StringArray;
+    use arrow_array::{StringArray, UInt8Array, UInt32Array};
     use arrow_schema::{DataType, Field, Schema};
+    use lance::blob::BlobArrayBuilder;
 
     fn batch_with_ids(ids: &[&str]) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
         let col = Arc::new(StringArray::from(ids.to_vec())) as ArrayRef;
         RecordBatch::try_new(schema, vec![col]).unwrap()
+    }
+
+    fn logical_blob_batch(values: &[&str]) -> RecordBatch {
+        let mut builder = BlobArrayBuilder::new(values.len());
+        for value in values {
+            builder.push_uri(*value).unwrap();
+        }
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![lance::blob::blob_field("payload", false)])),
+            vec![builder.finish().unwrap()],
+        )
+        .unwrap()
+    }
+
+    fn persisted_external_blob_batch(values: &[&str]) -> RecordBatch {
+        let fields = lance::datatypes::BLOB_V2_DESC_FIELDS.clone();
+        let descriptions = StructArray::new(
+            fields.clone(),
+            vec![
+                Arc::new(UInt8Array::from(vec![3; values.len()])) as ArrayRef,
+                Arc::new(UInt64Array::from(vec![0; values.len()])) as ArrayRef,
+                Arc::new(UInt64Array::from(vec![0; values.len()])) as ArrayRef,
+                Arc::new(UInt32Array::from(vec![0; values.len()])) as ArrayRef,
+                Arc::new(StringArray::from(values.to_vec())) as ArrayRef,
+            ],
+            None,
+        );
+        let field = Field::new("payload", DataType::Struct(fields), false)
+            .with_metadata(lance::datatypes::BLOB_V2_DESC_FIELD.metadata().clone());
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![field])),
+            vec![Arc::new(descriptions)],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn logical_blob_uri_collection_preserves_multiplicity() {
+        let batch = logical_blob_batch(&["s3://bucket/base/object", "s3://bucket/base/%6Fbject"]);
+        assert_eq!(
+            collect_external_blob_uris(&batch).unwrap(),
+            vec![
+                "s3://bucket/base/object".to_string(),
+                "s3://bucket/base/%6Fbject".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn file_preflight_deduplicates_normalized_target_but_counts_cells() {
+        let directory = tempfile::tempdir().unwrap();
+        let object = directory.path().join("file");
+        std::fs::write(&object, b"payload").unwrap();
+        let base_uri = url::Url::from_directory_path(directory.path()).unwrap();
+        let object_uri = url::Url::from_file_path(&object).unwrap().to_string();
+        let equivalent_uri = format!(
+            "{}%66ile",
+            object_uri
+                .strip_suffix("file")
+                .expect("test file URI suffix")
+        );
+        let policy = ExternalBlobPolicy::allow(vec![
+            crate::blob::ExternalBlobBase::new(
+                base_uri.as_str(),
+                crate::blob::ExternalBlobExecutionScope::EmbeddedOnly,
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+        let store = TableStore::new(
+            directory.path().to_string_lossy().as_ref(),
+            crate::lance_access::LanceAccessContext::new().data_session(),
+        )
+        .with_external_blob_policy(policy)
+        .unwrap();
+        let uris = vec![object_uri, equivalent_uri];
+        let preflight = store.preflight_external_blob_uris(&uris).await.unwrap();
+        assert_eq!(preflight.materialized_payload_bytes(&uris).unwrap(), 14);
+        let first = preflight.entry(&uris[0]).unwrap();
+        let second = preflight.entry(&uris[1]).unwrap();
+        assert!(Arc::ptr_eq(first, second));
+    }
+
+    #[test]
+    fn external_blob_metadata_budget_accepts_exact_limit_and_refuses_one_more() {
+        let mut budget = ExternalBlobMetadataBudget::default();
+        budget.retain_bytes(KEYED_WRITE_MAX_BYTES).unwrap();
+        let error = budget.retain_bytes(1).unwrap_err();
+        assert!(matches!(
+            error,
+            OmniError::ResourceLimitExceeded {
+                ref resource,
+                limit: KEYED_WRITE_MAX_BYTES,
+                actual,
+            } if resource == EXTERNAL_BLOB_URI_METADATA_RESOURCE
+                && actual == KEYED_WRITE_MAX_BYTES + 1
+        ));
+    }
+
+    #[test]
+    fn persisted_blob_selection_admits_exact_external_cells_and_refuses_one_over() {
+        let batch = persisted_external_blob_batch(
+            &(0..KEYED_WRITE_MAX_ROWS)
+                .map(|_| "s3://bucket/base/object")
+                .collect::<Vec<_>>(),
+        );
+        let mut selection = PersistedBlobSelection::default();
+        selection.include_batch(&batch).unwrap();
+        assert_eq!(selection.external_cell_count(), KEYED_WRITE_MAX_ROWS);
+
+        let one_more = persisted_external_blob_batch(&["s3://bucket/base/object"]);
+        let error = selection.include_batch(&one_more).unwrap_err();
+        assert!(matches!(
+            error,
+            OmniError::ResourceLimitExceeded {
+                ref resource,
+                limit,
+                actual,
+            } if resource == EXTERNAL_BLOB_REFERENCE_RESOURCE
+                && limit == KEYED_WRITE_MAX_ROWS as u64
+                && actual == KEYED_WRITE_MAX_ROWS as u64 + 1
+        ));
+    }
+
+    #[test]
+    fn persisted_blob_selection_uri_metadata_exact_and_plus_one_use_descriptor_batch() {
+        let uri = "s3://bucket/base/object";
+        let batch = persisted_external_blob_batch(&[uri]);
+        let charge = retained_string_bytes(uri).unwrap();
+
+        let mut exact = PersistedBlobSelection {
+            retained_uri_metadata_bytes: KEYED_WRITE_MAX_BYTES - charge,
+            ..PersistedBlobSelection::default()
+        };
+        exact.include_batch(&batch).unwrap();
+        assert_eq!(
+            exact.retained_uri_metadata_bytes, KEYED_WRITE_MAX_BYTES,
+            "the final descriptor at the exact metadata ceiling must be admitted"
+        );
+
+        let mut plus_one = PersistedBlobSelection {
+            retained_uri_metadata_bytes: KEYED_WRITE_MAX_BYTES - charge + 1,
+            ..PersistedBlobSelection::default()
+        };
+        let error = plus_one.include_batch(&batch).unwrap_err();
+        assert!(matches!(
+            error,
+            OmniError::ResourceLimitExceeded {
+                ref resource,
+                limit: KEYED_WRITE_MAX_BYTES,
+                actual,
+            } if resource == EXTERNAL_BLOB_URI_METADATA_RESOURCE
+                && actual == KEYED_WRITE_MAX_BYTES + 1
+        ));
+        assert_eq!(
+            plus_one.external_cell_count(),
+            0,
+            "metadata refusal must precede retaining the descriptor"
+        );
+    }
+
+    #[tokio::test]
+    async fn persisted_blob_selection_charges_exact_external_range_not_whole_object() {
+        let directory = tempfile::tempdir().unwrap();
+        let object = directory.path().join("large-sparse-object");
+        std::fs::File::create(&object)
+            .unwrap()
+            .set_len(KEYED_WRITE_MAX_BYTES + 1)
+            .unwrap();
+        let base_uri = url::Url::from_directory_path(directory.path()).unwrap();
+        let object_uri = url::Url::from_file_path(&object).unwrap().to_string();
+        let policy = ExternalBlobPolicy::allow(vec![
+            crate::blob::ExternalBlobBase::new(
+                base_uri.as_str(),
+                crate::blob::ExternalBlobExecutionScope::EmbeddedOnly,
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+        let store = TableStore::new(
+            directory.path().to_string_lossy().as_ref(),
+            crate::lance_access::LanceAccessContext::new().data_session(),
+        )
+        .with_external_blob_policy(policy)
+        .unwrap();
+        let mut selection = PersistedBlobSelection::default();
+        selection.add_managed_payload(7).unwrap();
+        selection
+            .push_external(object_uri, 1024, Some(2048))
+            .unwrap();
+        let preflight = store
+            .preflight_persisted_blob_selection(&selection)
+            .await
+            .unwrap();
+        assert_eq!(
+            selection.materialized_payload_bytes(&preflight).unwrap(),
+            2055,
+            "a persisted range must not be charged as its whole backing object"
+        );
     }
 
     #[test]
@@ -2086,8 +5572,8 @@ mod tests {
             "unexpected error: {msg}"
         );
         assert!(
-            msg.contains("MR-957"),
-            "error should reference MR-957: {msg}"
+            msg.contains("unique by `key_columns`"),
+            "error should state the unique-batch precondition: {msg}"
         );
     }
 
@@ -2100,3 +5586,6 @@ mod tests {
         assert!(err.to_string().contains("single-column keys only"));
     }
 }
+
+#[cfg(test)]
+mod staged_tests;

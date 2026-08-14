@@ -459,6 +459,42 @@ delete Person where tags contains $tag
 }
 
 #[test]
+fn test_parse_starts_with_filter() {
+    let input = r#"
+query autocomplete($q: String) {
+match {
+    $p: Person
+    $p.name starts_with $q
+}
+return { $p.name }
+}
+"#;
+    let qf = parse_query(input).unwrap();
+    let q = &qf.queries[0];
+    match &q.match_clause[1] {
+        Clause::Filter(f) => {
+            assert_eq!(f.op, CompOp::StartsWith);
+            assert!(matches!(
+                &f.left,
+                Expr::PropAccess { variable, property } if variable == "p" && property == "name"
+            ));
+            assert!(matches!(&f.right, Expr::Variable(v) if v == "q"));
+        }
+        _ => panic!("expected Filter"),
+    }
+}
+
+#[test]
+fn test_parse_starts_with_is_rejected_in_mutation_predicate() {
+    let input = r#"
+query drop_person($q: String) {
+delete Person where name starts_with $q
+}
+"#;
+    assert!(parse_query(input).is_err());
+}
+
+#[test]
 fn test_parse_triangle() {
     let input = r#"
 query triangles($name: String) {
@@ -970,4 +1006,47 @@ return { $p.name
 "#;
     let err = parse_query_diagnostic(input).unwrap_err();
     assert!(err.span.is_some());
+}
+
+#[test]
+fn test_parse_traversal_edge_binding() {
+    // `$p $w:knows $f` — the optional edge binding names the matched edge row
+    // so its properties become addressable (`$w.since`).
+    let input = r#"
+query rated_friends($name: String) {
+match {
+    $p: Person { name: $name }
+    $p $w:knows $f
+    $p $x:<knows> $g
+    $p knows $h
+}
+return { $f.name }
+}
+"#;
+    let qf = parse_query(input).unwrap();
+    let q = &qf.queries[0];
+    assert_eq!(q.match_clause.len(), 4);
+    match &q.match_clause[1] {
+        Clause::Traversal(t) => {
+            assert_eq!(t.src, "p");
+            assert_eq!(t.edge_name, "knows");
+            assert_eq!(t.dst, "f");
+            assert!(!t.undirected);
+            assert_eq!(t.edge_binding.as_deref(), Some("w"));
+        }
+        c => panic!("expected Traversal, got {c:?}"),
+    }
+    match &q.match_clause[2] {
+        Clause::Traversal(t) => {
+            assert!(t.undirected, "binding composes with undirected form");
+            assert_eq!(t.edge_binding.as_deref(), Some("x"));
+        }
+        c => panic!("expected Traversal, got {c:?}"),
+    }
+    match &q.match_clause[3] {
+        Clause::Traversal(t) => {
+            assert_eq!(t.edge_binding, None, "binding stays optional");
+        }
+        c => panic!("expected Traversal, got {c:?}"),
+    }
 }

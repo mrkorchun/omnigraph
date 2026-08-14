@@ -7,6 +7,11 @@ invariants, implementation contracts, test ownership, and upstream Lance
 constraints. User-facing behavior should still be documented through
 [docs/user/index.md](../user/index.md) and the relevant public reference docs.
 
+New to the codebase, or re-anchoring after time away? Read
+[canon.md](canon.md) — the linear narrative of the whole system (why it
+exists, how a read/write/merge/crash unfolds, deliberate exclusions, risks,
+roadmap). The per-area docs below remain the mechanical authority.
+
 ## Required For Every Non-Trivial Change
 
 | Need | Read |
@@ -23,10 +28,13 @@ constraints. User-facing behavior should still be documented through
 | System structure, L1/L2 framing, component diagrams | [architecture.md](architecture.md) |
 | On-disk layout, manifest schema, URI behavior | [storage.md](../user/concepts/storage.md) |
 | Direct-publish writes, D2, staged writes, recovery sidecars | [writes.md](writes.md) |
+| Streaming-ingest decision — direct graph batches and RFC-018/026 rejection | [wal-removal.md](wal-removal.md) |
 | Query execution, mutation execution, loader flow | [execution.md](execution.md) |
 | Index lifecycle and graph topology indexes | [indexes.md](../user/search/indexes.md) |
 | Branch and commit internals | [branches-commits.md](../user/branching/index.md) |
 | Three-way merge implementation and conflicts | [merge.md](merge.md) |
+| Branch-merge algorithmic complexity + object-store cost (timeout diagnosis) | [merge-complexity.md](merge-complexity.md) |
+| Merge latency L1–L3 implementation plan | [merge-l1-l3-plan.md](merge-l1-l3-plan.md) |
 | Diff/change-feed implementation | [changes.md](../user/branching/changes.md) |
 | Branch protection policy | [branch-protection.md](branch-protection.md) |
 
@@ -58,11 +66,14 @@ constraints. User-facing behavior should still be documented through
 |---|---|
 | How to contribute (external) | [CONTRIBUTING.md](../../CONTRIBUTING.md) |
 | Governance model, roles, decision authority | [GOVERNANCE.md](../../GOVERNANCE.md) |
-| Public contribution RFC track | [rfcs/](../rfcs/) |
+| RFC process — public contribution and maintainer design-series tracks | [rfcs/](../rfcs/) |
 
-The `docs/rfcs/` track is the **public, externally-authorable** RFC process. The
-maintainer/internal RFCs below (`rfc-00N-*.md`) are a separate, team-owned
-track; don't conflate the two.
+`docs/rfcs/` is the durable home for both formal tracks. Every formal RFC uses
+the four-digit `NNNN-*` filename namespace; explicit `Author track` and `Status`
+metadata select the public contribution or maintainer design-series lifecycle.
+Public RFC merge means acceptance, while maintainer design series may remain
+draft across merged revisions. Existing `docs/dev/rfc-00N-*` files are legacy
+internal design and implementation records that retain their current lifecycle.
 
 ## Case Studies
 
@@ -73,6 +84,15 @@ pattern, not just the outcome.
 | Area | Read |
 |---|---|
 | camelCase property filters lowercased at runtime (#283) — two engine→Lance boundaries, two different fixes | [bug-case-fix.md](bug-case-fix.md) |
+
+## Historical Design Reviews
+
+Review ledgers record open findings against proposed architecture. They remain
+as durable disposition history after closure, so RFC backlinks stay valid.
+
+| Area | Read |
+|---|---|
+| RFC-022–028 split architecture review — retained disposition history; RFC-026 is now rejected and its implementation removed | [rfc-022-027-architecture-review.md](rfc-022-027-architecture-review.md) |
 
 ## Active Implementation Plans
 
@@ -96,6 +116,17 @@ Working documents for in-flight feature work. Removed when the work lands.
 | Write-path latency — capture-once `WriteTxn`, version-pinned opens, one `GraphPublishAuthority` fed declarative `PublishPlan`s, manifest-authoritative lineage, epoch fence, bounded history (compaction + cleanup), and an IO-counted cost contract (`iss-write-s3-roundtrip-amplification`, `iss-991`) | [rfc-013-write-path-latency.md](rfc-013-write-path-latency.md) |
 | RFC-013 handoff — current-state map, latest validation, and concrete next actions for finishing write-path latency and correctness work | [handoff-rfc-013-write-path.md](handoff-rfc-013-write-path.md) |
 | Write-latency roadmap — validated cost model (the 6-LIST warm-write trace), the two root causes (un-GC'd `_versions/`; re-resolving latest by listing), and the layered fix (GC + capture-once reuse); how commit-graph-table retirement feeds in | [write-latency-roadmap.md](write-latency-roadmap.md) |
+
+## Historical Design Records
+
+These documents preserve the rejected RFC-026 experiment and its evidence.
+They are not current architecture or implementation plans.
+
+| Area | Read |
+|---|---|
+| RFC-026 implementation sequence and acceptance evidence | [firehose-path-specs.md](firehose-path-specs.md) |
+| WAL mental model, retention options, and proposed upstream support | [wal-thinking.md](wal-thinking.md), [wal-options.md](wal-options.md), [lance-memwal-pr.md](lance-memwal-pr.md) |
+| Pre-removal write-path snapshot | [writing-path-state-of-affairs.md](writing-path-state-of-affairs.md) |
 
 ## Boundary
 

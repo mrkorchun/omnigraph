@@ -90,11 +90,7 @@ pub(crate) fn confirm_destructive(label: &str, uri: &str, yes: bool, json: bool)
 /// misses the route and 404s. Because callers pass structured segments rather
 /// than a pre-joined string, neither a stray `//` nor an un-encoded dynamic
 /// component is representable here.
-pub(crate) fn remote_url(
-    base: &str,
-    segments: &[&str],
-    query: &[(&str, &str)],
-) -> Result<String> {
+pub(crate) fn remote_url(base: &str, segments: &[&str], query: &[(&str, &str)]) -> Result<String> {
     let mut url = reqwest::Url::parse(base.trim_end_matches('/'))?;
     url.path_segments_mut()
         .map_err(|_| color_eyre::eyre::eyre!("invalid remote base url"))?
@@ -155,9 +151,11 @@ pub(crate) fn require_cluster_scope(
         return Ok(resolve_name(cluster));
     }
     // A cluster profile (flag, else OMNIGRAPH_PROFILE) binds the cluster too.
-    let profile_name = profile
-        .map(str::to_string)
-        .or_else(|| std::env::var(scope::PROFILE_ENV).ok().filter(|s| !s.is_empty()));
+    let profile_name = profile.map(str::to_string).or_else(|| {
+        std::env::var(scope::PROFILE_ENV)
+            .ok()
+            .filter(|s| !s.is_empty())
+    });
     if let Some(name) = profile_name {
         let profile = op.profile(&name).ok_or_else(|| {
             color_eyre::eyre::eyre!("unknown profile '{name}' (not defined under `profiles:`)")
@@ -232,7 +230,10 @@ pub(crate) fn select_cluster_policy<'p>(
                 "graph `{graph_id}` in cluster `{cluster}` matches {} policy bundles ([{}]); \
                  the cluster model expects one bundle per graph scope",
                 many.len(),
-                many.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", ")
+                many.iter()
+                    .map(|p| p.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
         };
     }
@@ -242,7 +243,10 @@ pub(crate) fn select_cluster_policy<'p>(
         many => bail!(
             "cluster `{cluster}` has {} policy bundles ([{}]); pass --graph <id> to select one",
             many.len(),
-            many.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", ")
+            many.iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
     }
 }
@@ -404,6 +408,15 @@ pub(crate) fn build_http_client() -> Result<reqwest::Client> {
     Ok(reqwest::Client::new())
 }
 
+/// Blob delivery never follows the server's external-descriptor redirect.
+/// Keeping this client separate prevents a graph-level read from silently
+/// turning into an unbounded request against caller-owned object storage.
+pub(crate) fn build_blob_http_client() -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?)
+}
+
 pub(crate) fn apply_bearer_token(
     request: reqwest::RequestBuilder,
     token: Option<&str>,
@@ -415,6 +428,54 @@ pub(crate) fn apply_bearer_token(
     }
 }
 
+/// Typed marker for a 412 graph-commit precondition rejection, carried through
+/// `eyre` so the
+/// `mutate` verb can downcast it and exit with `EXIT_PRECONDITION_FAILED` (4)
+/// instead of the generic failure exit. Holds the full structured error body
+/// for `--json` passthrough.
+#[derive(Debug)]
+pub(crate) struct PreconditionFailedCli {
+    pub(crate) output: ErrorOutput,
+}
+
+impl std::fmt::Display for PreconditionFailedCli {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.output.error)
+    }
+}
+
+impl std::error::Error for PreconditionFailedCli {}
+
+/// Build the typed CAS-lost error for the embedded transport, mirroring the
+/// structured body a server would have returned so `--json` output is
+/// transport-uniform. `message` is the engine error's own `Display` text, so
+/// the wording never drifts from the source variant.
+pub(crate) fn precondition_failed_cli(
+    message: String,
+    expected: String,
+    actual: Option<String>,
+) -> PreconditionFailedCli {
+    PreconditionFailedCli {
+        output: ErrorOutput {
+            error: message,
+            code: None,
+            merge_conflicts: Vec::new(),
+            manifest_conflict: None,
+            read_set_conflict: None,
+            key_conflict: None,
+            resource_limit: None,
+            change_feed_gap: None,
+            blob_range: None,
+            external_blob_source: None,
+            recovery_required: None,
+            precondition_failure: Some(omnigraph_api_types::PreconditionFailureOutput {
+                expected,
+                actual,
+            }),
+        },
+    }
+}
+
 pub(crate) async fn remote_json<T: DeserializeOwned>(
     client: &reqwest::Client,
     method: Method,
@@ -422,7 +483,29 @@ pub(crate) async fn remote_json<T: DeserializeOwned>(
     body: Option<Value>,
     bearer_token: Option<&str>,
 ) -> Result<T> {
+    remote_json_with_graph_commit_precondition(client, method, url, body, bearer_token, None).await
+}
+
+/// [`remote_json`] with an optional `Omnigraph-If-Graph-Commit` graph-head
+/// precondition (mutation routes only). A 412 whose body carries
+/// `precondition_failure` surfaces as the typed [`PreconditionFailedCli`].
+pub(crate) async fn remote_json_with_graph_commit_precondition<T: DeserializeOwned>(
+    client: &reqwest::Client,
+    method: Method,
+    url: String,
+    body: Option<Value>,
+    bearer_token: Option<&str>,
+    expected_commit: Option<&str>,
+) -> Result<T> {
     let request = apply_bearer_token(client.request(method, url), bearer_token);
+    let request = if let Some(commit_id) = expected_commit {
+        request.header(
+            omnigraph_api_types::GRAPH_COMMIT_PRECONDITION_HEADER,
+            commit_id,
+        )
+    } else {
+        request
+    };
     let request = if let Some(body) = body {
         request.json(&body)
     } else {
@@ -433,6 +516,9 @@ pub(crate) async fn remote_json<T: DeserializeOwned>(
     let text = response.text().await?;
     if !status.is_success() {
         if let Ok(error) = serde_json::from_str::<ErrorOutput>(&text) {
+            if error.precondition_failure.is_some() {
+                return Err(PreconditionFailedCli { output: error }.into());
+            }
             bail!(error.error);
         }
         bail!("server returned {}: {}", status, text);
@@ -620,7 +706,10 @@ pub(crate) fn resolve_read_target(
     if cli_branch.is_some() && cli_snapshot.is_some() {
         bail!("read target may specify branch or snapshot, not both");
     }
-    Ok(read_target_from_cli(cli_branch.or(alias_branch), cli_snapshot))
+    Ok(read_target_from_cli(
+        cli_branch.or(alias_branch),
+        cli_snapshot,
+    ))
 }
 
 pub(crate) fn resolve_query_path(
@@ -679,8 +768,6 @@ pub(crate) fn resolve_read_format(
         })
         .unwrap_or_default()
 }
-
-
 
 pub(crate) fn read_target_from_cli(branch: Option<String>, snapshot: Option<String>) -> ReadTarget {
     if let Some(snapshot) = snapshot {
@@ -796,7 +883,6 @@ fn registry_from_serving_queries(
     })
 }
 
-
 /// `queries validate --cluster <dir>` (RFC-011): type-check every stored query
 /// in the cluster catalog against its graph's applied schema. Both the registry
 /// and the schemas come from the cluster serving snapshot — no omnigraph.yaml.
@@ -820,7 +906,8 @@ pub(crate) async fn execute_queries_validate(
             continue;
         }
         matched_any = true;
-        let registry = registry_from_serving_queries(&snapshot.queries, Some(&serving_graph.graph_id))?;
+        let registry =
+            registry_from_serving_queries(&snapshot.queries, Some(&serving_graph.graph_id))?;
         let db = Omnigraph::open(&serving_graph.root.to_string_lossy()).await?;
         let report = check(&registry, &db.catalog());
         total += registry.len();

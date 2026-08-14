@@ -19,7 +19,6 @@
 
 <p align="center">
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-1b1b1f?style=flat-square&labelColor=1b1b1f"></a>
-  <a href="https://crates.io/crates/omnigraph-cli"><img alt="crates.io" src="https://img.shields.io/crates/v/omnigraph-cli?style=flat-square&color=d71921&labelColor=1b1b1f"></a>
   <a href="rust-toolchain.toml"><img alt="Rust" src="https://img.shields.io/badge/rust-stable-1b1b1f?style=flat-square&labelColor=1b1b1f"></a>
 </p>
 
@@ -243,6 +242,7 @@ Notes:
 ## Workspace Crates
 
 - `crates/omnigraph-compiler`: shared schema/query parser, typechecker, catalog, and IR lowering (zero Lance dependency)
+- `crates/omnigraph-storage`: shared local/S3 control-object storage implementation and concrete backend handle
 - `crates/omnigraph` (package `omnigraph-engine`): storage/runtime, branching, merge, change detection, query execution, and embeddings
 - `crates/omnigraph-policy`: Cedar policy compilation and enforcement
 - `crates/omnigraph-api-types`: shared HTTP wire DTOs used by both the server and the CLI

@@ -4,7 +4,7 @@
 
 | Index | Use | Notes |
 |---|---|---|
-| **BTREE scalar** | `=` / range / `IN` / `IS NULL` on a scalar | always on the node `id` and edge `src`/`dst`; and on each one-column `@index`/`@key` property that is an **enum** or an **orderable scalar** (`DateTime`/`Date`/`I32`/`I64`/`U32`/`U64`/`F32`/`F64`/`Bool`) |
+| **BTREE scalar** | `=` / range / `IN` / `IS NULL` / `starts_with` (prefix) on a scalar | always on the node `id` and edge `src`/`dst`; and on each one-column `@index`/`@key` property that is an **enum** or an **orderable scalar** (`DateTime`/`Date`/`I32`/`I64`/`U32`/`U64`/`F32`/`F64`/`Bool`) |
 | **Inverted (FTS)** | `search`, `fuzzy`, `match_text`, `bm25` | created on **free-text** (non-enum) `String` `@index`/`@key` columns |
 | **Vector** | `nearest()` k-NN | Lance picks IVF_PQ vs HNSW family by configuration; OmniGraph stores as FixedSizeList(Float32, dim) |
 
@@ -13,12 +13,18 @@ by the builder and the sidecar-pinning coverage check so they cannot drift):
 enums and orderable scalars → BTREE, free-text Strings → FTS, `Vector` → vector,
 list/`Blob` columns → none.
 
-> **Free-text Strings are not equality-indexed.** A non-enum `String` column
-> (including a `String @key` slug) gets an FTS inverted index, which Lance does
-> **not** consult for `=`/range — only for `search`/`match_text`/`bm25`. So an
-> equality filter on a free-text String falls back to a full scan. If you filter
-> a String identifier by equality on a large table, model it so the value is the
-> node id, or track it as a follow-up to also build a BTREE on such columns.
+> **Free-text Strings are not equality- or prefix-indexed (deferred).** A
+> non-enum `String` column (including a `String @key` slug) gets an FTS
+> inverted index, which Lance does **not** consult for `=`/range/`starts_with`
+> — only for `search`/`match_text`/`bm25`. Those filters stay correct but fall
+> back to a scan. A companion BTREE that closes this gap is implemented (see
+> the `dual-btree-companion` branch) but deferred on an upstream Lance bug
+> (lance-format/lance#7840): second-generation shallow clones (a branch of a
+> branch, e.g. after a fast-forward merge into a non-main target) cannot read
+> parent index files at all, and the companion would widen that failure to
+> every `@key` equality lookup. The bug is pinned by
+> `lance_surface_guards::second_generation_branch_index_reads_fail_upstream`,
+> which turns red when a Lance bump fixes it.
 
 > **Coverage and cost.** Each indexed column adds index files and build time, and
 > an index only covers the fragments it was built over. Rows appended after the
@@ -27,8 +33,8 @@ list/`Blob` columns → none.
 
 ## L2 — OmniGraph orchestration
 
-- **`@index`/`@key` declares intent; the physical index is derived state.** A migration records the declaration in the catalog/IR and never fails on it — `schema apply` builds **no** indexes (adding an `@index` to an existing column is a pure metadata change that touches no table data). `load`/`mutate` build declared indexes inline as part of the write, but a column that can't be built yet (a `Vector` column with no trainable vectors — IVF k-means needs ≥1 vector, e.g. rows loaded before `embed` runs) is left **pending**, not fatal. Reads stay correct meanwhile: a missing/partial index degrades to a scan (vector search to brute-force). A later `ensure_indices`/`optimize` materializes the pending index once it is buildable. This mirrors how LanceDB builds indexes asynchronously and serves unindexed rows by brute-force.
-- `ensure_indices()` / `ensure_indices_on(branch)` — idempotent build of BTREE + inverted + vector indexes for the current head; safe to re-run; returns the columns it had to defer as pending. `optimize` runs it after compaction, so the maintenance cron is the convergence path for deferred indexes.
+- **`@index`/`@key` declares intent; the physical index is derived state.** A migration records the declaration in the catalog/IR and never fails on it — `schema apply` builds **no** indexes. Mutation/load likewise publish only their exact data effects; they do not widen the recovery plan with index commits. Reads stay correct while an index is missing or partially covered by falling back to scans (vector search to brute-force). A later `ensure_indices`/`optimize` materializes every buildable declaration; an untrainable Vector column remains pending rather than failing the logical write.
+- `ensure_indices()` / `ensure_indices_on(branch)` — idempotent build of BTREE + inverted + vector indexes for the current manifest head; safe to re-run; returns the columns it had to defer as pending. Existing Lance HEAD drift is refused with `omnigraph repair` guidance rather than silently adopted. On a lazy child branch, an ancestor-owned table stays inherited when there is no index work; real index work first verifies the target ref is absent, then creates it only after recovery intent is durable. `optimize` runs the reconciler after compaction, so the maintenance cron is the convergence path for deferred indexes.
 - Indexes are built on the *branch head* (not on a snapshot), so reads always see the current index state.
 - **Lazy branch forking for indexes**: a branch that hasn't mutated a sub-table doesn't need its own index — the main lineage's index is reused until the first write triggers a copy-on-write fork.
 - Vector index parameters (metric, nlist, nprobe, etc.) are not exposed in the schema; they default at the Lance layer and are picked up automatically when an index is asked for on a Vector column.

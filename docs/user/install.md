@@ -82,13 +82,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -InstallDir "$
 Install a specific tag:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/install.sh | VERSION=v0.1.0 bash
+curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/install.sh | VERSION=v0.9.0 bash
 ```
 
 Windows:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -Version v0.1.0
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -Version v0.9.0
 ```
 
 Build from a specific git ref:
@@ -115,19 +115,6 @@ New-Item -ItemType Directory -Force "$env:USERPROFILE\.local\bin" | Out-Null
 Copy-Item target\release\omnigraph.exe "$env:USERPROFILE\.local\bin\omnigraph.exe"
 Copy-Item target\release\omnigraph-server.exe "$env:USERPROFILE\.local\bin\omnigraph-server.exe"
 ```
-
-## Android (Termux)
-
-Android has no prebuilt release asset. Build from ordinary Termux, not PRoot:
-
-```bash
-pkg install rust clang lld cmake ninja pkg-config protobuf nodejs
-cargo build --release --locked -p omnigraph-cli
-./scripts/check-android-native.ts
-```
-
-The native check requires an `*-linux-android` Rust host and verifies
-`init → load → reopen/query` on Termux app storage. A GNU/Linux build inside PRoot is not an Android build.
 
 ## Release Assets
 

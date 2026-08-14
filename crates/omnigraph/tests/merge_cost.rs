@@ -7,11 +7,11 @@
 //!     through to the target snapshot), so a merge whose delta touches ONE table
 //!     still opens ALL tables. Cost ∝ #types (whole graph), not ∝ delta.
 //!
-//!  2. `merge_manifest_cost_grows_with_history` — a merge does several cold
-//!     coordinator opens (head lookups + merge_base + base/source/target
-//!     snapshots), each an O(history) `__manifest` scan, so on an un-compacted
-//!     graph merge `__manifest` reads grow with commit depth (Regime A — the
-//!     production RustFS/S3 case).
+//!  2. `merge_manifest_cost_grows_with_history` — retained manifest probes and
+//!     coherent state+lineage decoding cap the diverged route at four manifest
+//!     opens/scans, but each surviving append-only journal fold remains
+//!     O(history). On an un-compacted graph, merge `__manifest` reads therefore
+//!     still grow with commit depth (Regime A — the production RustFS/S3 case).
 //!
 //! Both bodies run on a 64 MiB-stack thread: the debug-build merge future plus
 //! the `cost_harness`/`measure` task-local layers overflow the default 2 MiB test
@@ -53,7 +53,9 @@ where
 /// one inserted Person must NOT open the untouched tables for validation — cost
 /// follows the delta, not the catalog. Pre-#5 this opened ~6 tables via a
 /// full-graph validation scan; the index-backed evaluator probes only the
-/// committed Person table (for uniqueness) plus the delta.
+/// committed Person table (for uniqueness) plus the delta, and RFC-022 v4
+/// re-opens the one physical effect to prove its exact transaction history
+/// before confirmation.
 #[test]
 fn merge_validation_is_delta_scoped() {
     on_big_stack(|| async {
@@ -87,39 +89,98 @@ fn merge_validation_is_delta_scoped() {
         res.unwrap();
 
         eprintln!(
-            "CONTROL  1-row insert on main : data_open_count={} data_reads={} manifest_reads={}",
-            ctrl.data_open_count, ctrl.data_reads, ctrl.manifest_reads
+            "CONTROL  1-row insert on main : data_open_count={} internal_open_count={} \
+             manifest_scan_count={} data_reads={} manifest_reads={}",
+            ctrl.data_open_count,
+            ctrl.internal_open_count,
+            ctrl.manifest_scan_count,
+            ctrl.data_reads,
+            ctrl.manifest_reads
         );
         eprintln!(
-            "MERGE    1-Person-row delta   : data_open_count={} data_reads={} manifest_reads={} \
-             [stage_append={} stage_merge_insert={} create_vector_index={}]",
+            "MERGE    1-Person-row delta   : data_open_count={} internal_open_count={} \
+             manifest_scan_count={} data_reads={} manifest_reads={} \
+             [stage_append={} stage_merge_insert={} stage_fenced_insert={} stage_vector_index={}]",
             io.data_open_count,
+            io.internal_open_count,
+            io.manifest_scan_count,
             io.data_reads,
             io.manifest_reads,
             staged.stage_append,
             staged.stage_merge_insert,
-            staged.create_vector_index,
+            staged.stage_fenced_insert,
+            staged.stage_vector_index,
         );
 
         // The proof: only Person changed, so the merge opens only Person-related
-        // tables (the delta + the committed-target index probe for uniqueness) —
-        // never the untouched Company / Knows / WorksAt. Pre-#5 this was ~6
-        // (every catalog table, full-scanned).
+        // state: pinned base + source, fresh source-authority recheck, target
+        // pre-arm handle, and post-effect exact-chain confirmation. The final
+        // reopen is required to prove the landed transaction chain is still at
+        // HEAD rather than buried by an external writer. None of these opens an
+        // untouched Company / Knows / WorksAt table.
+        // Pre-#5 this was ~6 (every catalog table, full-scanned).
         assert!(
-            io.data_open_count <= 3,
-            "merge of a 1-Person delta opened {} data tables; expected <= 3 (Δ-scoped). \
+            io.data_open_count <= 5,
+            "merge of a 1-Person delta opened {} data tables; expected <= 5 (Δ-scoped, including source authority and exact-chain confirmation). \
              Pre-#5 it opened every catalog table (~6) via a whole-graph validation scan.",
             io.data_open_count
+        );
+        const COMMON_MERGE_MANIFEST_OPEN_CEILING: u64 = 3;
+        const COMMON_MERGE_MANIFEST_SCAN_CEILING: u64 = 3;
+        assert!(
+            io.internal_open_count <= COMMON_MERGE_MANIFEST_OPEN_CEILING,
+            "common one-table fast-forward merge opened internal tables {} times; expected <= \
+             {COMMON_MERGE_MANIFEST_OPEN_CEILING}",
+            io.internal_open_count,
+        );
+        assert!(
+            io.manifest_scan_count <= COMMON_MERGE_MANIFEST_SCAN_CEILING,
+            "common one-table fast-forward merge scanned __manifest {} times; expected <= \
+             {COMMON_MERGE_MANIFEST_SCAN_CEILING}",
+            io.manifest_scan_count,
+        );
+
+        // True three-way scalar merge: source and target both advance from the
+        // same base on disjoint rows. The Blob descriptor preflight must not
+        // add a second full base/source/target scan to an ordinary table.
+        db.branch_create("scalar-three-way").await.unwrap();
+        db.mutate(
+            "scalar-three-way",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "source-only")], &[("$age", 42)]),
+        )
+        .await
+        .unwrap();
+        db.mutate(
+            "main",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "target-only")], &[("$age", 43)]),
+        )
+        .await
+        .unwrap();
+        let (res, three_way_io, three_way_staged) =
+            measure_with_staged(db.branch_merge("scalar-three-way", "main")).await;
+        res.unwrap();
+        assert_eq!(
+            three_way_staged.ordered_cursor_scan, 3,
+            "a scalar three-way merge must scan base/source/target once each, not repeat them for Blob selection"
+        );
+        eprintln!(
+            "MERGE    scalar three-way      : data_reads={} ordered_cursors={}",
+            three_way_io.data_reads, three_way_staged.ordered_cursor_scan,
         );
     });
 }
 
 /// CLAIM 2: a merge's `__manifest` cost grows with commit-history depth on an
-/// un-compacted graph (the several cold coordinator opens each scan O(fragments)
-/// of `__manifest`). Contrast with `write_cost.rs`, where a single write's
-/// manifest scan is held FLAT *after compaction* — here we deliberately do NOT
-/// compact, modelling the production graph that has grown its `_versions/` and
-/// `__manifest` fragments without GC.
+/// un-compacted graph. The route performs four coherent manifest scans, and
+/// each surviving append-only journal fold scans O(fragments) of `__manifest`.
+/// Contrast with `write_cost.rs`, where a single write's manifest scan is held
+/// FLAT *after compaction* — here we deliberately do NOT compact, modelling the
+/// production graph that has grown its `_versions/` and `__manifest` fragments
+/// without GC.
 #[test]
 fn merge_manifest_cost_grows_with_history() {
     on_big_stack(|| {
@@ -163,21 +224,43 @@ fn merge_manifest_cost_grows_with_history() {
                 current += 1; // the merge advanced depth
 
                 eprintln!(
-                    "depth~{d}: MERGE manifest_reads={} data_reads={} data_open_count={}  | \
-                     single-write manifest_reads={}  (merge/write ratio = {:.1}x)",
+                    "depth~{d}: MERGE manifest_reads={} data_reads={} data_open_count={} \
+                     internal_open_count={} manifest_scan_count={}  | single-write \
+                     manifest_reads={} internal_open_count={} manifest_scan_count={} \
+                     (merge/write ratio = {:.1}x)",
                     io.manifest_reads,
                     io.data_reads,
                     io.data_open_count,
+                    io.internal_open_count,
+                    io.manifest_scan_count,
                     ctrl.manifest_reads,
+                    ctrl.internal_open_count,
+                    ctrl.manifest_scan_count,
                     io.manifest_reads as f64 / ctrl.manifest_reads.max(1) as f64,
                 );
                 curve.push((d, io));
             }
 
-            // Regime A: merge __manifest cost still grows with history — the cold
-            // cross-branch coordinator opens, a separate amplification not
-            // addressed by the validation change.
+            // Regime A: merge __manifest cost still grows with history because
+            // each of the fixed-count coherent scans folds the uncompacted
+            // append-only journal.
             assert_grows(&curve, |c| c.manifest_reads, 1, "merge __manifest scan");
+            const DIVERGED_MERGE_MANIFEST_OPEN_CEILING: u64 = 4;
+            const DIVERGED_MERGE_MANIFEST_SCAN_CEILING: u64 = 4;
+            for (depth, io) in &curve {
+                assert!(
+                    io.internal_open_count <= DIVERGED_MERGE_MANIFEST_OPEN_CEILING,
+                    "diverged merge at depth {depth} opened internal tables {} times; expected \
+                     <= {DIVERGED_MERGE_MANIFEST_OPEN_CEILING}",
+                    io.internal_open_count,
+                );
+                assert!(
+                    io.manifest_scan_count <= DIVERGED_MERGE_MANIFEST_SCAN_CEILING,
+                    "diverged merge at depth {depth} scanned __manifest {} times; expected \
+                     <= {DIVERGED_MERGE_MANIFEST_SCAN_CEILING}",
+                    io.manifest_scan_count,
+                );
+            }
             // But validation table-opens are now Δ-scoped: flat across history
             // depth (the merge no longer scans the catalog's tables per merge).
             assert_flat(&curve, |c| c.data_open_count, 1, "merge data-table opens");

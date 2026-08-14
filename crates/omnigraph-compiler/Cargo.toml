@@ -1,6 +1,6 @@
 [package]
 name = "omnigraph-compiler"
-version = "0.8.1"
+version = "0.10.0"
 edition = "2024"
 description = "Schema/query compiler for Omnigraph. Zero Lance dependency."
 license = "MIT"
@@ -22,3 +22,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 ahash = { workspace = true }
 sha2 = { workspace = true }
+ulid = { workspace = true }
+
+[lints]
+workspace = true

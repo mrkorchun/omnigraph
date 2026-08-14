@@ -7,6 +7,8 @@
 // future Lance bumps stop needing this.
 #![recursion_limit = "256"]
 
+pub(crate) mod blob;
+mod branch_control;
 pub mod changes;
 pub mod db;
 pub mod embedding;
@@ -15,9 +17,26 @@ mod exec;
 pub mod failpoints;
 pub mod graph_index;
 pub mod instrumentation;
+pub(crate) mod lance_access;
 pub mod loader;
-pub mod runtime_cache;
+pub(crate) mod runtime_cache;
 pub mod storage;
-pub mod storage_layer;
-pub mod table_store;
+pub(crate) mod storage_layer;
+pub(crate) mod table_store;
 pub(crate) mod validate;
+
+pub use blob::{
+    BLOB_READ_RANGE_MAX_BYTES, BlobCell, BlobContent, BlobEtag, BlobRead, BlobReader,
+    EXTERNAL_BLOB_URI_MAX_BYTES, ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy,
+    ExternalBlobRef,
+};
+pub use changes::EntityKind;
+pub use table_store::IndexCoverage;
+
+/// Result of one mutation together with the exact commit published by it.
+/// `commit` is absent when the mutation changed no rows and published nothing.
+#[derive(Debug, Clone)]
+pub struct MutationReceipt {
+    pub result: omnigraph_compiler::result::MutationResult,
+    pub commit: Option<db::GraphCommit>,
+}

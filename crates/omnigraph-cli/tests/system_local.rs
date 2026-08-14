@@ -210,6 +210,8 @@ fn local_cli_end_to_end_init_load_read_change_read_flow() {
     ));
     assert_eq!(change_payload["branch"], "main");
     assert_eq!(change_payload["affected_nodes"], 1);
+    assert!(change_payload["commit"]["graph_commit_id"].is_string());
+    assert!(change_payload["commit"]["manifest_version"].is_number());
 
     let read_after = parse_stdout_json(&output_success(
         cli()
@@ -291,6 +293,7 @@ fn local_cli_end_to_end_branch_change_merge_flow() {
     ));
     assert_eq!(change_payload["branch"], "feature");
     assert_eq!(change_payload["affected_nodes"], 1);
+    assert!(change_payload["commit"]["graph_commit_id"].is_string());
 
     let feature_read = parse_stdout_json(&output_success(
         cli()
@@ -376,6 +379,8 @@ fn local_cli_ingest_creates_review_branch_and_keeps_it_readable() {
     assert_eq!(ingest_payload["branch"], "feature-ingest");
     assert_eq!(ingest_payload["base_branch"], "main");
     assert_eq!(ingest_payload["branch_created"], true);
+    assert!(ingest_payload["commit"]["graph_commit_id"].is_string());
+    assert!(ingest_payload["commit"]["manifest_version"].is_number());
     assert_eq!(ingest_payload["mode"], "merge");
     assert_eq!(ingest_payload["tables"][0]["table_key"], "node:Person");
     assert_eq!(ingest_payload["tables"][0]["rows_loaded"], 2);
@@ -472,6 +477,8 @@ fn local_cli_load_from_forks_branch_and_missing_branch_errors_without_from() {
     assert_eq!(payload["branch_created"], true);
     assert_eq!(payload["mode"], "merge");
     assert_eq!(payload["nodes_loaded"], 1);
+    assert!(payload["commit"]["graph_commit_id"].is_string());
+    assert!(payload["commit"]["manifest_version"].is_number());
 
     let snapshot = parse_stdout_json(&output_success(
         cli()
@@ -1154,8 +1161,7 @@ fn local_cli_change_enforces_engine_layer_policy() {
         cluster.path(),
         &[("OMNIGRAPH_SERVER_BEARER_TOKENS_JSON", POLICY_TOKENS_JSON)],
     );
-    let insert =
-        "query add($name: String, $age: I32) { insert Person { name: $name, age: $age } }";
+    let insert = "query add($name: String, $age: I32) { insert Person { name: $name, age: $age } }";
 
     // Case 1: no token → the server refuses before any policy check.
     let no_token = cli()
@@ -1441,7 +1447,10 @@ fn local_cli_branch_create_enforces_engine_layer_policy() {
         .arg("bruno-feature")
         .output()
         .unwrap();
-    assert!(!denied.status.success(), "bruno branch create must be denied");
+    assert!(
+        !denied.status.success(),
+        "bruno branch create must be denied"
+    );
     let stderr = String::from_utf8_lossy(&denied.stderr);
     assert!(
         stderr.contains("denied"),
@@ -1505,7 +1514,10 @@ fn local_cli_branch_delete_enforces_engine_layer_policy() {
         .arg("doomed")
         .output()
         .unwrap();
-    assert!(!denied.status.success(), "bruno branch delete must be denied");
+    assert!(
+        !denied.status.success(),
+        "bruno branch delete must be denied"
+    );
     let stderr = String::from_utf8_lossy(&denied.stderr);
     assert!(
         stderr.contains("denied"),
@@ -1568,7 +1580,10 @@ fn local_cli_branch_merge_enforces_engine_layer_policy() {
         .arg("main")
         .output()
         .unwrap();
-    assert!(!denied.status.success(), "bruno branch merge must be denied");
+    assert!(
+        !denied.status.success(),
+        "bruno branch merge must be denied"
+    );
     let stderr = String::from_utf8_lossy(&denied.stderr);
     assert!(
         stderr.contains("denied"),
@@ -1888,8 +1903,16 @@ fn local_cluster_full_lifecycle_declare_serve_evolve_delete() {
     // Phase 3-4: one apply creates both graphs and publishes the catalog.
     let converge = cluster_cli(dir, &["apply"]);
     assert_eq!(converge["converged"], true, "{converge}");
-    seed_graph(dir, "knowledge", "{\"type\":\"Person\",\"data\":{\"name\":\"Ada\"}}\n");
-    seed_graph(dir, "engineering", "{\"type\":\"Service\",\"data\":{\"name\":\"billing\"}}\n");
+    seed_graph(
+        dir,
+        "knowledge",
+        "{\"type\":\"Person\",\"data\":{\"name\":\"Ada\"}}\n",
+    );
+    seed_graph(
+        dir,
+        "engineering",
+        "{\"type\":\"Service\",\"data\":{\"name\":\"billing\"}}\n",
+    );
 
     // Phase 5: serve the applied revision.
     let client = Client::new();
@@ -1972,8 +1995,7 @@ fn local_cluster_full_lifecycle_declare_serve_evolve_delete() {
     });
     let refresh = cluster_cli(dir, &["refresh"]);
     assert_eq!(
-        refresh["resource_statuses"]["schema.knowledge"]["status"],
-        "drifted",
+        refresh["resource_statuses"]["schema.knowledge"]["status"], "drifted",
         "{refresh}"
     );
     let heal = cluster_cli(dir, &["apply"]);
@@ -1990,7 +2012,10 @@ fn local_cluster_full_lifecycle_declare_serve_evolve_delete() {
         String::from_utf8_lossy(&schema_show.stderr)
     );
     let shown = String::from_utf8_lossy(&schema_show.stdout);
-    assert!(shown.contains("Person"), "schema show produced no schema: {shown}");
+    assert!(
+        shown.contains("Person"),
+        "schema show produced no schema: {shown}"
+    );
     assert!(
         !shown.contains("rogue"),
         "drift must be soft-dropped back to the declared schema: {shown}"
@@ -2105,7 +2130,6 @@ rules:
         dir.join("server.policy.yaml"),
         r#"
 version: 1
-kind: server
 groups:
   admins: ["act-admin"]
 rules:
@@ -2139,7 +2163,11 @@ policies:
     assert_eq!(cluster_cli(dir, &["import"])["ok"], true);
     let converge = cluster_cli(dir, &["apply"]);
     assert_eq!(converge["converged"], true, "{converge}");
-    seed_graph(dir, "knowledge", "{\"type\":\"Person\",\"data\":{\"name\":\"Ada\"}}\n");
+    seed_graph(
+        dir,
+        "knowledge",
+        "{\"type\":\"Person\",\"data\":{\"name\":\"Ada\"}}\n",
+    );
 
     let server = spawn_server_with_cluster_env(
         dir,
@@ -2276,7 +2304,10 @@ fn local_cli_keyed_credentials_authenticate_url_matched_server() {
         .unwrap();
     assert!(output.status.success(), "{output:?}");
     let output = remote_read(&[]);
-    assert!(!output.status.success(), "wrong token must not authenticate");
+    assert!(
+        !output.status.success(),
+        "wrong token must not authenticate"
+    );
 
     // Re-login rotates to the right token (via --token); 0600 on disk.
     let output = cli()
@@ -2302,8 +2333,7 @@ fn local_cli_keyed_credentials_authenticate_url_matched_server() {
         output.status.success(),
         "keyed credential must authenticate the URL-matched server: {output:?}"
     );
-    let payload: serde_json::Value =
-        serde_json::from_slice(&output.stdout).unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(payload["rows"][0]["p.name"], "Alice");
 
     // OMNIGRAPH_TOKEN_<NAME> env outranks the credentials file.
@@ -2366,8 +2396,20 @@ fn local_cli_operator_alias_and_server_flag_invoke_stored_query() {
         "version: 1\nmetadata:\n  name: alias-sys\nstate:\n  backend: cluster\n  lock: true\ngraphs:\n  local:\n    schema: ./local.pg\n    queries:\n      find_person:\n        file: ./find-person.gq\n      insert_person:\n        file: ./insert-person.gq\npolicies:\n  graph:\n    file: ./graph.policy.yaml\n    applies_to: [local]\n",
     )
     .unwrap();
-    output_success(cli().arg("cluster").arg("import").arg("--config").arg(cluster.path()));
-    output_success(cli().arg("cluster").arg("apply").arg("--config").arg(cluster.path()));
+    output_success(
+        cli()
+            .arg("cluster")
+            .arg("import")
+            .arg("--config")
+            .arg(cluster.path()),
+    );
+    output_success(
+        cli()
+            .arg("cluster")
+            .arg("apply")
+            .arg("--config")
+            .arg(cluster.path()),
+    );
     output_success(
         cli()
             .arg("load")
@@ -2498,7 +2540,10 @@ fn local_cli_operator_alias_and_server_flag_invoke_stored_query() {
         .arg("--json")
         .output()
         .unwrap();
-    assert!(output.status.success(), "by-name catalog invocation: {output:?}");
+    assert!(
+        output.status.success(),
+        "by-name catalog invocation: {output:?}"
+    );
     let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(payload["rows"][0]["p.name"], "Alice", "{payload}");
 
@@ -2534,7 +2579,10 @@ fn local_cli_operator_alias_and_server_flag_invoke_stored_query() {
         .unwrap();
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("unknown server 'nope'") && stderr.contains("dev"), "{stderr}");
+    assert!(
+        stderr.contains("unknown server 'nope'") && stderr.contains("dev"),
+        "{stderr}"
+    );
 
     // --server is exclusive with --store (two ways to address the graph).
     // (RFC-011 D3: there is no positional URI anymore — the positional is a

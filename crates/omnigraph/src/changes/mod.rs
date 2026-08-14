@@ -1,38 +1,47 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use arrow_array::{Array, RecordBatch, StringArray, UInt64Array};
 use arrow_cast::display::array_value_to_string;
 use lance::dataset::scanner::ColumnOrdering;
 
 use crate::db::SubTableEntry;
-use crate::db::manifest::Snapshot;
+use crate::db::manifest::{Snapshot, TableIdentity};
 use crate::error::Result;
 use crate::storage_layer::{SnapshotHandle, TableStorage};
 use crate::table_store::TableStore;
+pub(crate) mod page;
+
+pub use page::{
+    COMMIT_CHANGES_DEFAULT_BYTES, COMMIT_CHANGES_DEFAULT_ROWS, COMMIT_CHANGES_MAX_BYTES,
+    COMMIT_CHANGES_MAX_ROWS, CommitChangesPage,
+};
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum EntityKind {
     Node,
     Edge,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ChangeOp {
     Insert,
     Update,
     Delete,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Endpoints {
     pub src: String,
     pub dst: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct EntityChange {
+    pub change_index: usize,
     pub table_key: String,
     pub kind: EntityKind,
     pub type_name: String,
@@ -40,6 +49,8 @@ pub struct EntityChange {
     pub op: ChangeOp,
     pub manifest_version: u64,
     pub endpoints: Option<Endpoints>,
+    pub before: Option<serde_json::Value>,
+    pub after: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -104,64 +115,115 @@ impl ChangeFilter {
 
 // ─── Core diff ──────────────────────────────────────────────────────────────
 
+/// One immutable table lifetime whose physical state differs between two
+/// graph snapshots.
+///
+/// Identity, not alias, pairs the endpoints. A rename therefore stays one
+/// interval (and is elided when its physical state did not move), while a
+/// drop/re-add under the same public name remains two distinct lifetimes.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TableChangeInterval<'a> {
+    pub(crate) identity: TableIdentity,
+    pub(crate) from: Option<&'a SubTableEntry>,
+    pub(crate) to: Option<&'a SubTableEntry>,
+}
+
+impl<'a> TableChangeInterval<'a> {
+    fn table_key(&self) -> &'a str {
+        &self
+            .to
+            .or(self.from)
+            .expect("a changed interval has at least one endpoint")
+            .table_key
+    }
+}
+
+/// Derive changed table lifetimes in stable graph-visible order: destination
+/// alias (or source alias for a removal), then immutable identity.
+///
+/// This is the graph-commit CDC pruning layer: later row enumeration only
+/// needs to inspect these exact endpoint pairs. It persists no parallel change
+/// log and does not infer identity from an alias, path, or Lance version.
+pub(crate) fn changed_table_intervals<'a>(
+    from: &'a Snapshot,
+    to: &'a Snapshot,
+) -> Vec<TableChangeInterval<'a>> {
+    let mut by_identity =
+        BTreeMap::<TableIdentity, (Option<&'a SubTableEntry>, Option<&'a SubTableEntry>)>::new();
+    for entry in from.entries() {
+        by_identity.entry(entry.identity).or_default().0 = Some(entry);
+    }
+    for entry in to.entries() {
+        by_identity.entry(entry.identity).or_default().1 = Some(entry);
+    }
+
+    let mut intervals = by_identity
+        .into_iter()
+        .filter_map(|(identity, (from, to))| {
+            (!same_state(from, to)).then_some(TableChangeInterval { identity, from, to })
+        })
+        .collect::<Vec<_>>();
+    intervals.sort_by(|left, right| {
+        left.table_key()
+            .cmp(right.table_key())
+            .then_with(|| left.identity.cmp(&right.identity))
+    });
+    intervals
+}
+
 /// Net-current diff between two snapshots.
 ///
 /// Uses a three-level algorithm:
 /// 1. Manifest diff — skip unchanged sub-tables
 /// 2. Lineage check — same branch → version-column diff; different → ID-based diff
 /// 3. Row-level diff
-pub async fn diff_snapshots(
+pub(crate) async fn diff_snapshots(
     table_store: &TableStore,
     from: &Snapshot,
     to: &Snapshot,
     filter: &ChangeFilter,
     branch: Option<String>,
 ) -> Result<ChangeSet> {
-    let mut all_keys: HashSet<String> = HashSet::new();
-    for entry in from.entries() {
-        all_keys.insert(entry.table_key.clone());
-    }
-    for entry in to.entries() {
-        all_keys.insert(entry.table_key.clone());
-    }
-
     let mut changes = Vec::new();
 
-    for table_key in &all_keys {
+    for interval in changed_table_intervals(from, to) {
+        let from_entry = interval.from;
+        let to_entry = interval.to;
+        // Prefer the destination alias for a rename; a removed table has only
+        // its source alias. Logical pairing never depends on either name.
+        let table_key = &to_entry
+            .or(from_entry)
+            .expect("identity came from one snapshot")
+            .table_key;
+        debug_assert!(
+            from_entry
+                .into_iter()
+                .chain(to_entry)
+                .all(|entry| entry.identity == interval.identity),
+            "table interval endpoints must retain their immutable identity"
+        );
         if !filter.matches_table(table_key) {
-            continue;
-        }
-
-        let from_entry = from.entry(table_key);
-        let to_entry = to.entry(table_key);
-
-        // Skip if both snapshots have identical state for this table
-        if same_state(from_entry, to_entry) {
             continue;
         }
 
         let (kind, type_name) = parse_table_key(table_key);
         let is_edge = kind == EntityKind::Edge;
 
-        let table_changes = if from_entry.is_none() {
+        let table_changes = match (from_entry, to_entry) {
             // Table added — all rows are inserts
-            diff_table_added(table_store, to, table_key, is_edge, filter).await?
-        } else if to_entry.is_none() {
+            (None, Some(to)) => diff_table_added(table_store, to, is_edge, filter).await?,
             // Table removed — all rows are deletes
-            diff_table_removed(table_store, from, table_key, is_edge, filter).await?
-        } else if same_lineage(from_entry, to_entry) {
+            (Some(from), None) => diff_table_removed(table_store, from, is_edge, filter).await?,
             // Fast path: version-column diff
-            diff_table_same_lineage(
-                table_store,
-                from_entry.unwrap(),
-                to_entry.unwrap(),
-                is_edge,
-                filter,
-            )
-            .await?
-        } else {
+            (Some(from), Some(to)) if same_lineage(from_entry, to_entry) => {
+                diff_table_same_lineage(table_store, from, to, is_edge, filter).await?
+            }
             // Cross-branch path: streaming ID-based diff
-            diff_table_cross_branch(table_store, from, to, table_key, is_edge, filter).await?
+            (Some(from), Some(to)) => {
+                diff_table_cross_branch(table_store, from, to, is_edge, filter).await?
+            }
+            // Unreachable: `same_state` above already skipped absent-on-both-sides tables.
+            (None, None) => continue,
         };
 
         for mut c in table_changes {
@@ -295,17 +357,14 @@ async fn diff_table_same_lineage(
 
 async fn diff_table_cross_branch(
     table_store: &TableStore,
-    from_snap: &Snapshot,
-    to_snap: &Snapshot,
-    table_key: &str,
+    from_entry: &SubTableEntry,
+    to_entry: &SubTableEntry,
     is_edge: bool,
     filter: &ChangeFilter,
 ) -> Result<Vec<EntityChange>> {
     let storage: &dyn TableStorage = table_store;
-    let from_ds = storage
-        .open_snapshot_at_table(from_snap, table_key)
-        .await?;
-    let to_ds = storage.open_snapshot_at_table(to_snap, table_key).await?;
+    let from_ds = storage.open_snapshot_at_entry(from_entry).await?;
+    let to_ds = storage.open_snapshot_at_entry(to_entry).await?;
 
     let from_rows = scan_all_rows_ordered(storage, &from_ds, is_edge).await?;
     let to_rows = scan_all_rows_ordered(storage, &to_ds, is_edge).await?;
@@ -386,8 +445,7 @@ async fn diff_table_cross_branch(
 
 async fn diff_table_added(
     table_store: &TableStore,
-    to_snap: &Snapshot,
-    table_key: &str,
+    to_entry: &SubTableEntry,
     is_edge: bool,
     filter: &ChangeFilter,
 ) -> Result<Vec<EntityChange>> {
@@ -395,7 +453,7 @@ async fn diff_table_added(
         return Ok(Vec::new());
     }
     let storage: &dyn TableStorage = table_store;
-    let ds = storage.open_snapshot_at_table(to_snap, table_key).await?;
+    let ds = storage.open_snapshot_at_entry(to_entry).await?;
     let rows = scan_all_rows_ordered(storage, &ds, is_edge).await?;
     Ok(rows
         .into_iter()
@@ -405,8 +463,7 @@ async fn diff_table_added(
 
 async fn diff_table_removed(
     table_store: &TableStore,
-    from_snap: &Snapshot,
-    table_key: &str,
+    from_entry: &SubTableEntry,
     is_edge: bool,
     filter: &ChangeFilter,
 ) -> Result<Vec<EntityChange>> {
@@ -414,9 +471,7 @@ async fn diff_table_removed(
         return Ok(Vec::new());
     }
     let storage: &dyn TableStorage = table_store;
-    let ds = storage
-        .open_snapshot_at_table(from_snap, table_key)
-        .await?;
+    let ds = storage.open_snapshot_at_entry(from_entry).await?;
     let rows = scan_all_rows_ordered(storage, &ds, is_edge).await?;
     Ok(rows
         .into_iter()
@@ -433,9 +488,7 @@ async fn scan_with_filter(
     cols: &[&str],
     filter_sql: &str,
 ) -> Result<Vec<ScannedRow>> {
-    let batches = storage
-        .scan(ds, Some(cols), Some(filter_sql), None)
-        .await?;
+    let batches = storage.scan(ds, Some(cols), Some(filter_sql), None).await?;
     Ok(extract_rows(&batches))
 }
 
@@ -580,6 +633,7 @@ fn extract_rows_with_signature(batches: &[RecordBatch], is_edge: bool) -> Vec<Sc
 
 fn entity_change_from_row(row: &ScannedRow, op: ChangeOp, is_edge: bool) -> EntityChange {
     EntityChange {
+        change_index: 0,
         table_key: String::new(),
         kind: if is_edge {
             EntityKind::Edge
@@ -590,6 +644,8 @@ fn entity_change_from_row(row: &ScannedRow, op: ChangeOp, is_edge: bool) -> Enti
         id: row.id.clone(),
         op,
         manifest_version: row.change_version.unwrap_or(0),
+        before: None,
+        after: None,
         endpoints: if is_edge {
             Some(Endpoints {
                 src: row.src.clone().unwrap_or_default(),

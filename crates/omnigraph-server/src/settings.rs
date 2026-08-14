@@ -166,6 +166,7 @@ pub(crate) async fn load_cluster_settings(
             uri: graph.root.to_string_lossy().to_string(),
             policy: graph_policies.get(&graph.graph_id).cloned(),
             embedding,
+            external_blob_policy: graph.external_blob_policy.clone(),
             queries: registry,
         });
     }
@@ -217,7 +218,7 @@ pub async fn load_server_settings(
             "omnigraph-server boots from a cluster: pass --cluster <dir|s3://…> \
              (the cluster's applied revision is the deployment artifact). The legacy \
              single-graph boot (positional <URI>, --target, --config omnigraph.yaml) \
-             was removed in RFC-011."
+             has been removed."
         );
     };
     load_cluster_settings(
@@ -641,6 +642,7 @@ mod tests {
                         .into_owned(),
                     policy: None,
                     embedding: None,
+                    external_blob_policy: omnigraph::ExternalBlobPolicy::Deny,
                     queries: crate::queries::QueryRegistry::default(),
                 }],
                 config_path: temp.path().join("omnigraph.yaml"),
@@ -694,6 +696,7 @@ mod tests {
                         .into_owned(),
                     policy: None,
                     embedding: None,
+                    external_blob_policy: omnigraph::ExternalBlobPolicy::Deny,
                     queries: crate::queries::QueryRegistry::default(),
                 }],
                 config_path: temp.path().join("cluster"),
